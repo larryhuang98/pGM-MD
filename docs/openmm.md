@@ -127,6 +127,28 @@ GVDW (`tests/compare_gvdw.py`, the GVDW manuscript's 512-water box `rayl_512_v2.
 | OpenCL double vs Reference: energy, forces rms rel. | 1e-14, 3e-12 | 1e-15, 3e-12 |
 | OpenCL mixed vs Reference | 3e-6, 3e-5 | 3e-6, 3e-5 |
 
+CUDA (NVIDIA RTX PRO 6000 Blackwell, driver 610 / CUDA 13.3; `runs/gpu_tests.sh`, `runs/gpu_bench.sh`):
+`test_pgm_api.py` and `test_gvdw_api.py` all passed; against the CPU platform (= the Reference kernel)
+on water512:
+
+| CUDA precision | energy rel. diff (PME, qpi) | forces max diff (kJ/mol/nm; rms 1500) | induced dipoles max diff |
+|---|---|---|---|
+| double | 9e-16 (no cutoff 2e-16) | 8e-7 | 1e-11 |
+| mixed | 2e-8 | 0.11 | 7e-7 |
+| single | 9e-9 | 0.11 | 7e-7 |
+
+GVDW on CUDA (mixed): 2e-8 / 1e-7 relative energy (Slater / Gauss), forces 3e-5 rms relative.  The PME
+grid is accumulated in 64-bit fixed point; with OpenMM's 2^32 scale the double-precision forces were
+limited to 1e-4 kJ/mol/nm, so double precision now uses 2^44 (single / mixed keep 2^32).  NVE water512,
+CUDA mixed: 141 ns/day, fluctuation 0.5 kJ/mol.  Speed against pmemd-pgm on the same GPU and system
+(4096 waters, 12288 atoms, cut 0.9 nm, beta 4/nm, 56^3, order 6, tol 1e-4, 1 fs, NVE, 2000 steps):
+pmemd.pgm.cuda_SPFP 91.7 ns/day, this plugin (CUDA mixed, `md_nve.py`, with energy reports) 77.2 ns/day,
+2 CG iterations per step; total energies agree (-9.2612e6 kJ/mol).
+
+The conda environment's NVRTC 13.4 emits PTX the 13.3 driver rejects (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
+for OpenMM's own kernels too): `LD_PRELOAD` an NVRTC 13.0 (`~/project/ext/nvrtc13.0`, conda-forge
+cuda-nvrtc 13.0) until the driver is updated.
+
 `tests/test_gvdw_api.py` (53 checks, random triclinic 48-atom systems against an independent Python sum):
 both repulsion forms x NoCutoff / CutoffNonPeriodic / CutoffPeriodic, excluded and parameterized
 exceptions with and without periodic images, dispersion correction: Reference = brute force to 1e-9,
@@ -186,6 +208,7 @@ mixed (pocl), 1 fs, 0.8 nm, beta 4, 48^3, tol 1e-5, mu4, peek 0.65: total energy
   truncated-octahedron box (CPU platform and brute force agree): compare on the CPU platform.
 * pocl (OpenCL on the CPU, used for testing without a GPU: `runs/ocl_env.sh`) gives wrong double-precision
   FFTs, for OpenMM's own PME too; mixed and single precision are fine.
+* NVRTC newer than the driver: see the CUDA validation above (preload an older NVRTC).
 * Mixed precision has an accuracy floor in the induced dipoles of about 2e-5 (max) / 5e-6 (rms) relative
   to double precision (water512, `tests/mixed_cg.py`), the same without PME and for every tolerance from
   1e-5 to 1e-8: it comes from the pair fields evaluated in single precision (float positions, as in all
