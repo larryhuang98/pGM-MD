@@ -48,4 +48,11 @@ EDITS = [
      "                               enerd,\n"
      "                               stepWork);\n"
      "        }\n    }\n"),
+    # ---------------------------------------------------------------- tables (DispCorr builds them)
+    ("src/gromacs/tables/forcetable.cpp",
+     "        case CoulombInteractionType::Cut: tabsel[etiCOUL] = etabCOUL; break;\n",
+     "        case CoulombInteractionType::Cut:\n"
+     "        case CoulombInteractionType::Pgm: // only the dispersion correction uses these tables\n"
+     "            tabsel[etiCOUL] = etabCOUL;\n"
+     "            break;\n"),
 ]

@@ -7,3 +7,4 @@ S=$1
 mkdir -p $S/src/gromacs/pgm
 cp $H/../src/pgm/pgm.h $H/../src/pgm/pgm.cpp $H/../src/pgm/CMakeLists.txt $S/src/gromacs/pgm/
 python3 $H/apply.py $H/g1_hooks.py $S
+python3 $H/apply.py $H/g1b_checks.py $S
