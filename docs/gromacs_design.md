@@ -76,3 +76,61 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
 | G2 | SIMD (4xM) pGM kernels, threaded PME paths | same numbers, speed |
 | G3 | CUDA: pGM pair kernels on the GPU list, GPU PME with dipoles, device CG | same numbers, speed vs pmemd.pgm.cuda |
 | G4 | domain decomposition, separate PME ranks | multi-rank = single-rank |
+
+## Status
+
+### Patches and build
+
+```
+python3 gromacs/patches/apply.py gromacs/patches/g0a_interactions.py $SRC   # topology data, tpr
+python3 gromacs/patches/apply.py gromacs/patches/g0b_coulombtype.py $SRC    # coulombtype = pGM, mdp options
+bash    gromacs/patches/g0b_elecnone.sh $SRC                                # LJ-only nbnxm kernels always
+bash    gromacs/patches/g1_install.sh $SRC                                  # src/gromacs/pgm + hooks (g1_hooks.py)
+```
+
+All stages are idempotent string replacements that fail loudly if upstream code moved.  Builds on
+rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
+`build_gmx.sh double -DGMX_DOUBLE=ON -DGMX_GPU=OFF` (`gmx_d`), incremental `rebuild.sh cuda|double`.
+
+### G1 (done): CPU reference in mdrun
+
+`src/gromacs/pgm/pgm.{h,cpp}` (`gmx::PgmElectrostatics`, owned by `t_forcerec::pgm`, created for
+`coulombtype = pGM`) ports `core/pgm_core.cpp` to GROMACS's data structures:
+
+* direct space: the local nbnxm CPU cluster lists (`pairlistSets().pairlistSet(Local).cpuLists()`,
+  `getLocalAtomOrder()`), exclusion masks ignored, overlapping (diagonal) cluster pairs counted with
+  nbnxm index j > i, pairs beyond rcoulomb skipped; kernels in double;
+* PME of charges and dipoles with the GROMACS FFT (`gmx_parallel_3dfft`, one rank; the complex grid is
+  y-major / x-minor as in `pme_solve`, whatever `complex_order` says), splines theta, dtheta, d2theta of
+  order 4-12, influence function with OpenMM's B-spline moduli;
+* Jacobi PCG with the mu3/mu4 predictor (history in the global atom order, so it survives the
+  repartitioning that also happens on a single rank), peek step;
+* outputs: forces into `ForceWithVirial` with the analytical virial Xi = S^T/2 (pairs, covalent chain
+  rule, reciprocal including the dipole term, background); energies: Coulomb (SR) = direct, Coul. recip.
+  = reciprocal + self + background, "pGM Polariz." = sum |mu|^2/(2 alpha);
+* OpenMP over the pair lists (per-thread field/force buffers), atoms (splines, gather) and per-thread
+  spread grids; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
+* `GMX_PGM_DUMP=file`: the first force call's settings, terms, virial, per-atom positions, parameters,
+  forces, dipoles and the covalent list, in the global order; `core/tests/run_dump` recomputes it with
+  pgm_core, `tests/compare_gmx.py` compares it with a pGM-JAX reference.
+
+Validation, water512 (pGM3P-25, 1536 atoms; beta 3.5/nm, grid 36^3, order 6, rc 0.9 nm, dipole tol 1e-10,
+no predictor / peek; `tests/gmx/sp_w512.sh`, `runs/gmx_w512/rl10`: rlist 1.0 nm):
+
+| | electrostatic energy | forces max abs diff (kJ/mol/nm; RMS force 1499) | dipoles max diff (e nm) | virial max diff (kJ/mol; max 5.6e4) |
+|---|---|---|---|---|
+| gmx_d vs pgm_core (same input) | 2e-15 relative | 2e-11 | 1e-16 | 6e-10 |
+| gmx_d vs pGM-JAX (float64) | 3e-11 relative | 1e-4 (g96 positions, 1e-9 nm) | 7e-10 | |
+| gmx (mixed) vs pgm_core | 2e-11 relative | 9e-4 | 4e-9 | 2e-3 |
+
+CG iterations 17 in all three.  With `rlist = rcoulomb` and no Verlet buffer (`runs/gmx_w512/sp.mdp`) a
+few pairs just inside the cut-off are missing from the lists (float bounding boxes): 1e-9 relative in
+the energy, 0.09 kJ/mol/nm in the forces; any buffer removes it.
+
+Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.sh`):
+
+* NVE, 1 fs, 4 ps, rigid water (SETTLE), plain LJ cut-off, Verlet buffer tolerance 1e-4, dipole tol
+  1e-5, mu4 predictor, peek 0.65: total energy fluctuation 0.36 kJ/mol, drift -0.07 kJ/mol over 4 ps;
+  4.0 CG iterations per step.
+* Speed of this reference: 1.8 ns/day (47 ms/step) for water512 on 8 cores; the pair setup (two erf
+  kernels per pair per step) and the scalar loops dominate, which is G2's job.

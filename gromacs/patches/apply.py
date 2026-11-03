@@ -20,7 +20,7 @@ for rel, old, new in edits:
     p = root / rel
     text = cache.get(p) or p.read_text()
     n = text.count(old)
-    if new and new in text and n == 0:
+    if new and new in text:
         print(f"already applied: {rel}: {old.strip().splitlines()[0][:70]}")
         cache[p] = text
         continue

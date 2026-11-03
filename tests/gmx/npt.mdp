@@ -1,0 +1,38 @@
+; water512 (pGM3P-25) NPT 298 K / 1 bar with pGM electrostatics; settings of the pmemd.pgm.cuda check
+; (pGM-JAX docs/dielectric.md: 9 A, ew_coeff 0.4 1/A, PME spacing ~0.52 A, order 6, vdwmeth 1, tol 1e-5,
+; SETTLE, 2 fs): density 1.0097 +- 0.0002 g/cm^3
+integrator              = md
+nsteps                  = 75000
+dt                      = 0.002
+cutoff-scheme           = Verlet
+nstlist                 = 10
+pbc                     = xyz
+coulombtype             = pGM
+rcoulomb                = 0.9
+vdwtype                 = cut-off
+vdw-modifier            = None
+rvdw                    = 0.9
+DispCorr                = EnerPres
+fourier-nx              = 48
+fourier-ny              = 48
+fourier-nz              = 48
+pme-order               = 6
+ewald-rtol              = 3.55862e-07
+pgm-dipole-tol          = 1e-5
+pgm-predictor           = 2
+pgm-peek                = 0.65
+tcoupl                  = v-rescale
+tc-grps                 = System
+tau-t                   = 0.5
+ref-t                   = 298
+pcoupl                  = C-rescale
+tau-p                   = 2.0
+ref-p                   = 1.0
+compressibility         = 4.5e-5
+gen-vel                 = yes
+gen-temp                = 298
+gen-seed                = 7
+continuation            = no
+nstcalcenergy           = 50
+nstenergy               = 50
+nstlog                  = 5000
