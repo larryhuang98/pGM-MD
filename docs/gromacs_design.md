@@ -133,7 +133,31 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
 * NVE, 1 fs, 4 ps, rigid water (SETTLE), plain LJ cut-off, Verlet buffer tolerance 1e-4, dipole tol
   1e-5, mu4 predictor, peek 0.65: total energy fluctuation 0.36 kJ/mol, drift -0.07 kJ/mol over 4 ps;
   4.0 CG iterations per step.
+* NPT 298 K / 1 bar (`tests/gmx/npt.mdp`: the pmemd.pgm.cuda settings of pGM-JAX docs/dielectric.md,
+  9 A, beta 4/nm, 48^3 order 6, DispCorr EnerPres = vdwmeth 1, tol 1e-5, SETTLE, 2 fs; v-rescale,
+  C-rescale), 150 ps from the 1.018 g/cm^3 start: 6.0 CG iterations per step, 7.4 ns/day; pressure
+  -8 +- 23 bar; density 1.0183 g/cm^3 over 30-150 ps, still drifting down (-8 kg/m^3 over the window)
+  towards pmemd's 1.0097 +- 0.0002.  Extended by 600 ps (`runs/gmx_w512/npt_ext.sh`, average from
+  100 ps in `npt_ext.out`) for the converged number.
 * Speed of this reference (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms per
   step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms, final
   forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels
   per pair in double; the PME is a plain per-thread-grid spread / FFT / gather.  Speed is G2's job.
+
+### G2 plan (next)
+
+Measured costs of the G1 reference (above) set the order:
+
+1. **PME** (half the step): spread/gather of order 6 over 216 grid points per atom, 7 solves per step.
+   Use GROMACS's `PmeAndFftGrids` thread-overlap decomposition (spread into thread-local subgrids with
+   halo reduction, as `spread_on_grid`) instead of full per-thread grids; mixed precision on the grid;
+   reuse the splines across the CG solves (already done) and gather field and field gradient in one pass.
+2. **Pair setup**: evaluate G1, G2 (and G0, G3 for the final pass) in SIMD over the 4xM cluster pairs
+   (`gmx::SimdReal`, erfc via `pmeForceCorrection`-style polynomials for beta and the exact series /
+   recursion for the Gaussian a_ij), store them per cluster pair in the list order (float in mixed
+   precision), so each CG pass is a streaming SIMD loop: load x_i, d_i (4 atoms), x_j, d_j (M atoms),
+   G1, G2 tile, accumulate E_i in registers, E_j with the nbnxm j-force reduction pattern.
+3. **CG vectors** in nbnxm atom order (no gathers through `getLocalAtomOrder` per pass).
+
+Check: the same G1 validation (gmx_d against pgm_core to 1e-12, mixed against double), then speed against
+pmemd.pgm (CPU) and OpenMM (CPU / pocl).
