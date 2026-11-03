@@ -248,7 +248,7 @@ vector<V3> Engine::frac_dipoles(const vector<V3>& d) const {
     return e;
 }
 
-double Engine::pme_potential(const vector<double>* q, const vector<V3>& d, vector<double>& phi) {
+double Engine::pme_potential(const vector<double>* q, const vector<V3>& d, vector<double>& phi, double* strain) {
     int K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], K3h = K3/2+1, p = s.order;
     vector<double> Q((size_t) K1*K2*K3, 0.0);
     vector<V3> e = frac_dipoles(d);
@@ -283,6 +283,18 @@ double Engine::pme_potential(const vector<double>* q, const vector<V3>& d, vecto
                 double g = influence[idx];
                 double w = (m3 == 0 || (K3%2 == 0 && m3 == K3/2) ? 1.0 : 2.0);
                 energy += 0.5*w*g*norm(F[idx]);
+                if (strain && g != 0) {
+                    int mm1 = (m1 <= K1/2 ? m1 : m1-K1), mm2 = (m2 <= K2/2 ? m2 : m2-K2), mm3 = m3;
+                    V3 ms;
+                    for (int k = 0; k < 3; k++)
+                        ms[k] = mm1*recip[k][0]+mm2*recip[k][1]+mm3*recip[k][2];
+                    double m2s = dot(ms, ms);
+                    double e = 0.5*w*g*norm(F[idx]);
+                    double c2 = 2.0*(M_PI*M_PI/(s.beta*s.beta)+1.0/m2s);
+                    for (int a = 0; a < 3; a++)
+                        for (int b = 0; b < 3; b++)
+                            strain[3*a+b] += e*((a == b ? -1.0 : 0.0)+c2*ms[a]*ms[b]);
+                }
                 F[idx] *= g;
             }
     phi.assign((size_t) K1*K2*K3, 0.0);
@@ -469,6 +481,7 @@ double Engine::compute(const vector<V3>& positions, const V3 boxIn[3], vector<V3
     EnergyTerms T;
     vector<V3> E(n, V3{0, 0, 0});        // total field at fixed d [e/nm^2]
     vector<V3> F(n, V3{0, 0, 0});        // forces at fixed d [e^2/nm^2]
+    double S[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   // strain derivative [e^2/nm]
     for (const Pair& p : pairs) {
         const V3& x = p.x;
         double qi = q[p.i], qj = q[p.j];
@@ -480,6 +493,8 @@ double Engine::compute(const vector<V3>& positions, const V3 boxIn[3], vector<V3
         double sc = -qi*qj*G[1]-(qi*djx-qj*dix)*G[2]-didj*G[2]+dix*djx*G[3];
         for (int k = 0; k < 3; k++) {
             double dedx = sc*x[k]+(qi*dj[k]-qj*di[k])*G[1]-(djx*di[k]+dix*dj[k])*G[2];
+            for (int b = 0; b < 3; b++)
+                S[3*k+b] += dedx*x[b];
             F[p.i][k] -= dedx;
             F[p.j][k] += dedx;
             E[p.i][k] += qj*x[k]*G[1]-dj[k]*G[1]+djx*x[k]*G[2];
@@ -488,8 +503,15 @@ double Engine::compute(const vector<V3>& positions, const V3 boxIn[3], vector<V3
     }
     if (s.periodic) {
         vector<double> phi;
-        T.reciprocal = pme_potential(&q, d, phi);
-        pme_field(phi, E);
+        T.reciprocal = pme_potential(&q, d, phi, S);
+        vector<V3> Erec(n, V3{0, 0, 0});
+        pme_field(phi, Erec);
+        for (int i = 0; i < n; i++)
+            for (int a = 0; a < 3; a++) {
+                E[i][a] += Erec[i][a];
+                for (int b = 0; b < 3; b++)
+                    S[3*a+b] += Erec[i][a]*d[i][b];   // fractional dipoles change with the box
+            }
         // reciprocal forces: -[q grad phi + (grad grad phi) . d]
         int K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], p = s.order;
         vector<V3> e = frac_dipoles(d);
@@ -537,6 +559,8 @@ double Engine::compute(const vector<V3>& positions, const V3 boxIn[3], vector<V3
         }
         T.self = -(s.beta/SQRT_PI)*q2-0.5*cs*d2;
         T.background = -M_PI*Q*Q/(2.0*volume*s.beta*s.beta);
+        for (int a = 0; a < 3; a++)
+            S[4*a] -= T.background;   // E_bg ~ 1/V
     }
     for (int i = 0; i < n; i++)
         if (top.alpha[i] > 0)
@@ -562,8 +586,12 @@ double Engine::compute(const vector<V3>& positions, const V3 boxIn[3], vector<V3
                 double t = top.covStrength[m]*(g[k]-gu*u[k])/L;
                 F[j][k] -= t;
                 F[i][k] += t;
+                for (int b = 0; b < 3; b++)
+                    S[3*k+b] += t*v[b];
             }
         }
+        for (int k = 0; k < 9; k++)
+            lastStrain[k] = s.ke*S[k];
         for (int i = 0; i < n; i++)
             for (int k = 0; k < 3; k++)
                 (*forces)[i][k] += s.ke*F[i][k];

@@ -58,6 +58,13 @@ public:
     int iterations() const { return lastIterations; }
     double residual() const { return lastResidual; }
     const EnergyTerms& terms() const { return lastTerms; }
+    /**
+     * Strain derivative S_ab = dE/d eps_ab [kJ/mol] of the last compute() with forces (atomic: every
+     * position and the box deformed as r -> (1 + eps) r, induced dipoles fixed (E is variational in
+     * them), covalent dipoles following their bonds).  Row-major 3x3.  GROMACS's virial is
+     * Xi = S^T / 2 (Xi = -1/2 sum r (x) F for pair forces); pressure P = 2/(3V) (E_kin - Xi).
+     */
+    const std::array<double, 9>& strainDerivative() const { return lastStrain; }
     void setTopology(const Topology& top);   // new parameters, same atoms (predictor history kept)
     void resetHistory() { history.clear(); havePos = false; }
     /** Field [e/nm^2] of charges q and dipoles d at every atom (direct + reciprocal + self), for tests. */
@@ -77,6 +84,7 @@ private:
     int lastIterations = 0;
     double lastResidual = 0;
     EnergyTerms lastTerms;
+    std::array<double, 9> lastStrain{};
     // geometry
     std::vector<V3> pos;
     V3 box[3], recip[3];   // recip[k][a] = (H^-1)_{k a}: fractional coordinate a = sum_k r_k recip[k][a]
@@ -91,7 +99,9 @@ private:
     void setup_pme();
     void compute_influence();
     // reciprocal-space potential on the grid of charges q and dipoles d; returns the energy [e^2/nm]
-    double pme_potential(const std::vector<double>* q, const std::vector<V3>& d, std::vector<double>& phi);
+    // with strain != nullptr, adds the strain derivative of the energy at fixed fractional positions and
+    // fixed fractional dipoles: (1/2) sum_m G |F|^2 [-delta + 2 (pi^2/beta^2 + 1/m^2) m m] [e^2/nm]
+    double pme_potential(const std::vector<double>* q, const std::vector<V3>& d, std::vector<double>& phi, double* strain = nullptr);
     void pme_field(const std::vector<double>& phi, std::vector<V3>& E) const;   // adds -grad phi
     std::vector<V3> frac_dipoles(const std::vector<V3>& d) const;
     void solve();
