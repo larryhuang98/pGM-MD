@@ -189,6 +189,10 @@ void CommonCalcPGMForceKernel::initialize(const System& system, const PGMForce& 
         defines["USE_CUTOFF"] = "1";
         defines["EWALD_ALPHA"] = cc.doubleToString(beta);
         defines["PME_ORDER"] = cc.intToString(pmeOrder);
+        // the grid is accumulated in 64-bit fixed point: 2^32 as OpenMM (grid values up to 2^31) in
+        // single / mixed precision; 2^44 in double precision (resolution 6e-14 instead of 2e-10, values
+        // up to 5e5 e, far above any grid value), so the double-precision PME is not limited by it
+        defines["GRID_FIXED_SCALE"] = (cc.getUseDoublePrecision() ? "((real) 17592186044416)" : "((real) 4294967296)");
         defines["GRID_SIZE_X"] = cc.intToString(gridX);
         defines["GRID_SIZE_Y"] = cc.intToString(gridY);
         defines["GRID_SIZE_Z"] = cc.intToString(gridZ);

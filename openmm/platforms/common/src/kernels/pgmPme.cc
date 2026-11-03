@@ -113,7 +113,7 @@ KERNEL void gridSpread(GLOBAL const real4* RESTRICT posq, GLOBAL const real* RES
                     zindex -= (zindex >= GRID_SIZE_Z ? GRID_SIZE_Z : 0);
                     real4 v = theta3[iz];
                     real add = term0*v.x + term1*v.y;
-                    ATOMIC_ADD(&pmeGrid[ybase+zindex], (mm_ulong) realToFixedPoint(add));
+                    ATOMIC_ADD(&pmeGrid[ybase+zindex], (mm_ulong) ((mm_long) (add*GRID_FIXED_SCALE)));
                 }
             }
         }
@@ -122,7 +122,7 @@ KERNEL void gridSpread(GLOBAL const real4* RESTRICT posq, GLOBAL const real* RES
 
 KERNEL void finishSpread(GLOBAL const mm_long* RESTRICT pmeGridLong, GLOBAL real* RESTRICT pmeGrid) {
     const unsigned int gridSize = GRID_SIZE_X*GRID_SIZE_Y*GRID_SIZE_Z;
-    real scale = 1/(real) 0x100000000;
+    real scale = 1/(real) GRID_FIXED_SCALE;
     for (int index = GLOBAL_ID; index < gridSize; index += GLOBAL_SIZE)
         pmeGrid[index] = scale*pmeGridLong[index];
 }
