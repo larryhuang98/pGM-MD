@@ -562,6 +562,54 @@ extern "C" void pgm_gpu_set_options_(int* pred, int* check, int* overlap, int* p
 }
 
 //---------------------------------------------------------------------------------------------
+// pgm_gpu_nb14_gvdw_setup_: 1-4 pairs for Gaussian VDW (igvdw = 1)
+//
+// Called from nb14_setup (extra_pnts_nb14.F90) right after gpu_nb14_setup.  The 1-4 VDW of the
+// AMBER bonded work units is switched off by zeroing its coefficients (pbNb142); the 1-4 GVDW
+// is then computed by kPGMNB14GVDW over the pairs uploaded here.
+//   ij(2,n):   1-based original atom indices;  coef(3,n): A, C6, kappa
+//---------------------------------------------------------------------------------------------
+extern "C" void kPGMNB14GVDW(gpuContext gpu, int npairs, const int* ij, const double* coef);
+static GpuBuffer<int>*    pgm_nb14_ij   = NULL;
+static GpuBuffer<double>* pgm_nb14_coef = NULL;
+static int                pgm_nb14_cnt  = 0;
+extern "C" void pgm_gpu_nb14_gvdw_setup_(int* npairs, int* ij, double* coef)
+{
+  PRINTMETHOD("pgm_gpu_nb14_gvdw_setup");
+  if (gpu->pbNb142 != NULL && gpu->ntf < 8) {
+    int n = *npairs;
+    for (int i = 0; i < n; i++) {
+      gpu->pbNb142->_pSysData[i].x = (PMEDouble)0.0;
+      gpu->pbNb142->_pSysData[i].y = (PMEDouble)0.0;
+    }
+    gpu->pbNb142->Upload();
+  }
+  delete pgm_nb14_ij;   pgm_nb14_ij = NULL;
+  delete pgm_nb14_coef; pgm_nb14_coef = NULL;
+  pgm_nb14_cnt = (gpu->ntf < 8) ? *npairs : 0;
+  if (pgm_nb14_cnt > 0) {
+    pgm_nb14_ij   = new GpuBuffer<int>(2 * pgm_nb14_cnt);
+    pgm_nb14_coef = new GpuBuffer<double>(3 * pgm_nb14_cnt);
+    for (int i = 0; i < pgm_nb14_cnt; i++) {
+      pgm_nb14_ij->_pSysData[2 * i]       = ij[2 * i] - 1;
+      pgm_nb14_ij->_pSysData[2 * i + 1]   = ij[2 * i + 1] - 1;
+      pgm_nb14_coef->_pSysData[3 * i]     = coef[3 * i];
+      pgm_nb14_coef->_pSysData[3 * i + 1] = coef[3 * i + 1];
+      pgm_nb14_coef->_pSysData[3 * i + 2] = coef[3 * i + 2];
+    }
+    pgm_nb14_ij->Upload();
+    pgm_nb14_coef->Upload();
+  }
+}
+
+static void pgm_gpu_run_nb14_gvdw(gpuContext gpu)
+{
+  if (pgm_nb14_cnt > 0) {
+    kPGMNB14GVDW(gpu, pgm_nb14_cnt, pgm_nb14_ij->_pDevData, pgm_nb14_coef->_pDevData);
+  }
+}
+
+//---------------------------------------------------------------------------------------------
 // pgm_gpu_set_pcg_params_: store PCG-specific parameters from Fortran
 //---------------------------------------------------------------------------------------------
 extern "C" void pgm_gpu_set_pcg_params_(int* solv_opt, int* local_niter,
@@ -900,6 +948,7 @@ static void pgm_gpu_run_force_field(gpuContext gpu, double coulomb_const)
     kPGMChainRuleForce(gpu);
     kPGMComputeEnergy(gpu, coulomb_const);
     kPGMScaleForces(gpu, coulomb_const);
+    pgm_gpu_run_nb14_gvdw(gpu);   // after scaling: kcal/mol units
     return;
   }
   kCalculatePMEDirectForce_PGM(gpu);
@@ -923,6 +972,7 @@ static void pgm_gpu_run_force_field(gpuContext gpu, double coulomb_const)
   kPGMChainRuleForce(gpu);
   kPGMComputeEnergy(gpu, coulomb_const);
   kPGMScaleForces(gpu, coulomb_const);
+  pgm_gpu_run_nb14_gvdw(gpu);   // after scaling: kcal/mol units
 }
 
 //---------------------------------------------------------------------------------------------

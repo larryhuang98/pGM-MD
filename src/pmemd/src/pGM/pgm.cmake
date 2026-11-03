@@ -6,7 +6,7 @@ set(PGM_FORTRAN_SOURCES pGM_direct.F90 pGM_induced.F90
     pGM_interface_data_mod.F90 pGM_interface.F90
     pGM_mdin_dat.F90 pGM_mdin.F90
     pGM_multipoles.F90 pGM_readparm.F90
-    pGM_self.F90)
+    pGM_self.F90 pGM_gvdw.F90)
 set(PGM_CUDA_FORTRAN_SOURCES pGM_gpu_interface.F90 pGM_gpu_setup.F90)
 set_property(SOURCE ${PGM_FORTRAN_SOURCES} ${PGM_CUDA_FORTRAN_SOURCES} PROPERTY COMPILE_FLAGS "${PMEMD_FFLAGS_SPC}")
 

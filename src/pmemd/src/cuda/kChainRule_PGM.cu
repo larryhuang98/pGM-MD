@@ -174,3 +174,96 @@ extern "C" void kPGMChainRuleForce(gpuContext gpu)
   kPGMChainRuleForce_kernel<<<nblocks, 256, 0, gpu->pgmStream>>>();
   LAUNCHERROR("kPGMChainRuleForce");
 }
+
+//---------------------------------------------------------------------------------------------
+// kPGMNB14GVDW_kernel: Gaussian VDW for 1-4 pairs (igvdw = 1).
+//
+// With GVDW the 1-4 Lennard-Jones coefficients of the AMBER bonded work units are zeroed in
+// pgm_gpu_nb14_gvdw_setup_ (pgm_gpu.cpp) and the 1-4 VDW is computed here, with the same
+// functional form as the GVDW direct-space pairs (kNLCPNE_PGM.h, PGMPairVDW):
+//   U = A exp(-b y^2) - C6 F(y) / r^6,   y = kappa r   (Slater form: A exp(-b y)).
+// One thread per 1-4 pair.  Pair atoms are in ORIGINAL order; coef = {A, C6, kappa} per pair.
+// Forces go to the bonded force accumulator, energy to the 1-4 VDW energy slot.
+//---------------------------------------------------------------------------------------------
+__global__ void
+__launch_bounds__(256, 4)
+kPGMNB14GVDW_kernel(int npairs, const int* __restrict__ ij, const double* __restrict__ coef)
+{
+  int p = blockIdx.x * blockDim.x + threadIdx.x;
+  double e = 0.0;
+  if (p < npairs) {
+    int i_slot = cSim.pImageAtomLookup[ij[2 * p]];
+    int j_slot = cSim.pImageAtomLookup[ij[2 * p + 1]];
+    double A = coef[3 * p], C6 = coef[3 * p + 1], kap = coef[3 * p + 2];
+    double delx = cSim.pImageX[j_slot] - cSim.pImageX[i_slot];
+    double dely = cSim.pImageY[j_slot] - cSim.pImageY[i_slot];
+    double delz = cSim.pImageZ[j_slot] - cSim.pImageZ[i_slot];
+    double dfx = delx*cSim.recip[0][0] + dely*cSim.recip[1][0] + delz*cSim.recip[2][0];
+    double dfy =                          dely*cSim.recip[1][1] + delz*cSim.recip[2][1];
+    double dfz =                                                   delz*cSim.recip[2][2];
+    dfx -= round(dfx);
+    dfy -= round(dfy);
+    dfz -= round(dfz);
+    delx = cSim.ucellf[0][0]*dfx + cSim.ucellf[0][1]*dfy + cSim.ucellf[0][2]*dfz;
+    dely =                          cSim.ucellf[1][1]*dfy + cSim.ucellf[1][2]*dfz;
+    delz =                                                   cSim.ucellf[2][2]*dfz;
+    double r2 = delx*delx + dely*dely + delz*delz;
+    double rinv = rsqrt(r2);
+    double r2inv = rinv * rinv;
+    double r6 = r2inv * r2inv * r2inv;
+    double y = kap / rinv, y2 = y * y;
+    const double isp = 0.56418958354775628695;          // 1/sqrt(pi)
+    double ey  = exp(-y2);
+    double gx  = (4.0 / 3.0) * isp * y * y2 * ey;
+    double ax  = erf(y) - 2.0 * isp * y * ey - gx;
+    double fx  = ax * ax + 0.5 * gx * gx;
+    double apx = (8.0 / 3.0) * isp * y2 * y2 * ey;
+    double gpx = 4.0 * isp * y2 * (1.0 - (2.0 / 3.0) * y2) * ey;
+    double fpx = 2.0 * ax * apx + gx * gpx;
+    double b = (double)cSim.pgmBRepScale, erep, df;
+    if (cSim.pgmGVDWRepForm == 0) {
+      erep = A * exp(-b * y2);
+      df   = 2.0 * b * kap * kap * erep;
+    }
+    else {
+      erep = A * exp(-b * y);
+      df   = b * kap * erep * rinv;
+    }
+    if (y > 0.01) {
+      e   = erep - C6 * fx * r6;
+      df += C6 * (kap * fpx * rinv - 6.0 * fx * r2inv) * r6;
+    }
+    else {
+      e   = erep - C6 * (8.0 / (9.0 * 3.14159265358979323846)) * kap * kap * kap * kap * kap * kap;
+    }
+    // df = -(dU/dr)/r; force on j is +df*del, on i is -df*del
+    long long int ifx = llrint(df * delx * FORCESCALE);
+    long long int ify = llrint(df * dely * FORCESCALE);
+    long long int ifz = llrint(df * delz * FORCESCALE);
+    atomicAdd((unsigned long long int*)&cSim.pForceXAccumulator[j_slot], llitoulli(ifx));
+    atomicAdd((unsigned long long int*)&cSim.pForceYAccumulator[j_slot], llitoulli(ify));
+    atomicAdd((unsigned long long int*)&cSim.pForceZAccumulator[j_slot], llitoulli(ifz));
+    atomicAdd((unsigned long long int*)&cSim.pForceXAccumulator[i_slot], llitoulli(-ifx));
+    atomicAdd((unsigned long long int*)&cSim.pForceYAccumulator[i_slot], llitoulli(-ify));
+    atomicAdd((unsigned long long int*)&cSim.pForceZAccumulator[i_slot], llitoulli(-ifz));
+  }
+  // block reduction of the energy
+  __shared__ double se[256];
+  se[threadIdx.x] = e;
+  __syncthreads();
+  for (int s = 128; s > 0; s >>= 1) {
+    if (threadIdx.x < s) se[threadIdx.x] += se[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && se[0] != 0.0) {
+    atomicAdd(cSim.pENB14, llitoulli(llrint(se[0] * ENERGYSCALE)));
+  }
+}
+
+extern "C" void kPGMNB14GVDW(gpuContext gpu, int npairs, const int* ij, const double* coef)
+{
+  if (npairs <= 0) return;
+  int nblocks = (npairs + 255) / 256;
+  kPGMNB14GVDW_kernel<<<nblocks, 256, 0, gpu->pgmStream>>>(npairs, ij, coef);
+  LAUNCHERROR("kPGMNB14GVDW");
+}

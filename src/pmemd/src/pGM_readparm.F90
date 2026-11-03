@@ -6,10 +6,6 @@
 subroutine POL_GAUSS_readparm(nf, natom)
 
    use mdin_ctrl_dat_mod, only : ipgm
-   use pol_gauss_mdin_dat_mod, only : igvdw
-   use prmtop_dat_mod, only : nphih, nphia
-   use file_io_dat_mod, only : mdout
-   use pmemd_lib_mod, only : mexit
    use pol_gauss_induced, only : pGM_INDUCED_readparm, polarizability
    use pol_gauss_multipoles_mod, only : pGM_MPOLE_readparm, covalent_monop, covalent_ptr, &
                                         covalent_atm, covalent_dip, r_gauss, b_polar
@@ -29,14 +25,6 @@ if (master) then
 #endif
 
    call POL_GAUSS_check_parm_legal(nf, ipgm)
-
-   ! GVDW is implemented for the nonbonded pair list only; 1-4 pairs would be
-   ! evaluated with the Lennard-Jones form in the bonded code, so stop for now.
-   if (igvdw .eq. 1 .and. (nphih + nphia) .gt. 0) then
-      write(mdout,'(a)') ' pGM: igvdw = 1 (Gaussian VDW) is not yet supported for topologies'
-      write(mdout,'(a)') '      with dihedrals (1-4 pairs); use igvdw = 0 (Lennard-Jones).'
-      call mexit(mdout, 1)
-   end if
 
    mpole_valid = pGM_MPOLE_readparm(nf, natom)
 

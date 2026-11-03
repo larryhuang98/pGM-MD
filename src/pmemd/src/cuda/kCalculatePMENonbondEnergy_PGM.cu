@@ -30,6 +30,7 @@
 
 #include "simulationConst.h"
 CSIM_STO simulationConst cSim;
+#include "kPGMPairVDW_PGM.h"
 
 #ifdef PGM_DEBUG_PAIR_COUNTS
 // Pair counters for diagnostics
