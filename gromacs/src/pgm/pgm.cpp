@@ -18,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <unordered_set>
 #include <vector>
 
 #include "gromacs/fft/fft.h"
@@ -41,6 +42,9 @@
 #include "gromacs/utility/gmxassert.h"
 #include "gromacs/utility/gmxmpi.h"
 #include "gromacs/utility/gmxomp.h"
+#include "gromacs/utility/listoflists.h"
+
+#include "gvdw_kernel.h" // the GVDW pair (pgm-native core/, copied next to this file)
 
 namespace gmx
 {
@@ -184,6 +188,7 @@ public:
                    ArrayRef<const real>          charges,
                    const nonbonded_verlet_t&     nbv,
                    const InteractionDefinitions& idef,
+                   const ListOfLists<int>&       exclusions,
                    ArrayRef<const RVec>          shiftVectors,
                    ArrayRef<const int>           globalIndex,
                    ForceWithVirial*              forceWithVirial,
@@ -191,6 +196,58 @@ public:
 
     // settings
     double rc_, beta_, ke_, tol_, peek_;
+
+    // GVDW (Gaussian-density van der Waals): per local atom sqrt(A), sqrt(C6), b; pair overrides
+    bool                 gvdw_ = false;
+    int                  gvdwRep_ = pgmcore::GVDWSlater;
+    double               rvdw_ = 0;
+    DispersionCorrectionType dispCorr_ = DispersionCorrectionType::No;
+    std::vector<double>  gvdwA_, gvdwC_, gvdwB_;
+    std::vector<char>    gvdwActive_;
+    struct GvdwPair
+    {
+        int    i, j;
+        double A, C6, B;
+    };
+    std::vector<GvdwPair>        gvdwPairs_;   // [ pgm_gvdw_pairs ]: replace the rule, any distance
+    std::unordered_set<int64_t> gvdwPairSet_; // their keys i*n+j (i < j)
+    const ListOfLists<int>*      excls_ = nullptr;
+    // per call: GVDW forces (per thread, reduced into [0]), energies and strain
+    std::vector<std::vector<DVec>> gvdwForce_;
+    double                         gvdwEnergy_ = 0, gvdwPairEnergy_ = 0, gvdwTail_ = 0;
+    double                         gvdwS_[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    void                           gvdwOverridesAndTail();
+    //! one combination-rule GVDW pair of the pair loop (x = r_i - r_j + shift): skips excluded and overridden pairs
+    void gvdwPairInLoop(int ai, int aj, const DVec& x, double r2, std::vector<DVec>& F, double* sum) const
+    {
+        for (const int e : (*excls_)[ai])
+        {
+            if (e == aj)
+            {
+                return;
+            }
+        }
+        if (!gvdwPairSet_.empty()
+            && gvdwPairSet_.count(static_cast<int64_t>(std::min(ai, aj)) * n_ + std::max(ai, aj)))
+        {
+            return;
+        }
+        const double r   = std::sqrt(r2);
+        const double bij = 1.0 / std::sqrt(2.0 * (radius_[ai] * radius_[ai] + radius_[aj] * radius_[aj]));
+        double       dEdR;
+        sum[0] += pgmcore::gvdwPair(
+                r, bij, gvdwA_[ai] * gvdwA_[aj], gvdwC_[ai] * gvdwC_[aj], 0.5 * (gvdwB_[ai] + gvdwB_[aj]), gvdwRep_, dEdR);
+        for (int k = 0; k < DIM; k++)
+        {
+            const double fk = dEdR * x[k]; // force on i; dU/dx_k = -fk
+            F[ai][k] += fk;
+            F[aj][k] -= fk;
+            for (int b = 0; b < DIM; b++)
+            {
+                sum[1 + 3 * k + b] -= fk * x[b];
+            }
+        }
+    }
     int    grid_[DIM], order_, maxIter_, predictor_;
     bool   polarizable_ = true;
 
@@ -322,6 +379,9 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
     peek_      = ir.pgm_peek;
     predictor_ = ir.pgm_predictor;
     order_     = ir.pme_order;
+    rvdw_      = ir.rvdw;
+    gvdwRep_   = (ir.pgm_gvdw_rep_form == 0 ? pgmcore::GVDWGaussian : pgmcore::GVDWSlater);
+    dispCorr_  = ir.eDispCorr;
     grid_[XX]  = ir.nkx;
     grid_[YY]  = ir.nky;
     grid_[ZZ]  = ir.nkz;
@@ -336,7 +396,8 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
                 "\npGM electrostatics (G1, CPU; double-precision kernels, PME grid in real):\n"
                 "  rcoulomb %g nm, Ewald coefficient %.10g 1/nm, PME grid %d x %d x %d, order %d\n"
                 "  Coulomb constant %.10g, dipole tolerance %g, max. iterations %d, predictor %d, "
-                "peek %g\n\n",
+                "peek %g\n  GVDW (if the topology has [ pgm_gvdw ]): rvdw %g nm, %s repulsion, dispersion "
+                "correction %s\n\n",
                 rc_,
                 beta_,
                 grid_[XX],
@@ -347,7 +408,10 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
                 tol_,
                 maxIter_,
                 predictor_,
-                peek_);
+                peek_,
+                rvdw_,
+                gvdwRep_ == pgmcore::GVDWSlater ? "Slater" : "Gaussian",
+                enumValueToString(dispCorr_));
     }
 }
 
@@ -454,6 +518,34 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         covPartner_.push_back(ilDip.iatoms[k + 2]);
     }
     polarizable_ = std::any_of(alpha_.begin(), alpha_.end(), [](double a) { return a > 0; });
+
+    // GVDW
+    gvdwA_.assign(n, 0.0);
+    gvdwC_.assign(n, 0.0);
+    gvdwB_.assign(n, 0.0);
+    gvdwActive_.assign(n, 0);
+    const auto& ilGvdw = idef.il[InteractionFunction::PgmGvdwAtom];
+    for (int k = 0; k < ilGvdw.size(); k += 2)
+    {
+        const t_iparams& ip = idef.iparams[ilGvdw.iatoms[k]];
+        const int        a  = ilGvdw.iatoms[k + 1];
+        gvdwA_[a]           = ip.pgmGvdwAtom.sqrtA;
+        gvdwC_[a]           = ip.pgmGvdwAtom.sqrtC6;
+        gvdwB_[a]           = ip.pgmGvdwAtom.b;
+        gvdwActive_[a]      = (gvdwA_[a] != 0 || gvdwC_[a] != 0);
+    }
+    gvdwPairs_.clear();
+    gvdwPairSet_.clear();
+    const auto& ilGvdwPair = idef.il[InteractionFunction::PgmGvdwPair];
+    for (int k = 0; k < ilGvdwPair.size(); k += 3)
+    {
+        const t_iparams& ip = idef.iparams[ilGvdwPair.iatoms[k]];
+        const int        i = std::min(ilGvdwPair.iatoms[k + 1], ilGvdwPair.iatoms[k + 2]);
+        const int        j = std::max(ilGvdwPair.iatoms[k + 1], ilGvdwPair.iatoms[k + 2]);
+        gvdwPairs_.push_back({ i, j, ip.pgmGvdwPair.A, ip.pgmGvdwPair.C6, ip.pgmGvdwPair.B });
+        gvdwPairSet_.insert(static_cast<int64_t>(i) * n + j);
+    }
+    gvdw_ = !ilGvdw.empty() || !ilGvdwPair.empty();
     if (static_cast<int>(mu_.size()) != n)
     {
         perm_.assign(n, DVec{ 0, 0, 0 });
@@ -506,6 +598,13 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
                                          ArrayRef<const RVec>      shiftVectors)
 {
     const double rc2   = rc_ * rc_;
+    const double rvdw2 = rvdw_ * rvdw_;
+    double       gvdwSum[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    gvdwForce_.resize(nt_);
+    for (auto& v : gvdwForce_)
+    {
+        v.assign(gvdw_ ? n_ : 0, DVec{ 0, 0, 0 });
+    }
     const auto&  lists = nbv.pairlistSets().pairlistSet(InteractionLocality::Local).cpuLists();
     if (lists.empty())
     {
@@ -538,7 +637,9 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
         // fill a local vector (no false sharing of the vector headers in pairs_), keep its capacity
         std::vector<Pair> pairs;
         pairs.swap(pairs_[gmx_omp_get_thread_num()]);
-        double Bb[4];
+        double             Bb[4];
+        std::vector<DVec>& Fg = gvdwForce_[gmx_omp_get_thread_num()];
+        double             sum[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // GVDW energy, strain (9)
 #pragma omp for schedule(dynamic, 8)
         for (int item = 0; item < numItems; item++)
         {
@@ -547,7 +648,14 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
             const int               naci = nbl.na_ci, nacj = nbl.na_cj;
             const int  ish     = ciEntry.shift & NBNXN_CI_SHIFT;
             const bool central = (ish == c_centralShiftIndex);
-            const DVec sv(shiftVectors[ish][XX], shiftVectors[ish][YY], shiftVectors[ish][ZZ]);
+            // the shift in double from the box (shiftVectors holds the same in real)
+            const IVec t = shiftIndexToXYZ(ish);
+            DVec       sv;
+            for (int d = 0; d < DIM; d++)
+            {
+                sv[d] = t[XX] * box_[XX][d] + t[YY] * box_[YY][d] + t[ZZ] * box_[ZZ][d];
+            }
+            GMX_UNUSED_VALUE(shiftVectors);
             const int  i0 = ciEntry.ci * naci;
             for (int cjIndex = ciEntry.cj_ind_start; cjIndex < ciEntry.cj_ind_end; cjIndex++)
             {
@@ -577,6 +685,10 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
                             p.x[d] = (static_cast<double>(x[ai][d]) + sv[d]) - static_cast<double>(x[aj][d]);
                         }
                         const double r2 = dot3(p.x, p.x);
+                        if (gvdw_ && gvdwActive_[ai] && gvdwActive_[aj] && r2 < rvdw2)
+                        {
+                            gvdwPairInLoop(ai, aj, p.x, r2, Fg, sum);
+                        }
                         if (r2 >= rc2)
                         {
                             continue;
@@ -597,6 +709,75 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
             }
         }
         pairs.swap(pairs_[gmx_omp_get_thread_num()]);
+        for (int k = 0; k < 10; k++)
+        {
+#pragma omp atomic
+            gvdwSum[k] += sum[k];
+        }
+    }
+    gvdwEnergy_ = gvdwSum[0];
+    for (int k = 0; k < 9; k++)
+    {
+        gvdwS_[k] = gvdwSum[1 + k];
+    }
+    // reduce the GVDW forces into thread 0's buffer
+    if (gvdw_)
+    {
+#pragma omp parallel for num_threads(nt_) schedule(static)
+        for (int i = 0; i < n_; i++)
+        {
+            for (int t = 1; t < nt_; t++)
+            {
+                gvdwForce_[0][i] += gvdwForce_[t][i];
+            }
+        }
+    }
+}
+
+void PgmElectrostatics::Impl::gvdwOverridesAndTail()
+{
+    gvdwPairEnergy_ = 0;
+    gvdwTail_       = 0;
+    if (!gvdw_)
+    {
+        return;
+    }
+    std::vector<DVec>& F = gvdwForce_[0];
+    for (const GvdwPair& p : gvdwPairs_)
+    {
+        DVec x = pos_[p.i] - pos_[p.j];
+        minImage(x);
+        const double r   = std::sqrt(dot3(x, x));
+        const double bij = 1.0 / std::sqrt(2.0 * (radius_[p.i] * radius_[p.i] + radius_[p.j] * radius_[p.j]));
+        double       dEdR;
+        gvdwPairEnergy_ += pgmcore::gvdwPair(r, bij, p.A, p.C6, p.B, gvdwRep_, dEdR);
+        for (int k = 0; k < DIM; k++)
+        {
+            const double fk = dEdR * x[k];
+            F[p.i][k] += fk;
+            F[p.j][k] -= fk;
+            for (int b = 0; b < DIM; b++)
+            {
+                gvdwS_[3 * k + b] -= fk * x[b];
+            }
+        }
+    }
+    // dispersion tail (Amber vdwmeth = 1 for the C6 term; GROMACS's DispCorr adds the LJ part)
+    if (dispCorr_ != DispersionCorrectionType::No)
+    {
+        double sumC = 0;
+        for (int i = 0; i < n_; i++)
+        {
+            sumC += gvdwC_[i];
+        }
+        gvdwTail_ = pgmcore::gvdwTail(sumC, volume_, rvdw_);
+        if (dispCorr_ == DispersionCorrectionType::EnerPres || dispCorr_ == DispersionCorrectionType::AllEnerPres)
+        {
+            for (int a = 0; a < DIM; a++)
+            {
+                gvdwS_[4 * a] -= gvdwTail_; // E ~ 1/V: dE/d eps_aa = -E
+            }
+        }
     }
 }
 
@@ -1102,11 +1283,13 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
                                         ArrayRef<const real>          charges,
                                         const nonbonded_verlet_t&     nbv,
                                         const InteractionDefinitions& idef,
+                                        const ListOfLists<int>&       exclusions,
                                         ArrayRef<const RVec>          shiftVectors,
                                         ArrayRef<const int>           globalIndex,
                                         ForceWithVirial*              forceWithVirial,
                                         gmx_enerdata_t*               enerd)
 {
+    excls_ = &exclusions;
     // the local atom order changes at repartitioning (also on a single rank): parameters are read
     // from the local topology at every call, the predictor history is kept in the global order
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
@@ -1127,6 +1310,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     permanentDipoles();
     double t0 = now();
     buildPairs(xIn, nbv, shiftVectors);
+    gvdwOverridesAndTail();
     const double tPairs1 = now();
     tPairs_ += tPairs1 - t0;
     for (const auto& v : pairs_)
@@ -1369,6 +1553,36 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::CoulombSR][0] += ke_ * direct;
     enerd->term[InteractionFunction::CoulombReciprocalSpace] += ke_ * (reciprocal + self + background);
     enerd->term[InteractionFunction::PgmAtom] += ke_ * polarization;
+    if (gvdw_)
+    {
+        const std::vector<DVec>& Fg = gvdwForce_[0];
+        for (int i = 0; i < n_; i++)
+        {
+            for (int k = 0; k < DIM; k++)
+            {
+                f[i][k] += Fg[i][k];
+            }
+        }
+        matrix virG;
+        for (int a = 0; a < DIM; a++)
+        {
+            for (int b = 0; b < DIM; b++)
+            {
+                virG[a][b] = 0.5 * gvdwS_[3 * b + a];
+            }
+        }
+        forceWithVirial->addVirialContribution(virG);
+        enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::LJSR][0] += gvdwEnergy_;
+        enerd->term[InteractionFunction::PgmGvdwPair] += gvdwPairEnergy_;
+        if (dispCorr_ != DispersionCorrectionType::No)
+        {
+            enerd->term[InteractionFunction::DispersionCorrection] += gvdwTail_;
+            if (dispCorr_ == DispersionCorrectionType::EnerPres || dispCorr_ == DispersionCorrectionType::AllEnerPres)
+            {
+                enerd->term[InteractionFunction::PressureDispersionCorrection] += c_presfac * gvdwTail_ / volume_;
+            }
+        }
+    }
 
     static const char* dump = std::getenv("GMX_PGM_DUMP");
     if (dump && numCalls_ == 1)
@@ -1418,6 +1632,22 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             fprintf(fp, "%d %d %.17g\n", globalIndex_.empty() ? a : globalIndex_[a],
                     globalIndex_.empty() ? b : globalIndex_[b], covStrength_[m]);
         }
+        if (gvdw_)
+        {
+            fprintf(fp,
+                    "# GVDW: energy (pairs) energy (overrides) energy (tail) [kJ/mol]; virial (3x3); per atom "
+                    "(global order) force [kJ/mol/nm]\n%.17g %.17g %.17g\n",
+                    gvdwEnergy_, gvdwPairEnergy_, gvdwTail_);
+            for (int a = 0; a < DIM; a++)
+            {
+                fprintf(fp, "%.17g %.17g %.17g\n", 0.5 * gvdwS_[a], 0.5 * gvdwS_[3 + a], 0.5 * gvdwS_[6 + a]);
+            }
+            for (int g = 0; g < n_; g++)
+            {
+                const int i = localOf[g];
+                fprintf(fp, "%.17g %.17g %.17g\n", gvdwForce_[0][i][XX], gvdwForce_[0][i][YY], gvdwForce_[0][i][ZZ]);
+            }
+        }
         std::fclose(fp);
     }
 }
@@ -1437,13 +1667,14 @@ void PgmElectrostatics::calculate(ArrayRef<const RVec>          x,
                                   ArrayRef<const real>          charges,
                                   const nonbonded_verlet_t&     nbv,
                                   const InteractionDefinitions& idef,
+                                  const ListOfLists<int>&       exclusions,
                                   ArrayRef<const RVec>          shiftVectors,
                                   ArrayRef<const int>           globalIndex,
                                   ForceWithVirial*              forceWithVirial,
                                   gmx_enerdata_t*               enerd,
                                   const StepWorkload& /*stepWork*/)
 {
-    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, shiftVectors, globalIndex, forceWithVirial, enerd);
+    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex, forceWithVirial, enerd);
 }
 
 ArrayRef<const DVec> PgmElectrostatics::inducedDipoles() const

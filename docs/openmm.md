@@ -173,7 +173,7 @@ mixed (pocl), 1 fs, 0.8 nm, beta 4, 48^3, tol 1e-5, mu4, peek 0.65: total energy
 * **Serialization**: proxies write `version`; a new property must be read with a default so that old
   files stay readable.
 * **Shared code**: `core/gvdw_kernel.h` and `core/pgm_constants.h` are header-only and meant for every
-  engine (the GROMACS module will include them for GVDW); `pgm_core` is the reference all ports are
+  engine (the GROMACS module includes `gvdw_kernel.h` for its GVDW); `pgm_core` is the reference all ports are
   checked against.
 * Not yet: alchemical lambda / energy parameter derivatives, per-term energies and the strain
   derivative in the API, quadrupoles, charge flux, external fields, virtual sites.
@@ -188,4 +188,4 @@ mixed (pocl), 1 fs, 0.8 nm, beta 4, 48^3, tol 1e-5, mu4, peek 0.65: total energy
   about 1e-6 are not reached reliably in mixed precision (use double precision for tight tolerances).
 * The GPU CG runs in one work group (at most 512 threads, fewer if the device allows fewer): fine for
   thousands of atoms, a bottleneck for very large systems.
-* Not implemented yet: quadrupoles, charge flux, DE van der Waals, GVDW in GROMACS, virtual sites, external fields; the strain derivative is computed by pgm_core but not exposed.
+* Not implemented yet: quadrupoles, charge flux, DE van der Waals, virtual sites, external fields; the strain derivative is computed by pgm_core but not exposed.

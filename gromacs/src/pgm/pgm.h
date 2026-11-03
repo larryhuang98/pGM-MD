@@ -9,6 +9,10 @@
  * Phase G1: scalar CPU implementation (double-precision kernels), single rank, the reference of the SIMD and
  * GPU kernels.  Forces go to the ForceWithVirial buffer with the analytical strain derivative as the
  * virial.
+ *
+ * GVDW (Gaussian-density van der Waals, pmemd-pgm igvdw = 1), if the topology has [ pgm_gvdw ]: pairs
+ * within rvdw over the same pair lists, the topology's exclusions applied, [ pgm_gvdw_pairs ] overrides,
+ * the C6 dispersion tail with DispCorr; energy in LJ (SR) / "GVDW pairs" / Disper. corr.
  */
 #ifndef GMX_PGM_PGM_H
 #define GMX_PGM_PGM_H
@@ -29,6 +33,8 @@ namespace gmx
 {
 class ForceWithVirial;
 class StepWorkload;
+template<typename>
+class ListOfLists;
 struct nonbonded_verlet_t;
 
 class PgmElectrostatics
@@ -50,7 +56,8 @@ public:
      * \param numHomeAtoms   number of home atoms
      * \param charges        atom charges (the pGM Gaussian monopoles)
      * \param nbv            the nonbonded setup with the current local CPU pair lists
-     * \param idef           local topology: InteractionFunction::PgmAtom and PgmCovalentDipole lists
+     * \param idef           local topology: the PgmAtom, PgmCovalentDipole, PgmGvdwAtom, PgmGvdwPair lists
+     * \param exclusions     local exclusions (they act on GVDW as on LJ; pGM electrostatics have none)
      * \param shiftVectors   the periodic shift vectors of the pair lists
      * \param globalIndex    global index of each local atom (empty: local = global), for the predictor
      */
@@ -60,6 +67,7 @@ public:
                    ArrayRef<const real>      charges,
                    const nonbonded_verlet_t& nbv,
                    const InteractionDefinitions& idef,
+                   const ListOfLists<int>&   exclusions,
                    ArrayRef<const RVec>      shiftVectors,
                    ArrayRef<const int>       globalIndex,
                    ForceWithVirial*          forceWithVirial,

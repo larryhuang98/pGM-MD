@@ -149,6 +149,44 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
   forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels
   per pair in double; the PME is a plain per-thread-grid spread / FFT / gather.  Speed is G2's job.
 
+### GVDW (done)
+
+The Gaussian-density van der Waals of pmemd-pgm (`igvdw = 1`; OpenMM's `GVDWForce`), computed in
+`src/gromacs/pgm` with the shared pair function `core/gvdw_kernel.h` (copied next to the module by
+`g1_install.sh`; patch stage `g2_gvdw.py`):
+
+* topology: `[ pgm_gvdw ]` (atom, funct 1, sqrtA [sqrt(kJ/mol)], sqrtC6 [sqrt(kJ/mol nm^6)], b) and
+  `[ pgm_gvdw_pairs ]` (ai, aj, funct 1, A, C6, B: replaces the combination rule for that pair, at any
+  distance, minimum image), interaction functions `PgmGvdwAtom` / `PgmGvdwPair`, tpr version
+  `tpxv_PgmGvdw`; the radius is the atom's `[ pgm_atoms ]` radius, so GVDW needs coulombtype = pGM;
+* mdp: `pgm-gvdw-rep-form` = 1 (Slater A exp(-B y), default) or 0 (Gaussian A exp(-B y^2)); `rvdw` is
+  the GVDW cutoff (plain cut, as pmemd); `DispCorr` != no adds the C6 tail -2 pi (sum c)^2/(3 V rvdw^3)
+  (Amber vdwmeth = 1) to GROMACS's LJ correction, with its virial and "Pres. DC" for EnerPres
+  (sim_util's DispCorr now adds instead of assigning);
+* pairs: the same nbnxm pair loop as the pGM direct sum, pairs within rvdw of atoms with a or c != 0,
+  the topology's exclusions applied (as for LJ: `gmx_localtop_t::excls`), overridden pairs skipped;
+  forces and virial into ForceWithVirial; energies: LJ (SR) (combination rule), "GVDW pairs"
+  (overrides), Disper. corr. (tail);
+* converter: `prmtop_to_gmx.py --gvdw slater|gauss [--gvdw-params A_kcal C6_kcalA6 b]` writes pmemd's
+  global parameters as `[ pgm_gvdw ]` on every atom with LJ epsilon > 0 and zeroes the atom types'
+  epsilon (molecules with 1-4 pairs not yet: their LJ would come from the zeroed types).
+
+Validation (`tests/gmx/gvdw_sp.sh`, `gvdw_extra.sh`, `tests/compare_gmx_gvdw.py`; the GVDW manuscript's
+512-water box, rvdw 1.0 nm, against an independent NumPy sum and pmemd-pgm):
+
+| | Slater | Gaussian |
+|---|---|---|
+| gmx_d energy vs NumPy | 3e-11 relative | 6e-11 |
+| gmx_d vs pmemd-pgm VDWAALS (kcal/mol) | -2e-5 | -4e-5 |
+| gmx_d forces / virial max diff (kJ/mol/nm, kJ/mol) | 1e-8 / 2e-7 | 2e-8 / 4e-7 |
+| gmx (mixed) energy vs NumPy | 9e-8 (float parameters in the tpr) | 4e-7 |
+| gmx (mixed) forces max diff | 5e-5 | 9e-5 |
+
+Overrides (an O-H pair of every water, A 300, C6 0.002, B 1.5) to 1e-15, the tail -88.19541348 kJ/mol =
+formula = OpenMM's, Pres. DC = E/V.  NVE (mixed, pGM + GVDW Slater, 1 fs, 4 ps, tol 1e-5, mu4, peek 0.65):
+total energy fluctuation 0.33 kJ/mol, drift -0.21 kJ/mol over 4 ps; 4.0 CG iterations; 4.6 ns/day.
+Direct-space shifts are now built in double from the box (mixed builds: forces 25x closer to double).
+
 ### G2 plan (next)
 
 Measured costs of the G1 reference (above) set the order:

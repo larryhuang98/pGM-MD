@@ -25,6 +25,9 @@ EDITS = [
      "        if (simulationWork.havePpDomainDecomposition || simulationWork.useMts)\n        {\n"
      '            gmx_fatal(FARGS, "coulombtype = pGM does not support domain decomposition or multiple time stepping yet");\n'
      "        }\n"
+     "        if (simulationWork.useGpuNonbonded)\n        {\n"
+     '            gmx_fatal(FARGS, "coulombtype = pGM needs the nonbonded interactions on the CPU (mdrun -nb cpu)");\n'
+     "        }\n"
      "        forcerec->pgm = std::make_unique<gmx::PgmElectrostatics>(inputrec, fplog);\n    }\n"),
     # ---------------------------------------------------------------- do_force
     ("src/gromacs/mdlib/sim_util.cpp",

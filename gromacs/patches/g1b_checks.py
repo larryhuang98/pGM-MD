@@ -2,7 +2,6 @@
 
 * grompp: every atom needs a [ pgm_atoms ] entry; 1-4 pairs must not carry electrostatics (fudgeQQ = 0,
   no pair type 2 / pairs_nb), since the pGM sum over all pairs already contains them.
-* mdrun: fatal error for GPU nonbonded (the pGM pair kernels run on the CPU lists until phase G3).
 * energy output: no "pGM Cov. Dip." term (a data list without energy).
 """
 
@@ -24,12 +23,6 @@ EDITS = [
      '                    "coulombtype = pGM: 1-4 pairs must carry Lennard-Jones only (fudgeQQ = 0, no pair "\n'
      '                    "type 2 or [ pairs_nb ]): the pGM electrostatics already include all pairs");\n'
      "        }\n    }\n"),
-    ("src/gromacs/mdlib/forcerec.cpp",
-     "        forcerec->pgm = std::make_unique<gmx::PgmElectrostatics>(inputrec, fplog);\n",
-     "        if (simulationWork.useGpuNonbonded)\n        {\n"
-     '            gmx_fatal(FARGS, "coulombtype = pGM needs the nonbonded interactions on the CPU (mdrun -nb cpu)");\n'
-     "        }\n"
-     "        forcerec->pgm = std::make_unique<gmx::PgmElectrostatics>(inputrec, fplog);\n"),
     ("src/gromacs/mdlib/energyoutput.cpp",
      "    bEner_[InteractionFunction::LennardJonesCoulombNonBondedPairs] = false;\n",
      "    bEner_[InteractionFunction::LennardJonesCoulombNonBondedPairs] = false;\n"
