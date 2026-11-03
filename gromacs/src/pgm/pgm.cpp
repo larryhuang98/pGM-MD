@@ -21,6 +21,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "gromacs/domdec/domdec_internal.h"
+#include "gromacs/domdec/domdec_struct.h"
 #include "gromacs/fft/fft.h"
 #include "gromacs/fft/parallel_3dfft.h"
 #include "gromacs/math/gmxcomplex.h"
@@ -141,9 +143,33 @@ public:
                    const ListOfLists<int>&       exclusions,
                    ArrayRef<const RVec>          shiftVectors,
                    ArrayRef<const int>           globalIndex,
+                   const gmx_domdec_t*           dd,
                    ForceWithVirial*              forceWithVirial,
                    gmx_enerdata_t*               enerd,
                    bool                          doPairSearch);
+
+    /* Domain decomposition (G4).  Local atoms 0..nHome_-1 are this rank's home atoms, nHome_..n_-1
+     * the halo (the DD zones), whose coordinates and charges GROMACS has communicated.  The pairs of the
+     * local and non-local nbnxm lists are each on exactly one rank; per-atom data the pairs need on
+     * the halo (radii, GVDW parameters, dipoles) are broadcast from the owners, partial sums on the halo
+     * (fields, permanent dipoles, forces) are reduced back to them.  The CG vectors and the PME live on
+     * the home atoms; the PME grid is summed over the ranks and every rank does the (small) FFT; scalar
+     * sums and the predictor history (global order) are reduced over the ranks.  dd_ = nullptr: one
+     * rank, all of this is the identity. */
+    const gmx_domdec_t* dd_     = nullptr;
+    int                 nHome_  = 0;
+    int                 nGlobal_ = 0;
+    bool                isMain_ = true; // energies and virial terms computed redundantly on every rank count here only
+    //! the owners' values on the halo atoms (as dd_move_x, no shift)
+    void haloBroadcast(std::vector<DVec>& v) const;
+    //! add the halo atoms' values to their owners' (as dd_move_f); the halo entries are then undefined
+    void haloReduce(std::vector<DVec>& v) const;
+    void sendRecv(int dimIndex, bool forward, std::vector<DVec>& send, std::vector<DVec>& recv) const;
+    //! sum over the PP ranks (in place)
+    void sumAll(double* data, int count) const;
+    double maxAll(double v) const;
+    //! global index of local atom i
+    int globalOf(int i) const { return globalIndex_.empty() ? i : globalIndex_[i]; }
 
     // settings
     double rc_, beta_, ke_, tol_, peek_;
@@ -161,7 +187,7 @@ public:
         double A, C6, B;
     };
     std::vector<GvdwPair>        gvdwPairs_;   // [ pgm_gvdw_pairs ]: replace the rule, any distance
-    std::unordered_set<int64_t> gvdwPairSet_; // their keys i*n+j (i < j)
+    std::unordered_set<int64_t> gvdwPairSet_; // their keys gi*N+gj (global indices, gi < gj; of all ranks)
     const ListOfLists<int>*      excls_ = nullptr;
     // per call: GVDW forces (per thread, reduced into [0]), energies and strain
     std::vector<std::vector<DVec>> gvdwForce_;
@@ -182,8 +208,8 @@ public:
                 return false;
             }
         }
-        return gvdwPairSet_.empty()
-               || gvdwPairSet_.count(static_cast<int64_t>(std::min(ai, aj)) * n_ + std::max(ai, aj)) == 0;
+        const int64_t gi = globalOf(ai), gj = globalOf(aj);
+        return gvdwPairSet_.empty() || gvdwPairSet_.count(std::min(gi, gj) * nGlobal_ + std::max(gi, gj)) == 0;
     }
     //! one combination-rule GVDW pair of the pair loop (x = r_i - r_j + shift)
     void gvdwPairInLoop(int ai, int aj, const DVec& x, double r2, std::vector<DVec>& F, double* sum) const
@@ -239,6 +265,10 @@ public:
     bool                            haveCandidates_ = false;
     //! the candidate pairs from the current nbnxm lists (at pair-search steps)
     void searchCandidates(const nonbonded_verlet_t& nbv);
+    //! GMX_PGM_CHECK_PAIRS: compare the number of pairs within rc (all ranks) with all pairs, each step (O(N^2))
+    bool checkPairs_ = (std::getenv("GMX_PGM_CHECK_PAIRS") != nullptr);
+    long numPairErrors_ = 0;
+    void checkPairCount();
 
     // OpenMP: per-thread scratch for the scatter loops
     int                              nt_ = 1;
@@ -299,7 +329,7 @@ public:
     std::vector<double>  theta_[DIM], dtheta_[DIM], d2theta_[DIM];
     std::vector<double>  phi_; // reciprocal potential on the padded grid (nx*ny*kzPad_, see padIndex)
 
-    void setTopology(int n, ArrayRef<const real> charges, const InteractionDefinitions& idef);
+    void setTopology(ArrayRef<const real> charges, const InteractionDefinitions& idef, bool topologyChanged);
     void setBox(const matrix box);
     void buildPairs();
     void minImage(DVec& v) const;
@@ -309,32 +339,26 @@ public:
     std::vector<DVec> fractionalDipoles(const std::vector<DVec>& d) const;
     double pmePotential(const std::vector<double>* q, const std::vector<DVec>& d, double* strain);
     void   pmeField(std::vector<DVec>& E);
-    std::vector<DVec> field(const std::vector<double>* q, const std::vector<DVec>& d);
+    //! the field at the home atoms of the charges q (nullptr: none) and the home atoms' dipoles dHome
+    std::vector<DVec> field(const std::vector<double>* q, const std::vector<DVec>& dHome);
     void              solve();
-    //! local -> global order (history), and back
+    //! the home atoms' values of all ranks in the global order (summed over the ranks), and back
     std::vector<DVec> toGlobal(const std::vector<DVec>& v) const
     {
-        if (globalIndex_.empty())
+        std::vector<DVec> g(nGlobal_, DVec{ 0, 0, 0 });
+        for (int i = 0; i < nHome_; i++)
         {
-            return v;
+            g[globalOf(i)] = v[i];
         }
-        std::vector<DVec> g(n_);
-        for (int i = 0; i < n_; i++)
-        {
-            g[globalIndex_[i]] = v[i];
-        }
+        sumAll(reinterpret_cast<double*>(g.data()), 3 * nGlobal_);
         return g;
     }
     std::vector<DVec> toLocal(const std::vector<DVec>& g) const
     {
-        if (globalIndex_.empty())
+        std::vector<DVec> v(n_, DVec{ 0, 0, 0 });
+        for (int i = 0; i < nHome_; i++)
         {
-            return g;
-        }
-        std::vector<DVec> v(n_);
-        for (int i = 0; i < n_; i++)
-        {
-            v[i] = g[globalIndex_[i]];
+            v[i] = g[globalOf(i)];
         }
         return v;
     }
@@ -425,6 +449,10 @@ PgmElectrostatics::Impl::~Impl()
                     numCandidates_ / std::max(1.0, numSearches_), numSearches_, numPairs_ / numCalls_, nt_);
         }
     }
+    if (checkPairs_)
+    {
+        fprintf(stderr, "pGM pair check: %ld of %ld calls with missing or extra pairs\n", numPairErrors_, numCalls_);
+    }
     if (fft_)
     {
         gmx_parallel_3dfft_destroy(fft_); // frees fft_
@@ -475,9 +503,12 @@ void PgmElectrostatics::Impl::fftExecute(gmx_fft_direction dir)
     }
 }
 
-void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, const InteractionDefinitions& idef)
+void PgmElectrostatics::Impl::setTopology(ArrayRef<const real>          charges,
+                                          const InteractionDefinitions& idef,
+                                          bool                          topologyChanged)
 {
-    n_ = n;
+    // n_ (local atoms, home + halo) and nHome_ are set; the per-atom interactions are on the owner
+    const int n = n_;
     q_.assign(charges.begin(), charges.begin() + n);
     radius_.assign(n, -1.0);
     alpha_.assign(n, 0.0);
@@ -489,13 +520,13 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         radius_[a]          = ip.pgmAtom.radius;
         alpha_[a]           = (ip.pgmAtom.alpha > c_minPolarizability ? ip.pgmAtom.alpha : 0.0);
     }
-    for (int a = 0; a < n; a++)
+    for (int a = 0; a < nHome_; a++)
     {
         if (radius_[a] <= 0)
         {
             gmx_fatal(FARGS,
                       "pGM: atom %d has no [ pgm_atoms ] entry with a positive radius; every atom needs one",
-                      a + 1);
+                      globalOf(a) + 1);
         }
     }
     covAtom_.clear();
@@ -508,7 +539,9 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         covAtom_.push_back(ilDip.iatoms[k + 1]);
         covPartner_.push_back(ilDip.iatoms[k + 2]);
     }
-    polarizable_ = std::any_of(alpha_.begin(), alpha_.end(), [](double a) { return a > 0; });
+    double numPolarizable = std::count_if(alpha_.begin(), alpha_.begin() + nHome_, [](double a) { return a > 0; });
+    sumAll(&numPolarizable, 1);
+    polarizable_ = numPolarizable > 0;
 
     // GVDW
     gvdwA_.assign(n, 0.0);
@@ -523,10 +556,8 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         gvdwA_[a]           = ip.pgmGvdwAtom.sqrtA;
         gvdwC_[a]           = ip.pgmGvdwAtom.sqrtC6;
         gvdwB_[a]           = ip.pgmGvdwAtom.b;
-        gvdwActive_[a]      = (gvdwA_[a] != 0 || gvdwC_[a] != 0);
     }
     gvdwPairs_.clear();
-    gvdwPairSet_.clear();
     const auto& ilGvdwPair = idef.il[InteractionFunction::PgmGvdwPair];
     for (int k = 0; k < ilGvdwPair.size(); k += 3)
     {
@@ -534,15 +565,72 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         const int        i = std::min(ilGvdwPair.iatoms[k + 1], ilGvdwPair.iatoms[k + 2]);
         const int        j = std::max(ilGvdwPair.iatoms[k + 1], ilGvdwPair.iatoms[k + 2]);
         gvdwPairs_.push_back({ i, j, ip.pgmGvdwPair.A, ip.pgmGvdwPair.C6, ip.pgmGvdwPair.B });
-        gvdwPairSet_.insert(static_cast<int64_t>(i) * n + j);
     }
-    gvdw_ = !ilGvdw.empty() || !ilGvdwPair.empty();
+    double haveGvdw = (!ilGvdw.empty() || !ilGvdwPair.empty()) ? 1 : 0;
+    sumAll(&haveGvdw, 1);
+    gvdw_ = haveGvdw > 0;
+
+    // the halo atoms' radii and GVDW parameters from their owners
+    if (dd_)
+    {
+        std::vector<DVec> v(n), w(n);
+        for (int a = 0; a < nHome_; a++)
+        {
+            v[a] = DVec(radius_[a], gvdwA_[a], gvdwC_[a]);
+            w[a] = DVec(gvdwB_[a], 0, 0);
+        }
+        haloBroadcast(v);
+        haloBroadcast(w);
+        for (int a = nHome_; a < n; a++)
+        {
+            radius_[a] = v[a][XX];
+            gvdwA_[a]  = v[a][YY];
+            gvdwC_[a]  = v[a][ZZ];
+            gvdwB_[a]  = w[a][XX];
+        }
+    }
+    for (int a = 0; a < n; a++)
+    {
+        gvdwActive_[a] = (gvdwA_[a] != 0 || gvdwC_[a] != 0);
+    }
+    // the overridden pairs of all ranks, by global index (a pair's override and its place in the
+    // pair lists can be on different ranks); they change only with the local topology
+    if (topologyChanged)
+    {
+        std::vector<double> keys; // gi*N + gj, exact in double for N < 9.4e7
+        for (const GvdwPair& gp : gvdwPairs_)
+        {
+            const int64_t gi = globalOf(gp.i), gj = globalOf(gp.j);
+            keys.push_back(static_cast<double>(std::min(gi, gj) * nGlobal_ + std::max(gi, gj)));
+        }
+        if (dd_)
+        {
+            const int        numRanks = dd_->mpiComm().size(), rank = dd_->mpiComm().rank();
+            std::vector<double> count(numRanks, 0.0);
+            count[rank] = keys.size();
+            sumAll(count.data(), numRanks);
+            int offset = 0, total = 0;
+            for (int r = 0; r < numRanks; r++)
+            {
+                offset += (r < rank ? static_cast<int>(count[r]) : 0);
+                total += static_cast<int>(count[r]);
+            }
+            std::vector<double> all(std::max(total, 1), 0.0);
+            std::copy(keys.begin(), keys.end(), all.begin() + offset);
+            sumAll(all.data(), total);
+            all.resize(total);
+            keys = all;
+        }
+        gvdwPairSet_.clear();
+        for (const double k : keys)
+        {
+            gvdwPairSet_.insert(static_cast<int64_t>(k));
+        }
+    }
     if (static_cast<int>(mu_.size()) != n)
     {
         perm_.assign(n, DVec{ 0, 0, 0 });
         mu_.assign(n, DVec{ 0, 0, 0 });
-        history_.clear();
-        havePos_ = false;
     }
 }
 
@@ -577,9 +665,166 @@ void PgmElectrostatics::Impl::minImage(DVec& v) const
     pgmcore::minImage(v, box_);
 }
 
+static_assert(sizeof(DVec) == 3 * sizeof(double), "DVec arrays are sent as doubles");
+
+void PgmElectrostatics::Impl::sumAll(double* data, int count) const
+{
+    if (dd_ && count > 0)
+    {
+        dd_->mpiComm().sumReduce(count, data);
+    }
+}
+
+double PgmElectrostatics::Impl::maxAll(double v) const
+{
+#if GMX_MPI
+    if (dd_)
+    {
+        double out = v;
+        MPI_Allreduce(&v, &out, 1, MPI_DOUBLE, MPI_MAX, dd_->mpiComm().comm());
+        return out;
+    }
+#endif
+    return v;
+}
+
+void PgmElectrostatics::Impl::sendRecv(int dimIndex, bool forward, std::vector<DVec>& send, std::vector<DVec>& recv) const
+{
+#if GMX_MPI
+    // the neighbours as ddSendrecv: forward sends to neighbor[d][0] and receives from neighbor[d][1]
+    const int  sendRank = dd_->neighbor[dimIndex][forward ? 0 : 1];
+    const int  recvRank = dd_->neighbor[dimIndex][forward ? 1 : 0];
+    const int  tag      = 7461; // pGM's own messages, apart from GROMACS's
+    MPI_Comm   comm     = dd_->mpiComm().comm();
+    MPI_Status status;
+    const int  ns = send.size() * sizeof(DVec), nr = recv.size() * sizeof(DVec);
+    if (ns > 0 && nr > 0)
+    {
+        MPI_Sendrecv(send.data(), ns, MPI_BYTE, sendRank, tag, recv.data(), nr, MPI_BYTE, recvRank, tag, comm, &status);
+    }
+    else if (ns > 0)
+    {
+        MPI_Send(send.data(), ns, MPI_BYTE, sendRank, tag, comm);
+    }
+    else if (nr > 0)
+    {
+        MPI_Recv(recv.data(), nr, MPI_BYTE, recvRank, tag, comm, &status);
+    }
+#else
+    GMX_UNUSED_VALUE(dimIndex);
+    GMX_UNUSED_VALUE(forward);
+    GMX_UNUSED_VALUE(send);
+    GMX_UNUSED_VALUE(recv);
+#endif
+}
+
+void PgmElectrostatics::Impl::haloBroadcast(std::vector<DVec>& v) const
+{
+    if (!dd_)
+    {
+        return;
+    }
+    // dd_move_x without the coordinate shift: pulse by pulse along the DD dimensions, the zones received
+    // so far are sent on
+    const gmx_domdec_comm_t& comm   = *dd_->comm;
+    int                      nzone  = 1;
+    int                      natTot = comm.atomRanges.numHomeAtoms();
+    std::vector<DVec>        send, recv;
+    for (int dimIndex = 0; dimIndex < dd_->ndim; dimIndex++)
+    {
+        const gmx_domdec_comm_dim_t& cd = comm.cd[dimIndex];
+        for (const gmx_domdec_ind_t& ind : cd.ind)
+        {
+            send.resize(ind.nsend[nzone + 1]);
+            int n = 0;
+            for (const int j : ind.index)
+            {
+                send[n++] = v[j];
+            }
+            recv.resize(ind.nrecv[nzone + 1]);
+            sendRecv(dimIndex, false, send, recv);
+            if (cd.receiveInPlace)
+            {
+                std::copy(recv.begin(), recv.end(), v.begin() + natTot);
+            }
+            else
+            {
+                int j = 0;
+                for (int zone = 0; zone < nzone; zone++)
+                {
+                    for (int i = ind.cell2at0[zone]; i < ind.cell2at1[zone]; i++)
+                    {
+                        v[i] = recv[j++];
+                    }
+                }
+            }
+            natTot += ind.nrecv[nzone + 1];
+        }
+        nzone += nzone;
+    }
+}
+
+void PgmElectrostatics::Impl::haloReduce(std::vector<DVec>& v) const
+{
+    if (!dd_)
+    {
+        return;
+    }
+    // dd_move_f without shift forces: the pulses in reverse, the halo values sent back and added
+    const gmx_domdec_comm_t& comm   = *dd_->comm;
+    int                      nzone  = dd_->zones.numZones() / 2;
+    int                      natTot = comm.atomRanges.end(DDAtomRanges::Type::Zones);
+    std::vector<DVec>        send, recv;
+    for (int dimIndex = dd_->ndim - 1; dimIndex >= 0; dimIndex--)
+    {
+        const gmx_domdec_comm_dim_t& cd = comm.cd[dimIndex];
+        for (int pulse = cd.numPulses() - 1; pulse >= 0; pulse--)
+        {
+            const gmx_domdec_ind_t& ind = cd.ind[pulse];
+            natTot -= ind.nrecv[nzone + 1];
+            send.resize(ind.nrecv[nzone + 1]);
+            if (cd.receiveInPlace)
+            {
+                std::copy(v.begin() + natTot, v.begin() + natTot + send.size(), send.begin());
+            }
+            else
+            {
+                int j = 0;
+                for (int zone = 0; zone < nzone; zone++)
+                {
+                    for (int i = ind.cell2at0[zone]; i < ind.cell2at1[zone]; i++)
+                    {
+                        send[j++] = v[i];
+                    }
+                }
+            }
+            recv.resize(ind.nsend[nzone + 1]);
+            sendRecv(dimIndex, true, send, recv);
+            int n = 0;
+            for (const int j : ind.index)
+            {
+                v[j] += recv[n++];
+            }
+        }
+        nzone /= 2;
+    }
+}
+
 void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
 {
-    const auto& lists = nbv.pairlistSets().pairlistSet(InteractionLocality::Local).cpuLists();
+    // the local lists, and with DD the non-local ones (pairs with halo atoms): one list vector
+    std::vector<const NbnxnPairlistCpu*> lists;
+    for (const InteractionLocality loc : { InteractionLocality::Local, InteractionLocality::NonLocal })
+    {
+        if (loc == InteractionLocality::NonLocal && !dd_)
+        {
+            continue;
+        }
+        for (const NbnxnPairlistCpu& nbl : nbv.pairlistSets().pairlistSet(loc).cpuLists())
+        {
+            lists.push_back(&nbl);
+        }
+    }
     if (lists.empty())
     {
         gmx_fatal(FARGS, "pGM electrostatics need the CPU pair lists (mdrun -nb cpu)");
@@ -587,19 +832,30 @@ void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
     // every atom pair of the cluster pairs is a candidate, as for the nbnxm LJ kernels: filtering at
     // the atomic list radius would drop the extra buffer the cluster bounding boxes give (water512
     // NVE, mixed: energy drift 1.0 instead of -0.07 kJ/mol over 4 ps)
+    // With dynamic pruning, ci / cj are the inner list, pruned every few steps; the candidates must
+    // last until the next pair search: the outer (unpruned) list ciOuter / cjOuter then.
     ArrayRef<const int> atomOrder = nbv.getLocalAtomOrder();
+    auto useOuter = [](const NbnxnPairlistCpu& nbl) { return !nbl.ciOuter.empty(); };
+    auto ciList   = [&](const NbnxnPairlistCpu& nbl) -> const FastVector<nbnxn_ci_t>& {
+        return useOuter(nbl) ? nbl.ciOuter : nbl.ci;
+    };
     // work items: the i-cluster entries of all lists, dealt out dynamically
     ciItems_.clear();
-    for (int l = 0; l < lists.ssize(); l++)
+    for (int l = 0; l < static_cast<int>(lists.size()); l++)
     {
-        for (int c = 0; c < static_cast<int>(lists[l].ci.size()); c++)
+        for (int c = 0; c < static_cast<int>(ciList(*lists[l]).size()); c++)
         {
             ciItems_.push_back({ l, c });
-            const nbnxn_ci_t& ci = lists[l].ci[c];
-            numCandidates_ += static_cast<double>(ci.cj_ind_end - ci.cj_ind_start) * lists[l].na_ci * lists[l].na_cj;
+            const nbnxn_ci_t& ci = ciList(*lists[l])[c];
+            numCandidates_ += static_cast<double>(ci.cj_ind_end - ci.cj_ind_start) * lists[l]->na_ci * lists[l]->na_cj;
         }
     }
     numSearches_++;
+    if (checkPairs_)
+    {
+        fprintf(stderr, "pGM pair search at call %ld: %s lists, %zu i-entries\n", numCalls_,
+                useOuter(*lists[0]) ? "outer" : "plain", ciItems_.size());
+    }
     const int numItems = ciItems_.size();
     tp_.resize(nt_);
 #pragma omp parallel num_threads(nt_)
@@ -613,8 +869,9 @@ void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
 #pragma omp for schedule(dynamic, 8)
         for (int item = 0; item < numItems; item++)
         {
-            const NbnxnPairlistCpu& nbl     = lists[ciItems_[item][0]];
-            const nbnxn_ci_t&       ciEntry = nbl.ci[ciItems_[item][1]];
+            const NbnxnPairlistCpu& nbl     = *lists[ciItems_[item][0]];
+            const bool              outer   = useOuter(nbl);
+            const nbnxn_ci_t&       ciEntry = ciList(nbl)[ciItems_[item][1]];
             const int               naci = nbl.na_ci, nacj = nbl.na_cj;
             const int               ish     = ciEntry.shift & NBNXN_CI_SHIFT;
             const bool              central = (ish == c_centralShiftIndex);
@@ -629,7 +886,7 @@ void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
                 const int start = T.candJ.size();
                 for (int cjIndex = ciEntry.cj_ind_start; cjIndex < ciEntry.cj_ind_end; cjIndex++)
                 {
-                    const int j0 = nbl.cj.cj(cjIndex) * nacj;
+                    const int j0 = (outer ? nbl.cjOuter[cjIndex].cj : nbl.cj.cj(cjIndex)) * nacj;
                     // nbnxm counts the pairs of overlapping cluster pairs (the diagonal) once: j > i;
                     // the exclusion masks are ignored: pGM electrostatics have no exclusions
                     const bool overlap = central && i0 < j0 + nacj && j0 < i0 + naci;
@@ -655,6 +912,80 @@ void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
         T.candSegBegin.push_back(T.candJ.size());
     }
     haveCandidates_ = true;
+}
+
+void PgmElectrostatics::Impl::checkPairCount()
+{
+    // all pairs of the global positions (the same on every rank) against the pairs found on all ranks
+    const double            rc2 = rc_ * rc_;
+    const std::vector<DVec> X   = toGlobal(pos_);
+    long                    all = 0;
+#pragma omp parallel for num_threads(nt_) schedule(dynamic, 16) reduction(+ : all)
+    for (int i = 0; i < nGlobal_; i++)
+    {
+        for (int j = i + 1; j < nGlobal_; j++)
+        {
+            DVec x = X[i] - X[j];
+            minImage(x);
+            all += (dot3(x, x) < rc2);
+        }
+    }
+    double numFound = 0;
+    for (const auto& T : tp_)
+    {
+        numFound += T.numPairs();
+    }
+    sumAll(&numFound, 1);
+    const long found = static_cast<long>(numFound);
+    if (found != all)
+    {
+        numPairErrors_++;
+        if (!dd_ && numPairErrors_ <= 2)
+        {
+            // which pairs: those within rc missing from the lists
+            std::unordered_set<int64_t> foundSet;
+            for (const auto& T : tp_)
+            {
+                for (int sg = 0; sg < static_cast<int>(T.segI.size()); sg++)
+                {
+                    for (int k = T.segBegin[sg]; k < T.segBegin[sg + 1]; k++)
+                    {
+                        const int64_t a = globalOf(T.segI[sg]), b = globalOf(T.j[k]);
+                        foundSet.insert(std::min(a, b) * nGlobal_ + std::max(a, b));
+                    }
+                }
+            }
+            long extra = 0;
+            for (const int64_t key : foundSet)
+            {
+                DVec x = X[key / nGlobal_] - X[key % nGlobal_];
+                minImage(x);
+                extra += (dot3(x, x) >= rc2);
+            }
+            fprintf(stderr, "  %zu distinct pairs in the lists, %ld of them beyond rc by the minimum image\n",
+                    foundSet.size(), extra);
+            int shown = 0;
+            for (int i = 0; i < nGlobal_ && shown < 10; i++)
+            {
+                for (int j = i + 1; j < nGlobal_ && shown < 10; j++)
+                {
+                    DVec x = X[i] - X[j];
+                    minImage(x);
+                    if (dot3(x, x) < rc2 && foundSet.count(static_cast<int64_t>(i) * nGlobal_ + j) == 0)
+                    {
+                        fprintf(stderr, "  missing pair %d %d: r %.6f nm, x_i %.4f %.4f %.4f, x_j %.4f %.4f %.4f\n", i, j,
+                                std::sqrt(dot3(x, x)), X[i][XX], X[i][YY], X[i][ZZ], X[j][XX], X[j][YY], X[j][ZZ]);
+                        shown++;
+                    }
+                }
+            }
+        }
+        if (isMain_)
+        {
+            fprintf(stderr, "pGM pair check, call %ld: %ld pairs within rc in the lists, %ld in all pairs\n",
+                    numCalls_, found, all);
+        }
+    }
 }
 
 void PgmElectrostatics::Impl::buildPairs()
@@ -814,11 +1145,13 @@ void PgmElectrostatics::Impl::gvdwOverridesAndTail()
     if (dispCorr_ != DispersionCorrectionType::No)
     {
         double sumC = 0;
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nHome_; i++)
         {
             sumC += gvdwC_[i];
         }
-        gvdwTail_ = pgmcore::gvdwTail(sumC, volume_, rvdw_);
+        sumAll(&sumC, 1);
+        // the same on every rank: counted on the main rank
+        gvdwTail_ = isMain_ ? pgmcore::gvdwTail(sumC, volume_, rvdw_) : 0.0;
         if (dispCorr_ == DispersionCorrectionType::EnerPres || dispCorr_ == DispersionCorrectionType::AllEnerPres)
         {
             for (int a = 0; a < DIM; a++)
@@ -855,6 +1188,9 @@ void PgmElectrostatics::Impl::permanentDipoles()
             perm_[i][k] += covStrength_[m] * v[k] / L;
         }
     }
+    // a covalent dipole of a home atom may sit on another rank, where the atom is in the halo
+    haloReduce(perm_);
+    std::fill(perm_.begin() + nHome_, perm_.end(), DVec{ 0, 0, 0 });
 }
 
 void PgmElectrostatics::Impl::assignTiles()
@@ -900,7 +1236,7 @@ void PgmElectrostatics::Impl::assignTiles()
         return m;
     };
     int tl[4];
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         const int m = tilesOf(i, tl);
         for (int k = 0; k < m; k++)
@@ -914,7 +1250,7 @@ void PgmElectrostatics::Impl::assignTiles()
     }
     tileStart_ = count;
     tileAtoms_.resize(count[numTiles]);
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         const int m = tilesOf(i, tl);
         for (int k = 0; k < m; k++)
@@ -929,17 +1265,18 @@ void PgmElectrostatics::Impl::splines()
     const int p = order_;
     for (int a = 0; a < DIM; a++)
     {
-        gridIndex_[a].resize(n_ * p);
-        theta_[a].resize(n_ * p);
-        dtheta_[a].resize(n_ * p);
-        d2theta_[a].resize(n_ * p);
+        gridIndex_[a].resize(nHome_ * p);
+        theta_[a].resize(nHome_ * p);
+        dtheta_[a].resize(nHome_ * p);
+        d2theta_[a].resize(nHome_ * p);
     }
     kzPad_ = grid_[ZZ] + p - 1;
-    zTheta_.resize(n_ * p);
-    zDTheta_.resize(n_ * p);
-    zD2Theta_.resize(n_ * p);
+    zTheta_.resize(nHome_ * p);
+    zDTheta_.resize(nHome_ * p);
+    zD2Theta_.resize(nHome_ * p);
+    // the PME acts on the home atoms only (their grid sums are added over the ranks)
 #pragma omp parallel for num_threads(nt_) schedule(static)
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         // M[k][j] = M_k(fr + j), j = 0..k-1 (cardinal B-spline of order k); grid point base - j
         double M[c_maxPmeOrder + 1][c_maxPmeOrder + 2] = {};
@@ -1037,8 +1374,8 @@ void PgmElectrostatics::Impl::computeInfluence()
 
 std::vector<DVec> PgmElectrostatics::Impl::fractionalDipoles(const std::vector<DVec>& d) const
 {
-    std::vector<DVec> e(n_);
-    for (int i = 0; i < n_; i++)
+    std::vector<DVec> e(nHome_);
+    for (int i = 0; i < nHome_; i++)
     {
         for (int a = 0; a < DIM; a++)
         {
@@ -1114,6 +1451,11 @@ double PgmElectrostatics::Impl::pmePotential(const std::vector<double>* q, const
                 }
             }
         }
+    }
+    // the grid of all ranks' home atoms
+    sumAll(spreadGrid_.data(), gridSize);
+#pragma omp parallel num_threads(nt_)
+    {
         // fold: grid point z is padded point z + p - 1, and z + p - 1 - nz for the top p - 1 points
 #pragma omp for schedule(static)
         for (int g1 = 0; g1 < K1; g1++)
@@ -1215,7 +1557,7 @@ void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E)
     const double tg0 = now();
     const int K1 = grid_[XX], K2 = grid_[YY], K3 = grid_[ZZ], p = order_;
 #pragma omp parallel for num_threads(nt_) schedule(static)
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         double f[3] = { 0, 0, 0 };
         for (int j1 = 0; j1 < p; j1++)
@@ -1248,9 +1590,13 @@ void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E)
     tGather_ += now() - tg0;
 }
 
-std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, const std::vector<DVec>& d)
+std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, const std::vector<DVec>& dHome)
 {
+    // dHome: the dipoles of the home atoms; the pairs need the halo's too
     const double      t0 = now();
+    std::vector<DVec> d  = dHome;
+    d.resize(n_, DVec{ 0, 0, 0 });
+    haloBroadcast(d);
     std::vector<DVec> E(n_, DVec{ 0, 0, 0 });
     const int         numLists = tp_.size();
     for (auto& v : threadVec_)
@@ -1289,13 +1635,15 @@ std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, c
         }
     }
     reduceThreadVec(E);
+    haloReduce(E); // the halo's field contributions to their owners
+    std::fill(E.begin() + nHome_, E.end(), DVec{ 0, 0, 0 });
     double t1 = now();
     tFieldPairs_ += t1 - t0;
     pmePotential(q, d, nullptr);
     pmeField(E);
     tPme_ += now() - t1;
     const double cs = 4.0 * beta_ * beta_ * beta_ / (3.0 * c_sqrtPi);
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         for (int k = 0; k < DIM; k++)
         {
@@ -1307,20 +1655,23 @@ std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, c
 
 void PgmElectrostatics::Impl::solve()
 {
+    // the CG runs on the home atoms; sums and maxima over all ranks
+    const int                  nh = nHome_;
     std::vector<DVec>          b  = field(&q_, perm_);
     const std::vector<double>& al = alpha_;
     double                     norm = 0;
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nh; i++)
     {
         for (int k = 0; k < DIM; k++)
         {
             norm += std::fabs(al[i] * b[i][k]);
         }
     }
-    norm = norm / (3.0 * n_) + 1e-300;
+    sumAll(&norm, 1);
+    norm = norm / (3.0 * nGlobal_) + 1e-300;
 
-    // initial guess (history in the global atom order)
-    std::vector<DVec> x(n_, DVec{ 0, 0, 0 });
+    // initial guess (history in the global atom order, the same on every rank)
+    std::vector<DVec>       x(n_, DVec{ 0, 0, 0 });
     const std::vector<DVec> posGlobal = toGlobal(pos_);
     const bool              samePos   = havePos_ && lastPos_ == posGlobal;
     const int               h         = history_.size();
@@ -1330,8 +1681,8 @@ void PgmElectrostatics::Impl::solve()
     }
     else if (predictor_ == 2 && h >= 4)
     {
-        std::vector<DVec> g(n_);
-        for (int i = 0; i < n_; i++)
+        std::vector<DVec> g(nGlobal_);
+        for (int i = 0; i < nGlobal_; i++)
         {
             g[i] = 4.0 * history_[0][i] - 6.0 * history_[1][i] + 4.0 * history_[2][i] - history_[3][i];
         }
@@ -1339,8 +1690,8 @@ void PgmElectrostatics::Impl::solve()
     }
     else if (predictor_ >= 1 && h >= 3)
     {
-        std::vector<DVec> g(n_);
-        for (int i = 0; i < n_; i++)
+        std::vector<DVec> g(nGlobal_);
+        for (int i = 0; i < nGlobal_; i++)
         {
             g[i] = 3.0 * history_[0][i] - 3.0 * history_[1][i] + history_[2][i];
         }
@@ -1352,7 +1703,7 @@ void PgmElectrostatics::Impl::solve()
     }
     else
     {
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nh; i++)
         {
             x[i] = al[i] * b[i];
         }
@@ -1360,8 +1711,8 @@ void PgmElectrostatics::Impl::solve()
 
     auto applyA = [&](const std::vector<DVec>& v) { // alpha^-1 v - T v (rows of polarizable atoms)
         std::vector<DVec> Tv = field(nullptr, v);
-        std::vector<DVec> out(n_);
-        for (int i = 0; i < n_; i++)
+        std::vector<DVec> out(n_, DVec{ 0, 0, 0 });
+        for (int i = 0; i < nh; i++)
         {
             for (int k = 0; k < DIM; k++)
             {
@@ -1372,26 +1723,27 @@ void PgmElectrostatics::Impl::solve()
     };
     auto vdot = [&](const std::vector<DVec>& a, const std::vector<DVec>& c) {
         double sum = 0;
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nh; i++)
         {
             sum += dot3(a[i], c[i]);
         }
+        sumAll(&sum, 1);
         return sum;
     };
     auto errOf = [&](const std::vector<DVec>& r) {
         double m = 0;
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nh; i++)
         {
             for (int k = 0; k < DIM; k++)
             {
                 m = std::max(m, std::fabs(al[i] * r[i][k]));
             }
         }
-        return m / norm;
+        return maxAll(m) / norm;
     };
     // r = b - A x, Jacobi-preconditioned CG (Polak-Ribiere)
-    std::vector<DVec> Ax = applyA(x), r(n_), z(n_), pdir(n_);
-    for (int i = 0; i < n_; i++)
+    std::vector<DVec> Ax = applyA(x), r(n_, DVec{ 0, 0, 0 }), z(n_, DVec{ 0, 0, 0 }), pdir;
+    for (int i = 0; i < nh; i++)
     {
         for (int k = 0; k < DIM; k++)
         {
@@ -1407,26 +1759,21 @@ void PgmElectrostatics::Impl::solve()
     {
         std::vector<DVec> Ap   = applyA(pdir);
         const double      alph = rz / std::max(vdot(pdir, Ap), 1e-300);
-        std::vector<DVec> rnew(n_), znew(n_);
-        for (int i = 0; i < n_; i++)
+        std::vector<DVec> rnew(n_, DVec{ 0, 0, 0 }), znew(n_, DVec{ 0, 0, 0 });
+        double            beta = 0;
+        for (int i = 0; i < nh; i++)
         {
             for (int k = 0; k < DIM; k++)
             {
                 x[i][k] += alph * pdir[i][k];
                 rnew[i][k] = r[i][k] - alph * Ap[i][k];
                 znew[i][k] = al[i] * rnew[i][k];
-            }
-        }
-        double beta = 0;
-        for (int i = 0; i < n_; i++)
-        {
-            for (int k = 0; k < DIM; k++)
-            {
                 beta += znew[i][k] * (rnew[i][k] - r[i][k]);
             }
         }
+        sumAll(&beta, 1);
         beta /= std::max(rz, 1e-300);
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nh; i++)
         {
             pdir[i] = znew[i] + beta * pdir[i];
         }
@@ -1438,7 +1785,7 @@ void PgmElectrostatics::Impl::solve()
     }
     if (peek_ != 0)
     {
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nh; i++)
         {
             x[i] += (peek_ * al[i]) * r[i];
         }
@@ -1467,11 +1814,31 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
                                         const ListOfLists<int>&       exclusions,
                                         ArrayRef<const RVec>          shiftVectors,
                                         ArrayRef<const int>           globalIndex,
+                                        const gmx_domdec_t*           dd,
                                         ForceWithVirial*              forceWithVirial,
                                         gmx_enerdata_t*               enerd,
                                         bool                          doPairSearch)
 {
     excls_ = &exclusions;
+    dd_    = dd;
+    if (dd_ && dd_->unitCellInfo.haveScrewPBC)
+    {
+        gmx_fatal(FARGS, "coulombtype = pGM does not support screw PBC");
+    }
+    if (dd_ && dd_->haloExchange)
+    {
+        gmx_fatal(FARGS, "coulombtype = pGM needs the classic DD halo communication (unset GMX_FILLERS_IN_LOCAL_STATE)");
+    }
+    isMain_ = (dd_ == nullptr || DDMAIN(dd_));
+    nHome_  = numHomeAtoms;
+    n_      = dd_ ? dd_->comm->atomRanges.end(DDAtomRanges::Type::Zones) : numHomeAtoms;
+    if (nGlobal_ == 0)
+    {
+        double ng = nHome_;
+        sumAll(&ng, 1);
+        nGlobal_ = static_cast<int>(ng);
+    }
+    const bool topologyChanged = doPairSearch || numCalls_ == 0;
     // the local atom order changes at repartitioning (also on a single rank): parameters are read
     // from the local topology at every call, the predictor history is kept in the global order
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
@@ -1480,8 +1847,8 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     {
         initFft(nt_);
     }
-    setTopology(numHomeAtoms, charges, idef);
     globalIndex_.assign(globalIndex.begin(), globalIndex.begin() + (globalIndex.empty() ? 0 : n_));
+    setTopology(charges, idef, topologyChanged);
     pos_.resize(n_);
     for (int i = 0; i < n_; i++)
     {
@@ -1490,13 +1857,21 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     setBox(box);
     permanentDipoles();
     double t0 = now();
-    if (doPairSearch || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_)
+    if (topologyChanged || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_)
     {
         searchCandidates(nbv);
     }
     GMX_UNUSED_VALUE(shiftVectors);
     buildPairs();
+    if (checkPairs_)
+    {
+        checkPairCount();
+    }
     gvdwOverridesAndTail();
+    if (gvdw_)
+    {
+        haloReduce(gvdwForce_[0]); // GVDW forces on halo atoms to their owners
+    }
     const double tPairs1 = now();
     tPairs_ += tPairs1 - t0;
     for (const auto& T : tp_)
@@ -1529,11 +1904,13 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     sumIterations_ += lastIterations_;
     const double tFinal0 = now();
 
-    std::vector<DVec> d(n_);
-    for (int i = 0; i < n_; i++)
+    // total dipoles: home atoms, then the halo's from their owners
+    std::vector<DVec> d(n_, DVec{ 0, 0, 0 });
+    for (int i = 0; i < nHome_; i++)
     {
         d[i] = perm_[i] + mu_[i];
     }
+    haloBroadcast(d);
     const std::vector<double>& q = q_;
     double                     direct = 0, reciprocal = 0, self = 0, background = 0, polarization = 0;
     std::vector<DVec>          E(n_, DVec{ 0, 0, 0 }); // total field at fixed d [e/nm^2]
@@ -1607,18 +1984,33 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             E[i] += threadE[t][i];
         }
     }
+    haloReduce(E); // the halo's direct fields to their owners (F: below, with the covalent forces)
+    std::fill(E.begin() + nHome_, E.end(), DVec{ 0, 0, 0 });
     for (int k = 0; k < 9; k++)
     {
         S[k] += threadSum[k];
     }
     direct += threadSum[9];
 
+    // reciprocal space: the home atoms; the k-space energy and strain are the same on every rank
     const double tPme0 = now();
-    reciprocal         = pmePotential(&q, d, S);
+    double       Sk[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    reciprocal         = pmePotential(&q, d, Sk);
+    if (isMain_)
+    {
+        for (int k = 0; k < 9; k++)
+        {
+            S[k] += Sk[k];
+        }
+    }
+    else
+    {
+        reciprocal = 0;
+    }
     std::vector<DVec> Erec(n_, DVec{ 0, 0, 0 });
     pmeField(Erec);
     const double tPme1 = now();
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         for (int a = 0; a < DIM; a++)
         {
@@ -1629,12 +2021,14 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             }
         }
     }
-    // reciprocal forces: -[q grad phi + (grad grad phi) . d]
+    // reciprocal forces on the home atoms: -[q grad phi + (grad grad phi) . d] (added after the halo
+    // reduction of F below)
+    std::vector<DVec> Frec(nHome_, DVec{ 0, 0, 0 });
     {
         const int         p = order_;
         std::vector<DVec> e = fractionalDipoles(d);
 #pragma omp parallel for num_threads(nt_) schedule(static)
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nHome_; i++)
         {
             double f1[3] = { 0, 0, 0 }, f2[3][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
             for (int j1 = 0; j1 < p; j1++)
@@ -1677,37 +2071,43 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
                 const double c = q[i] * f1[a] + e[i][0] * f2[a][0] + e[i][1] * f2[a][1] + e[i][2] * f2[a][2];
                 for (int k = 0; k < DIM; k++)
                 {
-                    F[i][k] -= grid_[a] * recip_[k][a] * c;
+                    Frec[i][k] -= grid_[a] * recip_[k][a] * c;
                 }
             }
         }
     }
     const double cs = 4.0 * beta_ * beta_ * beta_ / (3.0 * c_sqrtPi);
-    double       q2 = 0, d2 = 0, Q = 0;
-    for (int i = 0; i < n_; i++)
+    double       sums[3] = { 0, 0, 0 }; // sum q^2, sum |d|^2 (home: self energy), sum q (all ranks)
+    for (int i = 0; i < nHome_; i++)
     {
-        q2 += q[i] * q[i];
-        d2 += dot3(d[i], d[i]);
-        Q += q[i];
+        sums[0] += q[i] * q[i];
+        sums[1] += dot3(d[i], d[i]);
+        sums[2] += q[i];
         for (int k = 0; k < DIM; k++)
         {
             E[i][k] += cs * d[i][k];
         }
     }
-    self       = -(beta_ / c_sqrtPi) * q2 - 0.5 * cs * d2;
-    background = -M_PI * Q * Q / (2.0 * volume_ * beta_ * beta_);
-    for (int a = 0; a < DIM; a++)
+    self = -(beta_ / c_sqrtPi) * sums[0] - 0.5 * cs * sums[1];
+    sumAll(&sums[2], 1);
+    if (isMain_)
     {
-        S[4 * a] -= background; // E_bg ~ 1/V
+        background = -M_PI * sums[2] * sums[2] / (2.0 * volume_ * beta_ * beta_);
+        for (int a = 0; a < DIM; a++)
+        {
+            S[4 * a] -= background; // E_bg ~ 1/V
+        }
     }
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         if (alpha_[i] > 0)
         {
             polarization += dot3(mu_[i], mu_[i]) / (2.0 * alpha_[i]);
         }
     }
-    // covalent dipoles: dE/dr_partner = c (g - (g.u) u)/|v|, g = dE/dd_atom = -E_atom
+    // covalent dipoles: dE/dr_partner = c (g - (g.u) u)/|v|, g = dE/dd_atom = -E_atom; the dipole's atom
+    // may be in the halo: its total field from the owner
+    haloBroadcast(E);
     for (size_t m = 0; m < covAtom_.size(); m++)
     {
         const int i = covAtom_[m], j = covPartner_[m];
@@ -1728,13 +2128,18 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             }
         }
     }
+    haloReduce(F); // pair and covalent forces on the halo to their owners
+    for (int i = 0; i < nHome_; i++)
+    {
+        F[i] += Frec[i];
+    }
 
     tFinal_ += (now() - tFinal0) - (tPme1 - tPme0);
     tPme_ += tPme1 - tPme0;
 
     // outputs
     ArrayRef<RVec> f = forceWithVirial->force_;
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < nHome_; i++)
     {
         for (int k = 0; k < DIM; k++)
         {
@@ -1756,7 +2161,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     if (gvdw_)
     {
         const std::vector<DVec>& Fg = gvdwForce_[0];
-        for (int i = 0; i < n_; i++)
+        for (int i = 0; i < nHome_; i++)
         {
             for (int k = 0; k < DIM; k++)
             {
@@ -1785,7 +2190,11 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
 
     static const char* dump = std::getenv("GMX_PGM_DUMP");
-    if (dump && numCalls_ == 1)
+    if (dump && numCalls_ == 1 && dd_)
+    {
+        fprintf(stderr, "pGM: GMX_PGM_DUMP needs one rank; no dump written\n");
+    }
+    if (dump && numCalls_ == 1 && !dd_)
     {
         // everything needed to recompute this call with core/pgm_core (core/tests/run_dump.cpp)
         FILE* fp = std::fopen(dump, "w");
@@ -1870,11 +2279,12 @@ void PgmElectrostatics::calculate(ArrayRef<const RVec>          x,
                                   const ListOfLists<int>&       exclusions,
                                   ArrayRef<const RVec>          shiftVectors,
                                   ArrayRef<const int>           globalIndex,
+                                  const gmx_domdec_t*           dd,
                                   ForceWithVirial*              forceWithVirial,
                                   gmx_enerdata_t*               enerd,
                                   const StepWorkload&           stepWork)
 {
-    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex,
+    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex, dd,
                      forceWithVirial, enerd, stepWork.doNeighborSearch);
 }
 

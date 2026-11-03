@@ -86,7 +86,8 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
 python3 gromacs/patches/apply.py gromacs/patches/g0a_interactions.py $SRC   # topology data, tpr
 python3 gromacs/patches/apply.py gromacs/patches/g0b_coulombtype.py $SRC    # coulombtype = pGM, mdp options
 bash    gromacs/patches/g0b_elecnone.sh $SRC                                # LJ-only nbnxm kernels always
-bash    gromacs/patches/g1_install.sh $SRC                                  # src/gromacs/pgm + hooks (g1_hooks.py)
+bash    gromacs/patches/g1_install.sh $SRC                                  # src/gromacs/pgm + hooks (g1_hooks.py,
+                                                                            # g1b_checks.py, g2_gvdw.py, g4_dd.py)
 ```
 
 All stages are idempotent string replacements that fail loudly if upstream code moved.  Builds on
@@ -109,7 +110,8 @@ rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
 * outputs: forces into `ForceWithVirial` with the analytical virial Xi = S^T/2 (pairs, covalent chain
   rule, reciprocal including the dipole term, background); energies: Coulomb (SR) = direct, Coul. recip.
   = reciprocal + self + background, "pGM Polariz." = sum |mu|^2/(2 alpha);
-* OpenMP: see G2; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
+* OpenMP: see G2; domain decomposition: see G4; `-nb cpu`, no separate PME ranks (`-npme 0`), no MTS
+  (fatal errors otherwise).
 * `GMX_PGM_DUMP=file`: the first force call's settings, terms, virial, per-atom positions, parameters,
   forces, dipoles and the covalent list, in the global order; `core/tests/run_dump` recomputes it with
   pgm_core, `tests/compare_gmx.py` compares it with a pGM-JAX reference.
@@ -208,7 +210,8 @@ What changed:
 
 1. **Pair candidates cached per pair search.**  At `doNeighborSearch` steps every atom pair of the nbnxm
    cluster pairs (not only those within the atomic rlist: the cluster bounding boxes are part of the Verlet
-   buffer, filtering them out raised the mixed NVE drift from -0.07 to 1.0 kJ/mol / 4 ps) is stored once,
+   buffer, filtering them out raised the mixed NVE drift from -0.07 to 1.0 kJ/mol / 4 ps; with dynamic
+   pruning the *outer* list `ciOuter`/`cjOuter`, since `ci`/`cj` are re-pruned every few steps) is stored once,
    in segments of one i atom and one shift, with its GVDW eligibility (exclusions and overrides checked
    there, not at every step).  Each step compacts the pairs within rc into structure-of-arrays segments.
 2. **SIMD kernels.**  G_0..G_3 in the erfc form Bc(beta) - Bc(a) (`pgmcore::ewaldPairKernels`, now also
@@ -222,15 +225,69 @@ What changed:
    contiguous z.
 
 Accuracy unchanged: gmx_d vs pgm_core 1e-15 relative energy, 4e-11 forces, 3e-16 dipoles; mixed 3e-11 /
-9e-4; GVDW to 1e-16 (NumPy), pmemd -2e-5 / -4e-5 kcal/mol; NVE mixed 4 ps: fluctuation 0.37-0.44 kJ/mol,
-drift -0.04 to -0.28 kJ/mol (the trajectory depends on the thread count's summation order).
+9e-4; GVDW to 1e-16 (NumPy), pmemd -2e-5 / -4e-5 kcal/mol; NVE mixed 4 ps, three runs (the trajectory
+depends on the threads' summation order): total-energy fluctuation 0.37-0.52 kJ/mol, drift -0.3 to +0.6
+kJ/mol, within what the Verlet buffer tolerance (1e-4 kJ/mol/ps per atom: 0.6 kJ/mol) allows.
+
+### G4 (done): domain decomposition
+
+Several PP ranks (thread-MPI or MPI, `-npme 0`), `gromacs/patches/g4_dd.py` passes the `gmx_domdec_t`:
+
+* local atoms = home atoms + the halo of the DD zones (coordinates and charges communicated by GROMACS);
+  the candidates come from the local *and* non-local nbnxm lists, so every pair within rc is on exactly
+  one rank, with halo atoms as i or j;
+* the module's own halo communication with the DD setup (`comm->cd[].ind[]`, as `dd_move_x` /
+  `dd_move_f`, double precision, own MPI tag): radii and GVDW parameters (one-atom interactions live on
+  the owner) and the dipoles before every field pass are broadcast to the halo; the fields of every pass,
+  the permanent dipoles (a covalent dipole may be assigned to a rank where its atom is halo), the forces
+  and the GVDW forces are reduced to the owners; the total field is broadcast once more for the covalent
+  chain rule;
+* CG on the home atoms with global dot products and maxima; the predictor history and the "same
+  positions" test in the global atom order, summed over the ranks, so atoms can migrate;
+* PME: each rank spreads its home atoms, the grid is summed over the ranks, every rank does the FFT (fine
+  for one node; a decomposed FFT / PME ranks is the next step for many nodes); k-space energy and strain,
+  the background term and the GVDW tail are counted on the main rank, everything per atom on the owner;
+* GVDW overrides: the override list of all ranks by global index (an overridden pair's interaction and
+  its place in the pair lists can be on different ranks);
+* not supported: screw PBC, the direct halo exchange (`GMX_FILLERS_IN_LOCAL_STATE`), `GMX_PGM_DUMP` with
+  DD (use one rank).
+
+Validation (`tests/gmx/dd_sp.sh` + `dd_compare.py`; water512 replicated 2x2x2 = 4096 waters, grid 72^3,
+dipole tol 1e-10): energies (every term incl. virial and pressure) and forces against one rank:
+
+| DD grid | pulses | max energy-term rel. diff | max force diff (kJ/mol/nm; max 3488) |
+|---|---|---|---|
+| 2x1x1, 4x1x1, 4x2x1 | 1 | 6e-12 | 4e-10 |
+| 8x1x1 (0.56 nm cells) | 3 | 5e-12 | 1e-10 |
+| 2x2x2 | 1 | 5e-12 | 4e-10 |
+| 3x2x1 | 1 | 9e-12 | 4e-10 |
+| GVDW + overrides + tail, 4 ranks | 1 | 7e-11 (Pres-XY) | 1e-10 |
+
+The potential agrees to 1e-15 relative; the largest relative differences are in small off-diagonal
+pressure components.  NVE (4096 waters, 2 ps, 1 fs, tol 1e-5, mu4, double): total-energy fluctuation
+1.11 kJ/mol and drift 0.8 kJ/mol on 1 rank, 1.24 and 1.7 kJ/mol on 4 ranks (the Verlet buffer tolerance
+allows 2.5 kJ/mol here).  Started from MD coordinates the trajectories of 1 and n ranks differ from the
+first step by ~4e-3 kJ/mol: the waters (update groups) stick out of the box by up to 0.08 nm and the
+nbnxm lists then miss a few pairs just inside rc at the search, different ones for different
+decompositions (`GMX_PGM_CHECK_PAIRS=1`: 8 of 1855136 pairs on 1 rank, 3 on 4 ranks); pGM uses
+GROMACS's pair set, as GROMACS's own kernels do.
+
+Speed (4096 waters, NVE 1 fs, 72^3 grid, mixed build, pinned, ns/day): 1 rank x 8 threads 1.18,
+x 16 threads 1.17 (OpenMP saturated); 2 x 4: 0.97, 4 x 2: 0.68, 8 x 1: 0.44, 4 x 4: 0.76.  Correct but
+not yet faster: per force call (4 x 2) pair setup 19 ms and field passes 24 ms are as on one rank (the
+same 8 cores), the PME takes 75 instead of 20 ms: every rank sums the whole grid (3.2 MB, 7 times per
+step) and does the whole FFT with its few threads.  A decomposed PME (below) is what DD needs to pay off.
+
+`GMX_PGM_CHECK_PAIRS=1` counts, every step, the pairs within rc on all ranks against all pairs of the
+global coordinates (O(N^2), for testing) and lists missing ones on one rank.
 
 ### Next
 
 1. **G3 (GPU)**: the pair passes and the PME on the GPU (the nbnxm GPU lists; the CG in one kernel
    sequence as in the OpenMM plugin), the GPU PME grids.
-2. **G4 (domain decomposition)**: the pair passes over local + non-local atoms, halo exchange of the
-   dipoles each CG iteration, PME with the GROMACS PME decomposition.
+2. **Decomposed PME for DD**: spread into the local grid region only, send the parts to the owners of
+   FFT slabs (`gmx_parallel_3dfft` with the PP communicator), distributed FFT and convolution, return
+   the potential to the ranks whose atoms need it; instead of the whole-grid sum + redundant FFT.
 3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
    (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
 

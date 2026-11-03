@@ -13,3 +13,5 @@ python3 $H/apply.py $H/g1b_checks.py $S
 # GVDW (stage g2): the shared pair kernel next to the module, then the GROMACS changes
 cp $H/../../core/gvdw_kernel.h $S/src/gromacs/pgm/
 python3 $H/apply.py $H/g2_gvdw.py $S
+# domain decomposition (stage g4)
+python3 $H/apply.py $H/g4_dd.py $S

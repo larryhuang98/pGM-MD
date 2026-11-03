@@ -22,8 +22,11 @@ EDITS = [
      "        forcerec->dispersionCorrection->print(mdlog);\n    }\n",
      "        forcerec->dispersionCorrection->print(mdlog);\n    }\n\n"
      "    if (usingPgm(inputrec.coulombtype))\n    {\n"
-     "        if (simulationWork.havePpDomainDecomposition || simulationWork.useMts)\n        {\n"
-     '            gmx_fatal(FARGS, "coulombtype = pGM does not support domain decomposition or multiple time stepping yet");\n'
+     "        if (simulationWork.useMts)\n        {\n"
+     '            gmx_fatal(FARGS, "coulombtype = pGM does not support multiple time stepping yet");\n'
+     "        }\n"
+     "        if (simulationWork.haveSeparatePmeRank)\n        {\n"
+     '            gmx_fatal(FARGS, "coulombtype = pGM computes its own PME on the PP ranks: use mdrun -npme 0");\n'
      "        }\n"
      "        if (simulationWork.useGpuNonbonded)\n        {\n"
      '            gmx_fatal(FARGS, "coulombtype = pGM needs the nonbonded interactions on the CPU (mdrun -nb cpu)");\n'

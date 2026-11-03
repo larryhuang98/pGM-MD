@@ -6,8 +6,8 @@
  * sum runs over the nbnxm cluster pair lists, which keep all pairs within the cut-off, excluded pairs
  * included (pGM electrostatics have no exclusions; the nbnxm kernels compute Lennard-Jones only).
  *
- * CPU implementation (phases G1 + G2: double-precision kernels, the pair kernels in double SIMD, OpenMP),
- * single rank, the reference of the GPU kernels.  Forces go to the ForceWithVirial buffer with the
+ * CPU implementation (phases G1 + G2 + G4: double-precision kernels, the pair kernels in double SIMD,
+ * OpenMP, domain decomposition over PP ranks), the reference of the GPU kernels.  Forces go to the ForceWithVirial buffer with the
  * analytical strain derivative as the virial.
  *
  * GVDW (Gaussian-density van der Waals, pmemd-pgm igvdw = 1), if the topology has [ pgm_gvdw ]: pairs
@@ -25,6 +25,7 @@
 #include "gromacs/utility/arrayref.h"
 #include "gromacs/utility/real.h"
 
+struct gmx_domdec_t;
 struct gmx_enerdata_t;
 struct t_inputrec;
 class InteractionDefinitions;
@@ -60,6 +61,9 @@ public:
      * \param exclusions     local exclusions (they act on GVDW as on LJ; pGM electrostatics have none)
      * \param shiftVectors   the periodic shift vectors of the pair lists
      * \param globalIndex    global index of each local atom (empty: local = global), for the predictor
+     * \param dd             the domain decomposition (nullptr: one rank); then \p x, \p charges,
+     *                       \p globalIndex cover the halo atoms too, and the module communicates dipoles,
+     *                       fields and forces of the halo with the DD setup (no separate PME ranks)
      */
     void calculate(ArrayRef<const RVec>      x,
                    const matrix              box,
@@ -70,6 +74,7 @@ public:
                    const ListOfLists<int>&   exclusions,
                    ArrayRef<const RVec>      shiftVectors,
                    ArrayRef<const int>       globalIndex,
+                   const gmx_domdec_t*       dd,
                    ForceWithVirial*          forceWithVirial,
                    gmx_enerdata_t*           enerd,
                    const StepWorkload&       stepWork);

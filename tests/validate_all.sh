@@ -30,6 +30,8 @@ for V in double cuda; do
       && $R/glibc228.sh python $T/gmx/gvdw_14_compare.py . 2>&1 | grep -E "FAIL|PASS|failures"
   fi
 done
+echo "== GROMACS double: domain decomposition (4096 waters: 1-8 ranks, 3 pulses, 3D; GVDW; NVE)"
+mkdir -p $R/gmx_dd && cd $R/gmx_dd && bash $T/gmx/dd_sp.sh double 2>&1 | grep -E "ok  |FAIL|NVE"
 echo "== GROMACS cuda (mixed): water512 NVE 4 ps"
 cd $R/gmx_w512 && MDRUN_EXTRA="-pin on" bash $T/gmx/nve_w512.sh cuda 8 2>&1 | grep -E "Total Energy|Performance" | head -2
 echo "== OpenMM"
