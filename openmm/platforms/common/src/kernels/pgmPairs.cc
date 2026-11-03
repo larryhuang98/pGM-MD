@@ -125,8 +125,9 @@ DEVICE void computePair(real3 delta, real r2, real q1, real rg1, real3 d1, AtomD
         , real3* force1, mixed* energy
 #endif
         ) {
-    real invR = RSQRT(r2);
-    real r = r2*invR;
+    // finite at r = 0 (two sites on top of each other): the kernels use the series there
+    real r = SQRT(r2);
+    real invR = (r2 > 0 ? RSQRT(r2) : (real) 0);
     real G[NUM_B];
     pairKernels(rg1, data2->rg, r, invR, G);
     real3 x = make_real3(-delta.x, -delta.y, -delta.z);

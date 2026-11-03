@@ -1,7 +1,8 @@
 /**
  * Smooth PME of point charges and point dipoles for pGM (reciprocal part; the Gaussian widths enter only
  * the direct sum).  Grid conventions as OpenMM's AMOEBA PME: atom spline points igrid..igrid+PME_ORDER-1
- * with igrid = floor(w) - PME_ORDER + 1, theta[i] = (M, M', M'', M''') of the B-spline.
+ * with igrid = floor(w) - PME_ORDER + 1, theta[i] = (M, M', M'', 0) of the B-spline (the third
+ * derivative of AMOEBA's version is not needed: dipole forces use M'' at most).
  * A dipole d is spread as d . grad of its charge spline: fractional dipole e_a = K_a sum_k d_k recip_k[a].
  */
 
@@ -35,21 +36,8 @@ DEVICE void computeBSplinePoint(real4* thetai, real w, real* array) {
     for (int i = PME_ORDER-1; i >= 2; i--)
         ARRAY(k,i) = ARRAY(k,i-1) - ARRAY(k,i);
     ARRAY(k,1) = -ARRAY(k,1);
-    k = PME_ORDER - 3;
-    ARRAY(k,PME_ORDER-2) = ARRAY(k,PME_ORDER-3);
-    for (int i = PME_ORDER-3; i >= 2; i--)
-        ARRAY(k,i) = ARRAY(k,i-1) - ARRAY(k,i);
-    ARRAY(k,1) = -ARRAY(k,1);
-    ARRAY(k,PME_ORDER-1) = ARRAY(k,PME_ORDER-2);
-    for (int i = PME_ORDER-2; i >= 2; i--)
-        ARRAY(k,i) = ARRAY(k,i-1) - ARRAY(k,i);
-    ARRAY(k,1) = -ARRAY(k,1);
-    ARRAY(k,PME_ORDER) = ARRAY(k,PME_ORDER-1);
-    for (int i = PME_ORDER-1; i >= 2; i--)
-        ARRAY(k,i) = ARRAY(k,i-1) - ARRAY(k,i);
-    ARRAY(k,1) = -ARRAY(k,1);
     for (int i = 1; i <= PME_ORDER; i++)
-        thetai[i-1] = make_real4(ARRAY(PME_ORDER,i), ARRAY(PME_ORDER-1,i), ARRAY(PME_ORDER-2,i), ARRAY(PME_ORDER-3,i));
+        thetai[i-1] = make_real4(ARRAY(PME_ORDER,i), ARRAY(PME_ORDER-1,i), ARRAY(PME_ORDER-2,i), 0);   // M''' unused
 }
 
 /**

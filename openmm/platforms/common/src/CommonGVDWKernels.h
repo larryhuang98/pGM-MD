@@ -8,8 +8,10 @@
 namespace PGMPlugin {
 
 /**
- * GVDWForce on the Common platforms (CUDA, OpenCL, HIP): a pair interaction in OpenMM's
- * nonbonded tile kernel (NonbondedUtilities, with exclusions), the dispersion correction on the host.
+ * GVDWForce on the Common platforms (CUDA, OpenCL, HIP): combination-rule pairs in OpenMM's nonbonded
+ * tile kernel (NonbondedUtilities; every exception pair excluded there), exceptions with parameters as
+ * a BondedUtilities interaction, the dispersion correction on the host.  Device code:
+ * kernels/gvdwPair.cc (the pair), gvdwNonbonded.cc, gvdwExceptions.cc.
  */
 class CommonCalcGVDWForceKernel : public CalcGVDWForceKernel {
 public:
@@ -25,8 +27,11 @@ private:
     void uploadParameters(const GVDWForce& force);
     OpenMM::ComputeContext& cc;
     const OpenMM::System& system;
-    OpenMM::ComputeArray params;   // per atom (R^2, sqrt(A), sqrt(C6), b), in the context's atom order
     ForceInfo* info = nullptr;
+    OpenMM::ComputeArray params;            // per atom (R^2, sqrt(A), sqrt(C6), b), original atom order
+    OpenMM::ComputeArray exceptionParams;   // per exception with parameters (A, C6, B, b_ij)
+    std::vector<int> exceptionIndex;        // the force's index of each of them
+    std::vector<std::pair<int, int> > exceptionPairs;   // all exceptions (the excluded pairs)
     bool dispersionCorrection = false;
     double cutoff = 0, sumC = 0;
 };

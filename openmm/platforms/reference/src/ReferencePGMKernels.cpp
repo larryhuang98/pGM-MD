@@ -59,6 +59,7 @@ void ReferenceCalcPGMForceKernel::initialize(const System& system, const PGMForc
         settings.grid[2] = nz;
     }
     engine.reset(new pgmcore::Engine(top, settings));
+    forceGroup = force.getForceGroup();
 }
 
 double ReferenceCalcPGMForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy) {
@@ -74,6 +75,7 @@ double ReferenceCalcPGMForceKernel::execute(ContextImpl& context, bool includeFo
             box[i] = {b[i][0], b[i][1], b[i][2]};
     }
     vector<pgmcore::V3> f(n, pgmcore::V3{0, 0, 0});
+    engine->setHistoryKey(context.getStepCount());   // one predictor entry per step, as on the GPU
     double energy = engine->compute(p, box, includeForces ? &f : nullptr);
     computed = true;
     if (includeForces) {
@@ -85,8 +87,9 @@ double ReferenceCalcPGMForceKernel::execute(ContextImpl& context, bool includeFo
 }
 
 void ReferenceCalcPGMForceKernel::getInducedDipoles(ContextImpl& context, vector<Vec3>& dipoles) {
+    // the dipoles of the last evaluation; before the first one, evaluate this force's group
     if (!computed)
-        execute(context, false, true);
+        context.calcForcesAndEnergy(false, true, 1<<forceGroup);
     const vector<pgmcore::V3>& mu = engine->inducedDipoles();
     dipoles.resize(mu.size());
     for (size_t i = 0; i < mu.size(); i++)

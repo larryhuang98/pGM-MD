@@ -27,8 +27,9 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
      diagonal `cj == ci_sh && j <= i`; padding atoms have zero parameters) + PME of q and p;
   3. predictor (mu4) + Jacobi PCG, each iteration a dipole-field pair pass + PME of the search direction;
      convergence max|alpha r| / mean|alpha E_perm| (one reduction);
-  4. forces at fixed dipoles: pair pass (forces + total field, i-forces into `fshift[shift]` so the nbnxm
-     virial machinery stays correct), PME force gather with second derivatives, covalent chain rule;
+  4. forces at fixed dipoles: pair pass (forces + total field), PME force gather with second
+     derivatives, covalent chain rule (G1: all forces into `ForceWithVirial` with the analytical virial
+     Xi = S^T/2; a SIMD kernel may put the pair forces into the shift-force buffer instead);
   5. energies: `CoulombSR` (direct), `CoulombReciprocalSpace` (PME + self + background), `Polarization`
      (|mu|^2/(2 alpha)); virial: shift forces for the pair part, PME mesh virial + the dipole term
      `sum_i E_rec,i (x) d_i`, background, covalent terms (all checked in pgm_core by finite differences).
@@ -137,9 +138,12 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
   tail, tol 1e-5, SETTLE, 2 fs; v-rescale, C-rescale), 7.4 ns/day, 6.0 CG iterations per step.  The box
   (`examples/water512/pgm3p25_512.prmtop`) is pGM-JAX's README box: pGM3P-25 electrostatics on TIP3P's
   geometry and LJ, whose reference density is 1.018 g/cm^3 (pGM-JAX, 14.9 ns, same box and settings,
-  docs/dielectric.md); pmemd's 1.0097 is the paper's geometry and LJ, another model.  GROMACS after
-  343 ps (average from 100 ps): density 1.0201 +- 0.0013 g/cm^3, pressure 46 +- 34 bar, T 298.5 K.
-  The run continues to 750 ps (`runs/gmx_w512/npt_ext.sh`, `npt_ext.out`).
+  docs/dielectric.md); pmemd's 1.0097 is the paper's geometry and LJ, another model.  GROMACS, 750 ps,
+  averages from 100 ps: density 1.0192 +- 0.0007 g/cm^3, pressure 27 +- 16 bar, T 298.2 K
+  (`runs/gmx_w512/npt_ext.out`).
+* GROMACS-side input checks: finite epsilon-r, no energy groups (one CoulombSR pair), every atom in
+  `[ pgm_atoms ]`, no 1-4 electrostatics, `-nb cpu`, one rank, no MTS; polarizabilities <= 1e-9 nm^3
+  count as zero.
 * Speed of this reference (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms per
   step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms, final
   forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels

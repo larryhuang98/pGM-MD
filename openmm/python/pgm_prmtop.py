@@ -16,7 +16,8 @@ What it builds (docs/spec.md):
 * or, with vdw="gvdw", GVDWForce (the Gaussian-density van der Waals of pmemd-pgm igvdw = 1) in place
   of the Lennard-Jones: the pGM radii, GVDW parameters from `gvdw` (pmemd-pgm's global
   gvdw_arep / gvdw_c6 / b_rep_scale on the atoms that carry LJ, as pmemd-pgm, or per atom type), the
-  prmtop's exclusions; the 1-4 pairs keep their scaled Lennard-Jones (NonbondedForce exceptions);
+  prmtop's exclusions (GVDW exceptions with A = C6 = 0); the 1-4 pairs keep their scaled Lennard-Jones
+  (NonbondedForce exceptions);
   dispersion correction of the C6 term with lj_lrc.
 
 Units: OpenMM's (nm, kJ/mol).
@@ -246,9 +247,11 @@ def add_gvdw(system, nb, par, gvdw, cutoff, periodic, lrc, group):
     f.setRepulsionForm({"gauss": openmmpgm.GVDWForce.Gaussian, "slater": openmmpgm.GVDWForce.Slater}[gvdw["rep"]])
     for i in range(n):
         f.addParticle(float(par["radius"][i]), *(float(v) for v in prm[i]))
+    # every exception of the prmtop (1-2, 1-3, 1-4) is excluded from GVDW; the 1-4 pairs keep the prmtop's
+    # scaled Lennard-Jones below (pmemd-pgm evaluates GVDW only in the nonbonded pair list)
     for k in range(nb.getNumExceptions()):
         i, j, _, _, _ = nb.getExceptionParameters(k)
-        f.addExclusion(i, j)
+        f.addException(i, j, 0.0, 0.0, 0.0)
     if periodic:
         f.setNonbondedMethod(openmmpgm.GVDWForce.CutoffPeriodic)
         f.setCutoffDistance(cutoff)

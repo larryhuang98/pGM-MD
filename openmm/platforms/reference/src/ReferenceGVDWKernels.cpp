@@ -5,6 +5,8 @@
 #include "openmm/internal/ContextImpl.h"
 #include "openmm/reference/ReferencePlatform.h"
 #include <cmath>
+#include <map>
+#include <utility>
 
 using namespace PGMPlugin;
 using namespace OpenMM;
@@ -25,6 +27,13 @@ static Vec3* extractBoxVectors(ContextImpl& context) {
     return (Vec3*) data->periodicBoxVectors;
 }
 
+/** Minimum image of d in OpenMM's reduced triclinic box (c, then b, then a). */
+static void minimumImage(Vec3& d, const Vec3* box) {
+    d -= box[2]*floor(d[2]/box[2][2]+0.5);
+    d -= box[1]*floor(d[1]/box[1][1]+0.5);
+    d -= box[0]*floor(d[0]/box[0][0]+0.5);
+}
+
 void ReferenceCalcGVDWForceKernel::setParameters(const GVDWForce& force) {
     int n = force.getNumParticles();
     R2.resize(n);
@@ -40,6 +49,27 @@ void ReferenceCalcGVDWForceKernel::setParameters(const GVDWForce& force) {
             active.push_back(i);
     }
     sumC = GVDWForceImpl::sumSqrtC6(force);
+    // every exception pair leaves the neighbour list; the ones with parameters are evaluated separately
+    map<int, int> activeIndex;
+    for (int k = 0; k < (int) active.size(); k++)
+        activeIndex[active[k]] = k;
+    activeExclusions.assign(active.size(), set<int>());
+    exceptions.clear();
+    exceptionPairs.clear();
+    evaluated.clear();
+    for (int k = 0; k < force.getNumExceptions(); k++) {
+        Exception e;
+        force.getExceptionParameters(k, e.i, e.j, e.A, e.C6, e.B);
+        exceptionPairs.push_back(make_pair(e.i, e.j));
+        if (e.A != 0 || e.C6 != 0)
+            evaluated.push_back(k);
+        if (activeIndex.count(e.i) && activeIndex.count(e.j)) {
+            activeExclusions[activeIndex[e.i]].insert(activeIndex[e.j]);
+            activeExclusions[activeIndex[e.j]].insert(activeIndex[e.i]);
+        }
+        if (e.A != 0 || e.C6 != 0)
+            exceptions.push_back(e);
+    }
 }
 
 void ReferenceCalcGVDWForceKernel::initialize(const System& system, const GVDWForce& force) {
@@ -47,55 +77,48 @@ void ReferenceCalcGVDWForceKernel::initialize(const System& system, const GVDWFo
     rep = force.getRepulsionForm();
     cutoff = force.getCutoffDistance();
     dispersionCorrection = force.getUseDispersionCorrection() && method == GVDWForce::CutoffPeriodic;
+    exceptionsPeriodic = force.getExceptionsUsePeriodicBoundaryConditions() && method == GVDWForce::CutoffPeriodic;
     setParameters(force);
-    exclusions.assign(force.getNumParticles(), set<int>());
-    for (int k = 0; k < force.getNumExclusions(); k++) {
-        int p1, p2;
-        force.getExclusionParticles(k, p1, p2);
-        exclusions[p1].insert(p2);
-        exclusions[p2].insert(p1);
-    }
 }
 
 double ReferenceCalcGVDWForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy) {
     vector<Vec3>& pos = extractPositions(context);
     vector<Vec3>& force = extractForces(context);
-    bool periodic = (method == GVDWForce::CutoffPeriodic);
-    bool useCutoff = (method != GVDWForce::NoCutoff);
-    Vec3 box[3];
-    if (periodic) {
-        Vec3* bv = extractBoxVectors(context);
-        box[0] = bv[0];
-        box[1] = bv[1];
-        box[2] = bv[2];
-    }
-    double rc2 = cutoff*cutoff, energy = 0;
+    const bool periodic = (method == GVDWForce::CutoffPeriodic);
+    Vec3* box = (periodic || exceptionsPeriodic ? extractBoxVectors(context) : nullptr);
+    double energy = 0;
+    auto addPair = [&](int i, int j, const Vec3& d, double r, double A, double C6, double B) {
+        double dEdR;
+        energy += pgmcore::gvdwPair(r, 1.0/sqrt(2.0*(R2[i]+R2[j])), A, C6, B, rep, dEdR);
+        if (includeForces) {
+            force[i] += d*dEdR;
+            force[j] -= d*dEdR;
+        }
+    };
+    // combination-rule pairs: all pairs of active atoms (exact; OpenMM's voxel-hash list missed pairs near
+    // the cutoff in a truncated octahedron with unwrapped positions)
     int na = active.size();
-    for (int ii = 0; ii < na; ii++) {
-        int i = active[ii];
+    const bool useCutoff = (method != GVDWForce::NoCutoff);
+    const double rc2 = cutoff*cutoff;
+    for (int ii = 0; ii < na; ii++)
         for (int jj = ii+1; jj < na; jj++) {
-            int j = active[jj];
-            if (exclusions[i].count(j))
+            if (activeExclusions[ii].count(jj))
                 continue;
+            int i = active[ii], j = active[jj];
             Vec3 d = pos[i]-pos[j];
-            if (periodic) {
-                // minimum image in the reduced box (c, then b, then a)
-                d -= box[2]*floor(d[2]/box[2][2]+0.5);
-                d -= box[1]*floor(d[1]/box[1][1]+0.5);
-                d -= box[0]*floor(d[0]/box[0][0]+0.5);
-            }
+            if (periodic)
+                minimumImage(d, box);
             double r2 = d.dot(d);
             if (useCutoff && r2 >= rc2)
                 continue;
-            double r = sqrt(r2);
-            double beta = 1.0/sqrt(2.0*(R2[i]+R2[j]));
-            double dEdR;
-            energy += pgmcore::gvdwPair(r, beta, sqrtA[i]*sqrtA[j], sqrtC6[i]*sqrtC6[j], 0.5*(b[i]+b[j]), rep, dEdR);
-            if (includeForces) {
-                force[i] += d*dEdR;
-                force[j] -= d*dEdR;
-            }
+            addPair(i, j, d, sqrt(r2), sqrtA[i]*sqrtA[j], sqrtC6[i]*sqrtC6[j], 0.5*(b[i]+b[j]));
         }
+    // exceptions: always evaluated, minimum image only on request
+    for (const Exception& e : exceptions) {
+        Vec3 d = pos[e.i]-pos[e.j];
+        if (exceptionsPeriodic)
+            minimumImage(d, box);
+        addPair(e.i, e.j, d, sqrt(d.dot(d)), e.A, e.C6, e.B);
     }
     if (dispersionCorrection)
         energy += pgmcore::gvdwTail(sumC, box[0][0]*box[1][1]*box[2][2], cutoff);
@@ -103,7 +126,23 @@ double ReferenceCalcGVDWForceKernel::execute(ContextImpl& context, bool includeF
 }
 
 void ReferenceCalcGVDWForceKernel::copyParametersToContext(ContextImpl& context, const GVDWForce& force) {
+    // the same contract as the Common platforms: the exception pairs, and which of them are evaluated,
+    // are fixed when the Context is created
     if (force.getNumParticles() != (int) R2.size())
         throw OpenMMException("GVDWForce.updateParametersInContext: the number of particles has changed");
+    if (force.getNumExceptions() != (int) exceptionPairs.size())
+        throw OpenMMException("GVDWForce.updateParametersInContext: the number of exceptions has changed");
+    vector<int> withParameters;
+    for (int k = 0; k < force.getNumExceptions(); k++) {
+        int p1, p2;
+        double A, C6, B;
+        force.getExceptionParameters(k, p1, p2, A, C6, B);
+        if (make_pair(p1, p2) != exceptionPairs[k])
+            throw OpenMMException("GVDWForce.updateParametersInContext: the particles of an exception have changed");
+        if (A != 0 || C6 != 0)
+            withParameters.push_back(k);
+    }
+    if (withParameters != evaluated)
+        throw OpenMMException("GVDWForce.updateParametersInContext: an exception cannot change between excluded (A = C6 = 0) and evaluated");
     setParameters(force);
 }

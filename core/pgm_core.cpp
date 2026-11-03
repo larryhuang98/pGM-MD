@@ -1,4 +1,5 @@
 #include "pgm_core.h"
+#include "pgm_constants.h"
 #include "pocketfft_hdronly.h"
 #include <algorithm>
 #include <cmath>
@@ -44,7 +45,14 @@ void erfKernels(double a, double r, int nmax, double* B) {
     }
 }
 
+static void applyPolarizabilityThreshold(Topology& top) {
+    for (double& a : top.alpha)
+        if (a <= MIN_POLARIZABILITY)
+            a = 0.0;   // not polarizable (pmemd-pgm's threshold)
+}
+
 Engine::Engine(const Topology& topology, const Settings& settings) : top(topology), s(settings) {
+    applyPolarizabilityThreshold(top);
     n = top.q.size();
     if ((int) top.radius.size() != n || (int) top.alpha.size() != n)
         throw invalid_argument("pgmcore: per-atom arrays of different lengths");
@@ -65,6 +73,7 @@ void Engine::setTopology(const Topology& t) {
     if ((int) t.q.size() != n)
         throw invalid_argument("pgmcore: setTopology cannot change the number of atoms");
     top = t;
+    applyPolarizabilityThreshold(top);
     havePos = false;
 }
 
@@ -370,7 +379,7 @@ void Engine::solve() {
 
     // initial guess
     vector<V3> x(n, V3{0, 0, 0});
-    bool samePos = havePos && lastPos == pos;
+    bool samePos = havePos && (historyKey >= 0 ? historyKey == lastKey : lastPos == pos);
     int h = history.size();
     if (samePos && h > 0)
         x = history[0];
@@ -460,6 +469,7 @@ void Engine::solve() {
             history.pop_back();
     }
     lastPos = pos;
+    lastKey = historyKey;
     havePos = true;
 }
 

@@ -1,5 +1,6 @@
 /*
- * pGM electrostatics for GROMACS, phase G1: scalar CPU implementation in double precision.
+ * pGM electrostatics for GROMACS, phase G1: scalar CPU implementation (pair kernels, splines, CG and
+ * forces in double precision; the PME grid and FFT in GROMACS's `real`).
  *
  * The model and the formulas are those of docs/spec.md of pgm-native and of its reference engine
  * core/pgm_core.cpp (checked against pGM-JAX); this file ports that engine to the GROMACS data
@@ -48,6 +49,8 @@ namespace
 {
 
 constexpr double c_sqrtPi = 1.7724538509055160273;
+//! polarizabilities at or below this [nm^3] are not polarizable (pmemd-pgm; core/pgm_constants.h)
+constexpr double c_minPolarizability = 1e-9;
 //! largest PME order (readir: pme-order <= 12)
 constexpr int c_maxPmeOrder = 12;
 
@@ -305,7 +308,15 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
     GMX_RELEASE_ASSERT(usingPgm(ir.coulombtype), "PgmElectrostatics needs coulombtype = pGM");
     rc_        = ir.rcoulomb;
     beta_      = ewaldCoefficient(ir.rcoulomb, ir.ewald_rtol);
-    ke_        = c_one4PiEps0 / (ir.epsilon_r != 0 ? ir.epsilon_r : 1.0);
+    if (ir.epsilon_r == 0)
+    {
+        gmx_fatal(FARGS, "coulombtype = pGM needs a finite epsilon-r");
+    }
+    if (ir.opts.ngener > 1)
+    {
+        gmx_fatal(FARGS, "coulombtype = pGM does not support energy groups yet (energygrps)");
+    }
+    ke_        = c_one4PiEps0 / ir.epsilon_r;
     tol_       = ir.pgm_dipole_tol;
     maxIter_   = ir.pgm_max_iter;
     peek_      = ir.pgm_peek;
@@ -322,7 +333,7 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
     if (fplog)
     {
         fprintf(fplog,
-                "\npGM electrostatics (G1, CPU, double precision):\n"
+                "\npGM electrostatics (G1, CPU; double-precision kernels, PME grid in real):\n"
                 "  rcoulomb %g nm, Ewald coefficient %.10g 1/nm, PME grid %d x %d x %d, order %d\n"
                 "  Coulomb constant %.10g, dipole tolerance %g, max. iterations %d, predictor %d, "
                 "peek %g\n\n",
@@ -421,7 +432,7 @@ void PgmElectrostatics::Impl::setTopology(int n, ArrayRef<const real> charges, c
         const t_iparams& ip = idef.iparams[ilAtom.iatoms[k]];
         const int        a  = ilAtom.iatoms[k + 1];
         radius_[a]          = ip.pgmAtom.radius;
-        alpha_[a]           = ip.pgmAtom.alpha;
+        alpha_[a]           = (ip.pgmAtom.alpha > c_minPolarizability ? ip.pgmAtom.alpha : 0.0);
     }
     for (int a = 0; a < n; a++)
     {
@@ -1160,7 +1171,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     double                     S[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // strain derivative [e^2/nm]
     // pairs: per-thread forces in threadVec_, fields in threadE, strain and energy
     std::vector<std::vector<DVec>>      threadE(nt_, std::vector<DVec>(n_, DVec{ 0, 0, 0 }));
-    std::vector<std::array<double, 10>> threadSum(nt_, std::array<double, 10>{});
+    std::array<double, 10>              threadSum{}; // S (9), direct energy: summed over threads
     const int                           numLists = pairs_.size();
     for (auto& v : threadVec_)
     {
@@ -1204,7 +1215,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
         for (int k = 0; k < 10; k++)
         {
 #pragma omp atomic
-            threadSum[0][k] += sum[k];
+            threadSum[k] += sum[k];
         }
     }
     reduceThreadVec(F);
@@ -1218,9 +1229,9 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     for (int k = 0; k < 9; k++)
     {
-        S[k] += threadSum[0][k];
+        S[k] += threadSum[k];
     }
-    direct += threadSum[0][9];
+    direct += threadSum[9];
 
     const double tPme0 = now();
     reciprocal         = pmePotential(&q, d, S);

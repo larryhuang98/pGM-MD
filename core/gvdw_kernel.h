@@ -58,10 +58,11 @@ inline void gvdwG(double y, double& G, double& H) {
 
 /**
  * Energy of one pair [kJ/mol]; dEdR = -(1/r) dU/dr [kJ/mol/nm^2] (force on i = dEdR (r_i - r_j)).
- * beta = 1/sqrt(2 (R_i^2 + R_j^2)) [1/nm].
+ * bij = 1/sqrt(2 (R_i^2 + R_j^2)) [1/nm], the Gaussian pair exponent (not the Ewald coefficient).
+ * At r = 0 the energy is finite; the Slater force there is set to 0 (its direction is undefined).
  */
-inline double gvdwPair(double r, double beta, double A, double C6, double B, int rep, double& dEdR) {
-    double y = beta*r, b2 = beta*beta, b6 = b2*b2*b2;
+inline double gvdwPair(double r, double bij, double A, double C6, double B, int rep, double& dEdR) {
+    double y = bij*r, b2 = bij*bij, b6 = b2*b2*b2;
     double erep, drep;   // drep = (1/r) dU_rep/dr
     if (rep == GVDWGaussian) {
         erep = A*std::exp(-B*y*y);
@@ -69,7 +70,7 @@ inline double gvdwPair(double r, double beta, double A, double C6, double B, int
     }
     else {
         erep = A*std::exp(-B*y);
-        drep = (r > 0 ? -B*beta*erep/r : 0.0);
+        drep = (r > 0 ? -B*bij*erep/r : 0.0);
     }
     double G, H;
     gvdwG(y, G, H);

@@ -8,6 +8,7 @@ add_custom_command(
         -o "${WRAP_FILE}"
         "-I${OPENMM_DIR}/include"
         "-I${CMAKE_SOURCE_DIR}/openmmapi/include"
+        "-I${CMAKE_SOURCE_DIR}/serialization/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/openmmpgm.i"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/openmmpgm.i" "${CMAKE_SOURCE_DIR}/openmmapi/include/PGMForce.h" "${CMAKE_SOURCE_DIR}/openmmapi/include/GVDWForce.h"
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"

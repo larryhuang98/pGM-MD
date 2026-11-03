@@ -77,12 +77,17 @@ one digit per order at a r ~ 0.7 in float32; md/kernels.py `erf_kernels`).
     U_dir = sum q_i q_j G0 + (q_i d_j.x - q_j d_i.x) G1 + (d_i.d_j) G1 - (d_i.x)(d_j.x) G2
 
 (beta: Ewald coefficient; pairs beyond r_c are assumed to have erfc(beta r) and erfc(a_ij r)
-negligible, which holds since a_ij > beta in practice: water a_OH = 8.7 /nm, beta ~ 3.5 /nm.)
+negligible, which holds since a_ij > beta in practice: water a_OH = 8.7 /nm, beta ~ 3.5 /nm.  The
+OpenMM plugin checks it: erfc(a_min r_c), a_min = 1/(2 R_max), must not exceed the Ewald error
+tolerance.)
 
 **Reciprocal space:** standard smooth PME of point charges and point dipoles with the same beta
 (Essmann 1995; dipoles as Sagui 2004): a dipole is spread as d . grad of its charge spline.
-pGM-JAX's PME follows OpenMM's reference PME exactly (B-spline recursion, grid index convention
-floor(w)..floor(w)+p-1, Euler exponential-spline moduli). The Gaussian widths enter only the direct
+pGM-JAX's PME follows OpenMM's reference PME (B-spline recursion, Euler exponential-spline moduli);
+the grid-index convention differs between implementations by a constant shift of the grid (OpenMM
+reference: points floor(w)..floor(w)+p-1; pgm_core and the GROMACS module: M_p(fr + j) on point
+floor(w) - j; the GPU kernels: AMOEBA's floor(w) - p + 1 ...), which leaves energies and forces
+unchanged. The Gaussian widths enter only the direct
 sum.
 
 **Self and background:**
@@ -106,7 +111,8 @@ mu minimizes E_elec (a quadratic in mu): for every polarizable atom
 
 with E^perm the field of the charges and the permanent dipoles (direct + PME + self) and T the
 dipole-dipole field tensor (direct + PME + self). Atoms with alpha = 0 (pmemd: alpha <= 1e-6 A^3)
-are not polarizable: mu_i = 0 and their |mu|^2/(2 alpha) is 0.
+are not polarizable: mu_i = 0 and their |mu|^2/(2 alpha) is 0 (every engine applies the threshold
+1e-9 nm^3, core/pgm_constants.h).
 
 Solver (as pmemd-pgm GPU and pGM-JAX, `Induction`):
 

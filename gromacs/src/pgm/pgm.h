@@ -6,7 +6,7 @@
  * sum runs over the nbnxm cluster pair lists, which keep all pairs within the cut-off, excluded pairs
  * included (pGM electrostatics have no exclusions; the nbnxm kernels compute Lennard-Jones only).
  *
- * Phase G1: scalar CPU implementation in double precision, single rank, the reference of the SIMD and
+ * Phase G1: scalar CPU implementation (double-precision kernels), single rank, the reference of the SIMD and
  * GPU kernels.  Forces go to the ForceWithVirial buffer with the analytical strain derivative as the
  * virial.
  */

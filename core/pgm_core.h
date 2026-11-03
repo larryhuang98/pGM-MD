@@ -53,6 +53,12 @@ public:
      * ignored for non-periodic systems.
      */
     double compute(const std::vector<V3>& pos, const V3 box[3], std::vector<V3>* forces);
+    /**
+     * Key of the predictor history (an MD step count; -1: none).  The history holds one solution per key:
+     * a later evaluation with the same key (a barostat trial, an energy query) starts from that solution
+     * and leaves the history alone; without a key, evaluations at unchanged positions do the same.
+     */
+    void setHistoryKey(long long key) { historyKey = key; }
     const std::vector<V3>& permanentDipoles() const { return perm; }
     const std::vector<V3>& inducedDipoles() const { return mu; }
     int iterations() const { return lastIterations; }
@@ -81,6 +87,7 @@ private:
     std::deque<std::vector<V3> > history;
     std::vector<V3> lastPos;
     bool havePos = false;
+    long long historyKey = -1, lastKey = -1;
     int lastIterations = 0;
     double lastResidual = 0;
     EnergyTerms lastTerms;

@@ -1,6 +1,7 @@
 #include "CommonPGMKernels.h"
 #include "CommonPGMKernelSources.h"
 #include "internal/PGMForceImpl.h"
+#include "pgm_constants.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/common/ComputeForceInfo.h"
 #include "openmm/common/ContextSelector.h"
@@ -14,7 +15,8 @@ using namespace PGMPlugin;
 using namespace OpenMM;
 using namespace std;
 
-static const int CG_GROUP_SIZE = 512;
+// threads of the single-work-group CG kernels: at most this, a power of two within the device limit
+static const int MAX_CG_GROUP_SIZE = 512;
 
 class CommonCalcPGMForceKernel::ForceInfo : public ComputeForceInfo {
 public:
@@ -105,6 +107,8 @@ void CommonCalcPGMForceKernel::uploadParameters(const PGMForce& force) {
     for (int i = 0; i < numParticles; i++) {
         double r;
         force.getParticleParameters(i, q[i], r, al[i]);
+        if (al[i] <= pgmcore::MIN_POLARIZABILITY)
+            al[i] = 0.0;   // not polarizable (pmemd-pgm's threshold)
         rg[i] = 2*r*r;
         totalCharge += q[i];
     }
@@ -186,8 +190,20 @@ void CommonCalcPGMForceKernel::initialize(const System& system, const PGMForce& 
     cgAp.initialize(cc, 3*padded, elementSize, "pgmCgAp");
     for (int k = 0; k < 4; k++)
         hist[k].initialize(cc, 3*padded, elementSize, "pgmHistory");
+    histScratch.initialize(cc, 3*padded, elementSize, "pgmHistoryScratch");
     scalars.initialize(cc, 8, mixedSize, "pgmScalars");
-    cc.clearBuffer(inducedDipole);
+    // defined values everywhere, padding atoms included
+    for (ComputeArray* a : {&inducedDipole, &permDipole, &totalDipole, &cgR, &cgZ, &cgP, &cgAp, &histScratch, &hist[0], &hist[1], &hist[2], &hist[3]})
+        cc.clearBuffer(*a);
+    cgGroupSize = 1;
+    while (2*cgGroupSize <= min(MAX_CG_GROUP_SIZE, cc.getMaxThreadBlockSize()))
+        cgGroupSize *= 2;
+    for (int m = 0; m < force.getNumCovalentDipoles(); m++) {
+        int a, b;
+        double c;
+        force.getCovalentDipoleParameters(m, a, b, c);
+        covalentPairs.push_back(make_pair(a, b));
+    }
 
     map<string, string> defines;
     defines["NUM_ATOMS"] = cc.intToString(numParticles);
@@ -195,7 +211,7 @@ void CommonCalcPGMForceKernel::initialize(const System& system, const PGMForce& 
     defines["NUM_COVALENT"] = cc.intToString(numCovalent);
     defines["ENERGY_SCALE"] = cc.doubleToString(ke);
     defines["CSELF"] = cc.doubleToString(cself);
-    defines["CG_GROUP_SIZE"] = cc.intToString(CG_GROUP_SIZE);
+    defines["CG_GROUP_SIZE"] = cc.intToString(cgGroupSize);
     defines["SQRT_PI"] = cc.doubleToString(sqrt(M_PI));
     defines["M_PI"] = cc.doubleToString(M_PI);
     if (usePME) {
@@ -332,7 +348,9 @@ void CommonCalcPGMForceKernel::initialize(const System& system, const PGMForce& 
 
     // Every pair interacts: no exclusions are requested (the vdW forces have their own).
     cc.getNonbondedUtilities().addInteraction(usePME, usePME, false, cutoff, vector<vector<int> >(), "", force.getForceGroup());
-    cc.addForce(new ForceInfo(force));
+    forceGroup = force.getForceGroup();
+    info = new ForceInfo(force);
+    cc.addForce(info);
     cc.addReorderListener(new ReorderListener(*this));
 }
 
@@ -479,6 +497,7 @@ double CommonCalcPGMForceKernel::execute(ContextImpl& context, bool includeForce
     ContextSelector selector(cc);
     if (!hasInitializedKernels)
         initKernels();
+    evaluated = true;
     NonbondedUtilities& nb = cc.getNonbondedUtilities();
     if (nb.getUseCutoff() && maxTiles < nb.getInteractingTiles().getSize()) {
         // The neighbor list grew: point the pair kernels at the new arrays.
@@ -547,7 +566,7 @@ double CommonCalcPGMForceKernel::execute(ContextImpl& context, bool includeForce
         runPairs(pairInducedKernel);
         if (usePME)
             pmeField(inducedDipole, 0.0f, inducedField);
-        cgInitKernel->execute(CG_GROUP_SIZE, CG_GROUP_SIZE);
+        cgInitKernel->execute(cgGroupSize, cgGroupSize);
         pairInducedKernel->setArg(5, cgP);
         double err = downloadScalars()[2];
         int it = 0;
@@ -556,16 +575,20 @@ double CommonCalcPGMForceKernel::execute(ContextImpl& context, bool includeForce
             runPairs(pairInducedKernel);
             if (usePME)
                 pmeField(cgP, 0.0f, inducedField);
-            cgStepKernel->execute(CG_GROUP_SIZE, CG_GROUP_SIZE);
+            cgStepKernel->execute(cgGroupSize, cgGroupSize);
             err = downloadScalars()[2];
             it++;
         }
         lastIterations = it;
+        // the history holds one solution per step (the first evaluation of the step): a second evaluation
+        // at the same step (a barostat trial, getState) starts from it but must not replace it
         if (!sameStep) {
             histHead = (histHead+1)%4;
             histCount = min(histCount+1, 4);
+            cgFinishKernel->setArg(3, hist[histHead]);
         }
-        cgFinishKernel->setArg(3, hist[histHead]);
+        else
+            cgFinishKernel->setArg(3, histScratch);
         cgFinishKernel->execute(padded);
         lastStep = step;
     }
@@ -607,6 +630,9 @@ double CommonCalcPGMForceKernel::execute(ContextImpl& context, bool includeForce
 }
 
 void CommonCalcPGMForceKernel::getInducedDipoles(ContextImpl& context, vector<Vec3>& dipoles) {
+    // the dipoles of the last evaluation; before the first one, evaluate this force's group
+    if (!evaluated)
+        context.calcForcesAndEnergy(false, true, 1<<forceGroup);
     ContextSelector selector(cc);
     vector<double> d;
     inducedDipole.download(d, true);
@@ -635,24 +661,18 @@ void CommonCalcPGMForceKernel::copyParametersToContext(ContextImpl& context, con
         throw OpenMMException("updateParametersInContext: the number of particles has changed");
     if (force.getNumCovalentDipoles() != numCovalent)
         throw OpenMMException("updateParametersInContext: the number of covalent dipoles has changed");
-    // Parameters are stored in the current atom order: permute the force's values accordingly.
-    const vector<int>& order = cc.getAtomIndex();
-    PGMForce reordered;
-    for (int i = 0; i < numParticles; i++) {
-        double q, r, a;
-        force.getParticleParameters(order[i], q, r, a);
-        reordered.addParticle(q, r, a);
-    }
-    vector<int> inverse(numParticles);
-    for (int i = 0; i < numParticles; i++)
-        inverse[order[i]] = i;
     for (int m = 0; m < numCovalent; m++) {
         int a, b;
         double c;
         force.getCovalentDipoleParameters(m, a, b, c);
-        reordered.addCovalentDipole(inverse[a], inverse[b], c);
+        if (make_pair(a, b) != covalentPairs[m])
+            throw OpenMMException("updateParametersInContext: the atoms of a covalent dipole have changed");
     }
-    uploadParameters(reordered);
+    // In the original atom order, as OpenMM's own forces: the context only exchanges identical molecules
+    // (ForceInfo); if the change makes an exchange invalid, invalidateMolecules() restores the original
+    // order (and the reorder listener resets the predictor history).
+    uploadParameters(force);
+    cc.invalidateMolecules(info, true, true);
     resetHistory();
 }
 

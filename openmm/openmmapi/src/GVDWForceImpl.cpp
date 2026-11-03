@@ -2,7 +2,6 @@
 #include "PGMKernels.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/internal/ContextImpl.h"
-#include <set>
 
 using namespace PGMPlugin;
 using namespace OpenMM;
@@ -19,14 +18,12 @@ void GVDWForceImpl::initialize(ContextImpl& context) {
     int n = owner.getNumParticles();
     if (n != system.getNumParticles())
         throw OpenMMException("GVDWForce must have exactly as many particles as the System it belongs to.");
-    set<pair<int, int> > seen;
-    for (int i = 0; i < owner.getNumExclusions(); i++) {
+    for (int i = 0; i < owner.getNumExceptions(); i++) {
         int a, b;
-        owner.getExclusionParticles(i, a, b);
-        if (a < 0 || a >= n || b < 0 || b >= n || a == b)
-            throw OpenMMException("GVDWForce: illegal particle index in an exclusion");
-        if (!seen.insert(make_pair(min(a, b), max(a, b))).second)
-            throw OpenMMException("GVDWForce: the same pair is excluded twice");
+        double A, C6, B;
+        owner.getExceptionParameters(i, a, b, A, C6, B);
+        if (a < 0 || a >= n || b < 0 || b >= n)
+            throw OpenMMException("GVDWForce: illegal particle index in an exception");
     }
     if (owner.getNonbondedMethod() == GVDWForce::CutoffPeriodic) {
         Vec3 boxVectors[3];

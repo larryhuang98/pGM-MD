@@ -48,13 +48,18 @@ private:
     double tol, peek, ke, beta, cutoff, totalCharge, cself;
     OpenMM::ComputeArray charge, rgauss, polarizability, covStart, covAtom, covPartner, covStrength;
     OpenMM::ComputeArray permDipole, inducedDipole, totalDipole, field, inducedField, totalField;
-    OpenMM::ComputeArray cgR, cgZ, cgP, cgAp, scalars, hist[4];
+    OpenMM::ComputeArray cgR, cgZ, cgP, cgAp, scalars, hist[4], histScratch;
     OpenMM::ComputeArray pmeGridLong, pmeGrid1, pmeGrid2, moduliX, moduliY, moduliZ;
     OpenMM::FFT3D fft;
     OpenMM::ComputeKernel permKernel, guessKernel, cgInitKernel, cgStepKernel, cgFinishKernel, totalKernel, selfKernel, covForceKernel;
     OpenMM::ComputeKernel pairInducedKernel, pairFixedKernel, pairForceKernel;
     OpenMM::ComputeKernel spreadKernel, finishSpreadKernel, convKernel, fieldFromGridKernel, forceFromGridKernel;
     int pairBlockSize, maxTiles;
+    int cgGroupSize;                                   // threads of the single-group CG kernels (power of 2)
+    ForceInfo* info = nullptr;
+    bool evaluated = false;
+    int forceGroup = 0;
+    std::vector<std::pair<int, int> > covalentPairs;   // fixed after initialize
 };
 
 } // namespace PGMPlugin

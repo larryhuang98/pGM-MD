@@ -27,6 +27,7 @@ private:
     pgmcore::Settings settings;
     std::unique_ptr<pgmcore::Engine> engine;
     bool computed = false;
+    int forceGroup = 0;
 };
 
 } // namespace PGMPlugin

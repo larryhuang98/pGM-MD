@@ -1,7 +1,7 @@
 #---------------------------------------------------
 # OpenMM pGM plugin
 #
-# Libraries: OpenMMPGM (API), OpenMMPGMReference (Reference/CPU platforms, pgm_core),
+# Libraries: OpenMMPGM (API + XML serialization), OpenMMPGMReference (Reference/CPU platforms, pgm_core),
 # OpenMMPGMCUDA / OpenMMPGMOpenCL (Common kernels).  Python module openmmpgm.
 #----------------------------------------------------
 
@@ -25,14 +25,15 @@ SET(PGM_CORE_DIR "${CMAKE_SOURCE_DIR}/../core")
 # The API library
 SET(PGM_LIBRARY_NAME OpenMMPGM)
 SET(SHARED_PGM_TARGET ${PGM_LIBRARY_NAME})
-FILE(GLOB API_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/src/*.cpp)
-FILE(GLOB API_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include/*.h ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include/internal/*.h)
-INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include)
+FILE(GLOB API_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/src/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/serialization/src/*.cpp)
+FILE(GLOB API_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include/*.h ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include/internal/*.h
+     ${CMAKE_CURRENT_SOURCE_DIR}/serialization/include/*.h)
+INCLUDE_DIRECTORIES(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/openmmapi/include ${CMAKE_CURRENT_SOURCE_DIR}/serialization/include)
 ADD_LIBRARY(${SHARED_PGM_TARGET} SHARED ${API_SOURCES} ${API_HEADERS})
 SET_TARGET_PROPERTIES(${SHARED_PGM_TARGET} PROPERTIES COMPILE_FLAGS "-DOPENMM_PGM_BUILDING_SHARED_LIBRARY")
 TARGET_LINK_LIBRARIES(${SHARED_PGM_TARGET} OpenMM)
 INSTALL(TARGETS ${SHARED_PGM_TARGET} DESTINATION lib)
-FILE(GLOB API_ONLY_INCLUDE_FILES "openmmapi/include/*.h")
+FILE(GLOB API_ONLY_INCLUDE_FILES "openmmapi/include/*.h" "serialization/include/*.h")
 INSTALL(FILES ${API_ONLY_INCLUDE_FILES} DESTINATION include)
 FILE(GLOB API_ONLY_INCLUDE_FILES_INTERNAL "openmmapi/include/internal/*.h")
 INSTALL(FILES ${API_ONLY_INCLUDE_FILES_INTERNAL} DESTINATION include/internal)

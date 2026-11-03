@@ -115,13 +115,20 @@ public:
                     out[3*i+k] = d[i][k];
             return out;
         }
-        static PGMPlugin::PGMForce& cast(OpenMM::Force& force) {
+        static PGMPlugin::PGMForce& _cast(OpenMM::Force& force) {
             return dynamic_cast<PGMPlugin::PGMForce&>(force);
         }
         static bool isinstance(OpenMM::Force& force) {
             return (dynamic_cast<PGMPlugin::PGMForce*>(&force) != NULL);
         }
         %pythoncode %{
+          @staticmethod
+          def cast(force):
+              """The PGMForce behind a generic Force (e.g. from System.getForce or XmlSerializer); keeps `force` alive."""
+              result = PGMForce._cast(force)
+              result._owner = force
+              return result
+
           def getInducedDipoles(self, context):
               """Induced dipoles of the last evaluation, (N, 3) numpy array [e nm]."""
               import numpy as np
@@ -155,14 +162,22 @@ public:
     %clear double& sqrtC6;
     %clear double& b;
     void setParticleParameters(int index, double radius, double sqrtA, double sqrtC6, double b);
-    int getNumExclusions() const;
-    int addExclusion(int particle1, int particle2);
+    int getNumExceptions() const;
+    int addException(int particle1, int particle2, double A, double C6, double B, bool replace = false);
     %apply int& OUTPUT {int& particle1};
     %apply int& OUTPUT {int& particle2};
-    void getExclusionParticles(int index, int& particle1, int& particle2) const;
+    %apply double& OUTPUT {double& A};
+    %apply double& OUTPUT {double& C6};
+    %apply double& OUTPUT {double& B};
+    void getExceptionParameters(int index, int& particle1, int& particle2, double& A, double& C6, double& B) const;
     %clear int& particle1;
     %clear int& particle2;
-    void setExclusionParticles(int index, int particle1, int particle2);
+    %clear double& A;
+    %clear double& C6;
+    %clear double& B;
+    void setExceptionParameters(int index, int particle1, int particle2, double A, double C6, double B);
+    bool getExceptionsUsePeriodicBoundaryConditions() const;
+    void setExceptionsUsePeriodicBoundaryConditions(bool periodic);
     NonbondedMethod getNonbondedMethod() const;
     void setNonbondedMethod(NonbondedMethod method);
     double getCutoffDistance() const;
@@ -174,9 +189,28 @@ public:
     void updateParametersInContext(OpenMM::Context& context);
     bool usesPeriodicBoundaryConditions() const;
     %extend {
-        static PGMPlugin::GVDWForce& cast(OpenMM::Force& force) {
+        static PGMPlugin::GVDWForce& _cast(OpenMM::Force& force) {
             return dynamic_cast<PGMPlugin::GVDWForce&>(force);
         }
+        void _createExceptionsFromBonds(const std::vector<int>& flat, double scale14A, double scale14C6) {
+            std::vector<std::pair<int, int> > bonds;
+            for (size_t i = 0; i+1 < flat.size(); i += 2)
+                bonds.push_back(std::make_pair(flat[i], flat[i+1]));
+            self->createExceptionsFromBonds(bonds, scale14A, scale14C6);
+        }
+        %pythoncode %{
+          @staticmethod
+          def cast(force):
+              """The GVDWForce behind a generic Force (e.g. from System.getForce or XmlSerializer); keeps `force` alive."""
+              result = GVDWForce._cast(force)
+              result._owner = force
+              return result
+
+          def createExceptionsFromBonds(self, bonds, scale14A, scale14C6):
+              """Exclude the 1-2 and 1-3 pairs of `bonds` (pairs of particle indices), scale the 1-4 pairs."""
+              flat = [int(v) for bond in bonds for v in bond]
+              return self._createExceptionsFromBonds(flat, scale14A, scale14C6)
+        %}
         static bool isinstance(OpenMM::Force& force) {
             return (dynamic_cast<PGMPlugin::GVDWForce*>(&force) != NULL);
         }

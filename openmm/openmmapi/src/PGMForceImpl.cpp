@@ -2,8 +2,10 @@
 #include "PGMKernels.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/internal/ContextImpl.h"
+#include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 
 using namespace PGMPlugin;
 using namespace OpenMM;
@@ -33,6 +35,27 @@ void PGMForceImpl::initialize(ContextImpl& context) {
         double cutoff = owner.getCutoffDistance();
         if (cutoff > 0.5*boxVectors[0][0] || cutoff > 0.5*boxVectors[1][1] || cutoff > 0.5*boxVectors[2][2])
             throw OpenMMException("PGMForce: the cutoff distance cannot be greater than half the periodic box size.");
+        // the direct sum drops erf(a_ij r)/r - erf(beta r)/r beyond the cutoff, i.e. erfc(a_ij rc)/rc of the
+        // Gaussian part (docs/spec.md, section 4): wide Gaussians need a longer cutoff
+        double maxRadius = 0;
+        for (int i = 0; i < n; i++) {
+            double q, R, a;
+            owner.getParticleParameters(i, q, R, a);
+            maxRadius = max(maxRadius, R);
+        }
+        double amin = 1.0/sqrt(4.0*maxRadius*maxRadius);
+        if (erfc(amin*cutoff) > owner.getEwaldErrorTolerance()) {
+            stringstream msg;
+            msg << "PGMForce: the largest Gaussian radius (" << maxRadius << " nm) is too wide for the cutoff: "
+                << "erfc(a rc) = " << erfc(amin*cutoff) << " exceeds the Ewald error tolerance; increase the cutoff";
+            throw OpenMMException(msg.str());
+        }
+        double alpha;
+        int nx, ny, nz;
+        calcPMEParameters(system, owner, alpha, nx, ny, nz);
+        int order = owner.getPMEOrder();
+        if (nx < order || ny < order || nz < order)
+            throw OpenMMException("PGMForce: every PME grid dimension must be at least the PME order");
     }
     kernel = context.getPlatform().createKernel(CalcPGMForceKernel::Name(), context);
     kernel.getAs<CalcPGMForceKernel>().initialize(system, owner);

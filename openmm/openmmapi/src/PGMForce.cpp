@@ -74,6 +74,8 @@ double PGMForce::getCutoffDistance() const {
 }
 
 void PGMForce::setCutoffDistance(double distance) {
+    if (!(distance > 0))
+        throw OpenMMException("PGMForce: the cutoff must be positive");
     cutoffDistance = distance;
 }
 
@@ -85,6 +87,11 @@ void PGMForce::getPMEParameters(double& alpha, int& nx, int& ny, int& nz) const 
 }
 
 void PGMForce::setPMEParameters(double alpha, int nx, int ny, int nz) {
+    // alpha = 0: automatic (grid ignored); alpha > 0 needs a grid of at least the PME order per axis
+    if (!(alpha >= 0))
+        throw OpenMMException("PGMForce: the Ewald coefficient must not be negative");
+    if (alpha > 0 && (nx < 1 || ny < 1 || nz < 1))
+        throw OpenMMException("PGMForce: an explicit Ewald coefficient needs an explicit PME grid");
     this->alpha = alpha;
     this->nx = nx;
     this->ny = ny;
@@ -106,6 +113,8 @@ double PGMForce::getEwaldErrorTolerance() const {
 }
 
 void PGMForce::setEwaldErrorTolerance(double tol) {
+    if (!(tol > 0 && tol < 1))
+        throw OpenMMException("PGMForce: the Ewald error tolerance must be between 0 and 1");
     ewaldErrorTol = tol;
 }
 
@@ -118,6 +127,8 @@ PGMForce::Polarization PGMForce::getPolarization() const {
 }
 
 void PGMForce::setPolarization(Polarization type) {
+    if (type != Mutual && type != NoPolarization)
+        throw OpenMMException("PGMForce: illegal value for the polarization type");
     polarization = type;
 }
 
@@ -126,6 +137,8 @@ double PGMForce::getInducedDipoleTolerance() const {
 }
 
 void PGMForce::setInducedDipoleTolerance(double tol) {
+    if (!(tol > 0))
+        throw OpenMMException("PGMForce: the induced-dipole tolerance must be positive");
     inducedTol = tol;
 }
 
@@ -134,6 +147,8 @@ int PGMForce::getMaxInducedDipoleIterations() const {
 }
 
 void PGMForce::setMaxInducedDipoleIterations(int iter) {
+    if (iter < 0)
+        throw OpenMMException("PGMForce: the maximum number of iterations must not be negative");
     maxIterations = iter;
 }
 
@@ -142,6 +157,8 @@ double PGMForce::getPeekCoefficient() const {
 }
 
 void PGMForce::setPeekCoefficient(double omega) {
+    if (!(omega >= 0 && omega <= 2))
+        throw OpenMMException("PGMForce: the peek coefficient must be between 0 and 2");
     peek = omega;
 }
 
@@ -150,6 +167,8 @@ PGMForce::Predictor PGMForce::getPredictor() const {
 }
 
 void PGMForce::setPredictor(Predictor p) {
+    if (p != NoPredictor && p != Mu3 && p != Mu4)
+        throw OpenMMException("PGMForce: illegal value for the predictor");
     predictor = p;
 }
 
@@ -158,6 +177,8 @@ double PGMForce::getCoulombConstant() const {
 }
 
 void PGMForce::setCoulombConstant(double ke) {
+    if (!(ke > 0))
+        throw OpenMMException("PGMForce: the Coulomb constant must be positive");
     coulomb = ke;
 }
 
