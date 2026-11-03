@@ -55,10 +55,7 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
 #else
 !#ifdef NEED_VIR
   use pol_gauss_direct_data, only : displacement_img
-!#ifdef NEED_DEVDW || NEED_BHVDW
-  use altvdw_var_mod, only : idevdw, ibuckvdw, &
-                             de_a, de_c, de_eps0, de_rmin, de_a_r, de_c_r, &
-                             bh_a, bh_eps0, bh_rmin, bh_a_r
+  use pol_gauss_mdin_dat_mod, only : igvdw, gvdw_rep_form, b_rep_scale
 #endif
 !#endif
 
@@ -294,12 +291,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         if (cutoffs_equal) then
           if(fswitch .le. 0) then
             if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -308,12 +301,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                endif
             else
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -330,12 +319,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         else
           if(fswitch .le. 0) then
             if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -344,12 +329,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                   gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
             else
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw_2cut(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -371,12 +352,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         if (need_virials) then
           if(fswitch .le. 0) then
             if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -385,12 +362,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
             else
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_efv_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_efv_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_efv_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -407,12 +380,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         else
           if(fswitch .le. 0) then
             if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_ef_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_ef_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_ef_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -421,12 +390,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
             else
-               if (idevdw .gt. 0) then
-              call pairs_calc_PGM_ef_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-              call pairs_calc_PGM_ef_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
+               if (igvdw .gt. 0) then
+              call pairs_calc_PGM_ef_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, efs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -500,12 +465,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
           if (cutoffs_equal) then
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -514,12 +475,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                    gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)!modified _sp by Ashraf
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -536,12 +493,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
           else
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -550,12 +503,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                         gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -576,12 +525,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
           if (cutoffs_equal) then
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -590,12 +535,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                       gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -612,12 +553,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
           else
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -626,12 +563,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                        gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)!modified _sp by Ashraf
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -656,12 +589,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         if (need_virials) then
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -670,12 +599,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                    gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)!modified _sp by Ashraf
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_fv_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_fv_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_fv_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -692,12 +617,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
         else
             if(fswitch .le. 0) then
               if(use_pme .eq. 0) then
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -706,12 +627,8 @@ subroutine get_nb_energy_PGM(ipairs, img_crd, img_disp, img_chg, img_dip, eed_cu
                                       gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                end if
               else
-               if (idevdw .gt. 0) then
-                call pairs_calc_PGM_f_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
-                                      eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
-                                     gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
-               else if (ibuckvdw .gt. 0) then
-                call pairs_calc_PGM_f_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
+               if (igvdw .gt. 0) then
+                call pairs_calc_PGM_f_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, fs_tbl, &
                                       eed_cub, phi, typ_ico, ipairs(ipairs_idx), &
                                      gbl_img_iac, gbl_cn1, gbl_cn2, x_tran)
                else
@@ -787,22 +704,14 @@ contains
 
 ! energy + force combos
 #define BUILD_PAIRS_CALC_EF
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_ef_devdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_ef_gvdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_ef_bhvdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_ef_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_ef(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_ef_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -812,22 +721,14 @@ contains
 
 #define BUILD_PAIRS_CALC_EF
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_ef_devdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_ef_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_devdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_ef_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_bhvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_ef_gvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_ef_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_ef_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -857,21 +758,14 @@ contains
 
 #define BUILD_PAIRS_CALC_EF
 #define VACUUM
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_ef_devdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_ef_gvdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_ef_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_ef_bhdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 
 !subroutine pairs_calc_PGM_ef_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
@@ -880,22 +774,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_ef_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_ef_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_devdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_ef_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_ef_bhvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_ef_gvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_ef_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_ef_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -907,21 +793,14 @@ contains
 
 ! energy + force + virial combos
 #define BUILD_PAIRS_CALC_EFV
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_efv_devdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_efv_gvdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_efv_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_efv_bhvdw(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_efv(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_efv_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -929,21 +808,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_efv_devdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_efv_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_devdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_efv_gvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_efv_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_bhvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_efv_2cut(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                               phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_efv_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -966,21 +838,14 @@ contains
 #undef FSWITCH
 
 #define VACUUM
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_efv_devdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_efv_gvdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_efv_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_efv_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_efv_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_efv_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -988,21 +853,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_efv_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_efv_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_devdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_efv_gvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_efv_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_efv_bhvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_efv_2cut_vac(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_efv_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, ef_tbl, eed_cub, &
@@ -1015,21 +873,14 @@ contains
 
 ! force + virial combos
 #define BUILD_PAIRS_CALC_FV
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_fv_devdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_fv_gvdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_fv_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_fv_bhvdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_fv(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_fv_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1037,21 +888,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_fv_devdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_fv_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_devdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_fv_gvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_fv_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_bhvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_fv_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_fv_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1077,21 +921,14 @@ contains
 #undef FSWITCH
 
 #define VACUUM
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_fv_devdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_fv_gvdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_fv_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_fv_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_fv_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_fv_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1099,21 +936,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_fv_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_fv_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_devdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_fv_gvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_fv_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_fv_bhvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_fv_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_fv_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1126,21 +956,14 @@ contains
 
 ! force combos
 #define BUILD_PAIRS_CALC_F
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_f_devdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_f_gvdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_devdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_f_gvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_f_bhvdw(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_bhvdw_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_f(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_f_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1148,21 +971,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_f_devdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_f_gvdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_fdevdw__2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_f_bhvdw_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_bhvdw_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_f_2cut(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_f_2cut_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1185,21 +1001,14 @@ contains
 #undef FSWITCH
 
 #define VACUUM
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_f_devdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_f_gvdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_devdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_f_gvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_f_bhvdw_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_bhvdw_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_f_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_f_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
@@ -1207,21 +1016,14 @@ contains
 #include "pairs_calc_PGM.i"
 
 #define BUILD_PAIRS_CALC_NOVEC_2CUT
-#define NEED_DEVDW
-!subroutine pairs_calc_PGM_f_devdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+#define NEED_GVDW
+!subroutine pairs_calc_PGM_f_gvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                             phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_devdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
+!subroutine pairs_calc_PGM_f_gvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 #include "pairs_calc_PGM.i"
 
-#undef NEED_DEVDW
-#define NEED_BHVDW
-!subroutine pairs_calc_PGM_f_bhvdw_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                             phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-!subroutine pairs_calc_PGM_f_bhvdw_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
-!                        phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
-#include "pairs_calc_PGM.i"
-#undef NEED_BHVDW
+#undef NEED_GVDW
 !subroutine pairs_calc_PGM_f_2cut_vac(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &
 !                             phi, ico, ipairs_sublst, img_iac, cn1, cn2, x_tran)
 !subroutine pairs_calc_PGM_f_2cut_vac_use_saved_B(img_frc, img_crd, img_chg, img_dip, f_tbl, eed_cub, &

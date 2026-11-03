@@ -51,6 +51,178 @@ extern "C" void kPGMXLUpdate(gpuContext gpu, double* dst, const double* mu, doub
 // integrator; each step: fused sweep gives r0 = b - A n, mu = n + w*r0, forces from mu, then
 // n_{k+1} = 2n_k - n_{k-1} + kappa*(mu - n_k) + alpha*sum_j c_j n_{k-j}.   env PGM_XL_W = w (default 0.727)
 static double pgm_xl_w = 0.727;
+#include <vector>
+// ---- CLAUDE 2026-10-08: mode 8 'cpuls' = exact port of the CPU predictor (pGM_induced.F90 extrap_ind_dipole,
+//      dipole_scf_init=3, dipole_scf_init_order=3, dipole_scf_init_step=2).  Records live on the device so they can be
+//      remapped across neighbor-list rebuilds with kPGMRemapDipHistory; the tiny least-squares math runs on the host.
+static const int CPULS_STEP = 2, CPULS_ORDER = 3;
+static GpuBuffer<double>* cpuls_R[4][CPULS_STEP] = {{NULL,NULL},{NULL,NULL},{NULL,NULL},{NULL,NULL}};  // record1..4
+static GpuBuffer<double>* cpuls_O[2] = {NULL, NULL};   // oldrec(:,:,1:2) = stage-1 / stage-2 predictions
+static GpuBuffer<double>* cpuls_tmp = NULL;
+static int cpuls_cnt[4] = {0,0,0,0};                   // reccnt(1:4)
+static int cpuls_slot[4] = {-1,-1,-1,-1};              // last written slot per record (ring of CPULS_STEP)
+static void cpuls_alloc(int stride) {
+  if (cpuls_tmp) return;
+  for (int k = 0; k < 4; k++) for (int j = 0; j < CPULS_STEP; j++) cpuls_R[k][j] = new GpuBuffer<double>(3 * stride);
+  cpuls_O[0] = new GpuBuffer<double>(3 * stride); cpuls_O[1] = new GpuBuffer<double>(3 * stride);
+  cpuls_tmp = new GpuBuffer<double>(3 * stride);
+}
+static void cpuls_push(int k, const std::vector<double>& v) {        // update_record()
+  cpuls_slot[k] = (cpuls_slot[k] + 1) % CPULS_STEP;
+  cudaMemcpy(cpuls_R[k][cpuls_slot[k]]->_pDevData, v.data(), v.size() * sizeof(double), cudaMemcpyHostToDevice);
+  cpuls_cnt[k]++;
+}
+static void cpuls_fetch(GpuBuffer<double>* b, std::vector<double>& v) {
+  cudaMemcpy(v.data(), b->_pDevData, v.size() * sizeof(double), cudaMemcpyDeviceToHost);
+}
+static double cpuls_dot(const std::vector<double>& a, const std::vector<double>& b) {
+  double s = 0.0; for (size_t i = 0; i < a.size(); i++) s += a[i] * b[i]; return s;
+}
+// least_square_extrap(): c = argmin || sum_j c_j record_j - target ||^2, solved with init_step CG iterations as on the CPU
+static void cpuls_ls(const std::vector<double> R[CPULS_STEP], const std::vector<double>& target, double c[CPULS_STEP]) {
+  const int n = CPULS_STEP; double M[CPULS_STEP][CPULS_STEP], b[CPULS_STEP];
+  for (int i = 0; i < n; i++) { b[i] = cpuls_dot(R[i], target); for (int j = i; j < n; j++) { M[i][j] = cpuls_dot(R[i], R[j]); M[j][i] = M[i][j]; } }
+  double r[CPULS_STEP], p[CPULS_STEP], Mp[CPULS_STEP];
+  for (int i = 0; i < n; i++) { c[i] = 0.0; r[i] = b[i]; p[i] = r[i]; }
+  for (int it = 0; it < n; it++) {
+    for (int j = 0; j < n; j++) { Mp[j] = 0.0; for (int k = 0; k < n; k++) Mp[j] += M[j][k] * p[k]; }
+    double pMp = 0.0, rr = 0.0; for (int j = 0; j < n; j++) { pMp += Mp[j] * p[j]; rr += r[j] * r[j]; }
+    double alpha = (fabs(pMp) > 1.0e-50) ? rr / pMp : 0.0;
+    for (int j = 0; j < n; j++) { c[j] += alpha * p[j]; r[j] -= alpha * Mp[j]; }
+    double rr2 = 0.0; for (int j = 0; j < n; j++) rr2 += r[j] * r[j];
+    double beta = (rr > 1.0e-50) ? rr2 / rr : 0.0;
+    for (int j = 0; j < n; j++) p[j] = r[j] + beta * p[j];
+  }
+}
+// extrap_ind_dipole(): called before the SCF solve; sets x0 in pPGMCGx
+static void cpuls_predict(gpuContext gpu, int stride) {
+  cpuls_alloc(stride);
+  const int n3 = 3 * gpu->sim.atoms;
+  std::vector<double> b(n3), pol(gpu->sim.atoms), B(n3), x0(n3), R[CPULS_STEP];
+  cudaMemcpy(b.data(), gpu->sim.pPGMCGb, n3 * sizeof(double), cudaMemcpyDeviceToHost);
+  cudaMemcpy(pol.data(), gpu->sim.pPGMPolarizability, gpu->sim.atoms * sizeof(double), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < n3; i++) B[i] = pol[i / 3] * b[i];          // ind_dip_new = pol * (alpha*E_perm), as on the CPU
+  for (int j = 0; j < CPULS_STEP; j++) R[j].resize(n3);
+  double c[CPULS_STEP] = {0.0, 0.0};
+  bool have_c = false;
+  if (cpuls_cnt[0] >= CPULS_STEP) { for (int j = 0; j < CPULS_STEP; j++) cpuls_fetch(cpuls_R[0][j], R[j]); cpuls_ls(R, B, c); have_c = true; }
+  else { x0 = B; cudaMemcpy(gpu->sim.pPGMCGx, x0.data(), n3 * sizeof(double), cudaMemcpyHostToDevice); }
+  cpuls_push(0, B);
+  // stage 1: total induced dipoles (record2)
+  if (cpuls_cnt[1] >= CPULS_STEP && have_c) {
+    for (int j = 0; j < CPULS_STEP; j++) cpuls_fetch(cpuls_R[1][j], R[j]);
+    for (int i = 0; i < n3; i++) { double s = 0.0; for (int j = 0; j < CPULS_STEP; j++) s += c[j] * R[j][i]; x0[i] = s; }
+    cudaMemcpy(cpuls_O[0]->_pDevData, x0.data(), n3 * sizeof(double), cudaMemcpyHostToDevice);
+  } else {
+    if (cpuls_cnt[0] == 1 || CPULS_ORDER == 1) { x0 = B; cudaMemcpy(gpu->sim.pPGMCGx, x0.data(), n3 * sizeof(double), cudaMemcpyHostToDevice); }
+    return;   // otherwise keep previous converged dipoles already in pPGMCGx (CPU behaviour)
+  }
+  // stage 2: first-order differences (record3)
+  if (CPULS_ORDER >= 2 && cpuls_cnt[2] >= CPULS_STEP) {
+    for (int j = 0; j < CPULS_STEP; j++) cpuls_fetch(cpuls_R[2][j], R[j]);
+    for (int i = 0; i < n3; i++) { double s = 0.0; for (int j = 0; j < CPULS_STEP; j++) s += c[j] * R[j][i]; x0[i] += s; }
+    cudaMemcpy(cpuls_O[1]->_pDevData, x0.data(), n3 * sizeof(double), cudaMemcpyHostToDevice);
+  }
+  // stage 3: second-order differences (record4)
+  if (CPULS_ORDER == 3 && cpuls_cnt[3] >= CPULS_STEP) {
+    for (int j = 0; j < CPULS_STEP; j++) cpuls_fetch(cpuls_R[3][j], R[j]);
+    for (int i = 0; i < n3; i++) { double s = 0.0; for (int j = 0; j < CPULS_STEP; j++) s += c[j] * R[j][i]; x0[i] += s; }
+  }
+  cudaMemcpy(gpu->sim.pPGMCGx, x0.data(), n3 * sizeof(double), cudaMemcpyHostToDevice);
+}
+// post-solve record updates (pGM_INDUCED_eval after the solver)
+static void cpuls_update(gpuContext gpu, int stride) {
+  const int n3 = 3 * gpu->sim.atoms;
+  std::vector<double> mu(n3), o(n3), d(n3);
+  cudaMemcpy(mu.data(), gpu->sim.pPGMCGx, n3 * sizeof(double), cudaMemcpyDeviceToHost);
+  cpuls_push(1, mu);
+  if (CPULS_ORDER >= 2 && cpuls_cnt[1] > CPULS_STEP) {
+    cpuls_fetch(cpuls_O[0], o); for (int i = 0; i < n3; i++) d[i] = mu[i] - o[i]; cpuls_push(2, d);
+  }
+  if (CPULS_ORDER == 3 && cpuls_cnt[2] > CPULS_STEP) {
+    cpuls_fetch(cpuls_O[1], o); for (int i = 0; i < n3; i++) d[i] = mu[i] - o[i]; cpuls_push(3, d);
+  }
+}
+// ---- device implementation (mode 'cpulsd'): identical algorithm and slot bookkeeping, math in kCPULS_PGM.cu
+extern "C" void cpuls_dev_scale_pol(double* B, const double* b, const double* pol, int n3);
+extern "C" void cpuls_dev_ls(const double* R0, const double* R1, const double* T, int n3, double* part, double* c);
+extern "C" void cpuls_dev_comb(double* dst, const double* R0, const double* R1, const double* c, int n3, int accumulate);
+extern "C" void cpuls_dev_sub(double* d, const double* a, const double* b, int n3);
+extern "C" int  cpuls_dev_scratch_size();
+extern "C" double cpuls_dev_power(const double* r, const double* x, double* xprev, const double* pol, int n3, double* part, int skip);
+// CLAUDE: env PGM_POWER=N -> every N steps print mean per-step dH = -sum r.dP/alpha (kcal/mol) and its ns^-1 rate at 1 fs
+static int pgm_power_every = -1; static bool pgm_power_skip = true; static GpuBuffer<double>* pgm_power_xprev = NULL;
+static GpuBuffer<double>* pgm_power_part = NULL; static double pgm_power_sum = 0.0, pgm_power_sum_all = 0.0; static long pgm_power_n = 0, pgm_power_n_all = 0;
+static int cpuls_device = 0;
+static GpuBuffer<double>* cpuls_part = NULL;
+static int cpuls_advance(int k) { cpuls_slot[k] = (cpuls_slot[k] + 1) % CPULS_STEP; cpuls_cnt[k]++; return cpuls_slot[k]; }
+static void cpulsd_predict(gpuContext gpu, int stride) {
+  cpuls_alloc(stride);
+  if (!cpuls_part) cpuls_part = new GpuBuffer<double>(cpuls_dev_scratch_size());
+  const int n3 = 3 * gpu->sim.atoms; const size_t bytes = n3 * sizeof(double);
+  double* c = cpuls_part->_pDevData + cpuls_dev_scratch_size() - 2;
+  double* x = gpu->sim.pPGMCGx; double* B = cpuls_tmp->_pDevData;
+  cpuls_dev_scale_pol(B, gpu->sim.pPGMCGb, gpu->sim.pPGMPolarizability, n3);
+  bool have_c = false;
+  if (cpuls_cnt[0] >= CPULS_STEP) { cpuls_dev_ls(cpuls_R[0][0]->_pDevData, cpuls_R[0][1]->_pDevData, B, n3, cpuls_part->_pDevData, c); have_c = true; }
+  else cudaMemcpyAsync(x, B, bytes, cudaMemcpyDeviceToDevice, 0);
+  { int s = cpuls_advance(0); cudaMemcpyAsync(cpuls_R[0][s]->_pDevData, B, bytes, cudaMemcpyDeviceToDevice, 0); }
+  if (!(cpuls_cnt[1] >= CPULS_STEP && have_c)) {
+    if (cpuls_cnt[0] == 1 || CPULS_ORDER == 1) cudaMemcpyAsync(x, B, bytes, cudaMemcpyDeviceToDevice, 0);
+    return;
+  }
+  cpuls_dev_comb(x, cpuls_R[1][0]->_pDevData, cpuls_R[1][1]->_pDevData, c, n3, 0);
+  cudaMemcpyAsync(cpuls_O[0]->_pDevData, x, bytes, cudaMemcpyDeviceToDevice, 0);
+  if (CPULS_ORDER >= 2 && cpuls_cnt[2] >= CPULS_STEP) {
+    cpuls_dev_comb(x, cpuls_R[2][0]->_pDevData, cpuls_R[2][1]->_pDevData, c, n3, 1);
+    cudaMemcpyAsync(cpuls_O[1]->_pDevData, x, bytes, cudaMemcpyDeviceToDevice, 0);
+  }
+  if (CPULS_ORDER == 3 && cpuls_cnt[3] >= CPULS_STEP)
+    cpuls_dev_comb(x, cpuls_R[3][0]->_pDevData, cpuls_R[3][1]->_pDevData, c, n3, 1);
+}
+static void cpulsd_update(gpuContext gpu, int stride) {
+  const int n3 = 3 * gpu->sim.atoms; const size_t bytes = n3 * sizeof(double);
+  double* x = gpu->sim.pPGMCGx;
+  { int s = cpuls_advance(1); cudaMemcpyAsync(cpuls_R[1][s]->_pDevData, x, bytes, cudaMemcpyDeviceToDevice, 0); }
+  if (CPULS_ORDER >= 2 && cpuls_cnt[1] > CPULS_STEP) { int s = cpuls_advance(2); cpuls_dev_sub(cpuls_R[2][s]->_pDevData, x, cpuls_O[0]->_pDevData, n3); }
+  if (CPULS_ORDER == 3 && cpuls_cnt[2] > CPULS_STEP) { int s = cpuls_advance(3); cpuls_dev_sub(cpuls_R[3][s]->_pDevData, x, cpuls_O[1]->_pDevData, n3); }
+}
+// MC-barostat trial save/restore of the predictor state (both cpuls modes)
+static GpuBuffer<double>* cpuls_saved[10] = {NULL};
+static int cpuls_saved_cnt[4], cpuls_saved_slot[4]; static bool cpuls_saved_valid = false;
+static GpuBuffer<double>* cpuls_buf(int i) { return i < 8 ? cpuls_R[i / 2][i % 2] : cpuls_O[i - 8]; }
+static void cpuls_save_state(gpuContext gpu) {
+  if (!cpuls_tmp) { cpuls_saved_valid = false; return; }
+  size_t bytes = 3 * gpu->sim.stride * sizeof(double);
+  for (int i = 0; i < 10; i++) {
+    if (!cpuls_saved[i]) cpuls_saved[i] = new GpuBuffer<double>(3 * gpu->sim.stride);
+    cudaMemcpy(cpuls_saved[i]->_pDevData, cpuls_buf(i)->_pDevData, bytes, cudaMemcpyDeviceToDevice);
+  }
+  for (int k = 0; k < 4; k++) { cpuls_saved_cnt[k] = cpuls_cnt[k]; cpuls_saved_slot[k] = cpuls_slot[k]; }
+  cpuls_saved_valid = true;
+}
+static void cpuls_restore_state(gpuContext gpu, const unsigned int* saved_lookup) {
+  if (!cpuls_saved_valid) return;
+  for (int i = 0; i < 10; i++)   // saved data are in the ordering of the save; remap into the current ordering
+    kPGMRemapDipHistory(gpu, cpuls_buf(i)->_pDevData, cpuls_saved[i]->_pDevData, saved_lookup);
+  for (int k = 0; k < 4; k++) { cpuls_cnt[k] = cpuls_saved_cnt[k]; cpuls_slot[k] = cpuls_saved_slot[k]; }
+}
+// remap all records (and the warm-start x) to the new image ordering after a neighbor-list rebuild
+static void cpuls_remap(gpuContext gpu, int stride) {
+  unsigned int* old_lookup = gpu->pbPGMOldImageLookup->_pDevData;
+  size_t bytes = 3 * stride * sizeof(double);
+  for (int k = 0; k < 4; k++) for (int j = 0; j < CPULS_STEP; j++) {
+    cudaMemcpy(cpuls_tmp->_pDevData, cpuls_R[k][j]->_pDevData, bytes, cudaMemcpyDeviceToDevice);
+    kPGMRemapDipHistory(gpu, cpuls_R[k][j]->_pDevData, cpuls_tmp->_pDevData, old_lookup);
+  }
+  for (int k = 0; k < 2; k++) {
+    cudaMemcpy(cpuls_tmp->_pDevData, cpuls_O[k]->_pDevData, bytes, cudaMemcpyDeviceToDevice);
+    kPGMRemapDipHistory(gpu, cpuls_O[k]->_pDevData, cpuls_tmp->_pDevData, old_lookup);
+  }
+  cudaMemcpy(cpuls_tmp->_pDevData, gpu->sim.pPGMCGx, bytes, cudaMemcpyDeviceToDevice);
+  kPGMRemapDipHistory(gpu, gpu->sim.pPGMCGx, cpuls_tmp->_pDevData, old_lookup);
+}
+
 static const double pgm_xl_kappa = 1.82, pgm_xl_alpha = 0.018;
 static const double pgm_xl_c[6] = {-6.0, 14.0, -8.0, -3.0, 4.0, -1.0};   // K=5 Niklasson coefficients
 extern "C" void kCalculatePMEDirectFieldCacheReadH_PGM(gpuContext gpu);
@@ -88,11 +260,21 @@ static int pgm_pred_hist_max() {
   if (pgm_pred_mode == 6) return 8;
   return (pgm_pred_mode >= 2) ? 4 : 3;
 }
+// Solver options from the &pol_gauss namelist (pgm_gpu_set_options_); environment variables
+// PGM_GPU_PRED, PGM_FUSED, PGM_OVERLAP, PGM_CG_BATCH and PGM_POWER override them (developer use).
+static int pgm_opt_pred = 1, pgm_opt_check = 3, pgm_opt_overlap = 1, pgm_opt_power = 0;
+static double pgm_power_dt = 0.001;   // ps, set from the MD time step
 static void pgm_pred_init() {
   if (pgm_pred_mode >= 0) return;
   const char* e = getenv("PGM_GPU_PRED");
-  pgm_pred_mode = 0;
+  // defaults from mdin: 0 quadratic, 1 cubic + combined field, 2 MOE (device)
+  pgm_pred_mode = (pgm_opt_pred == 1) ? 4 : 0;
+  if (pgm_opt_pred == 2) { pgm_pred_mode = 8; cpuls_device = 1; }
+  pgm_fused = (pgm_opt_pred == 1) ? 1 : 0;
+  pgm_overlap = pgm_opt_overlap ? 1 : 0;
+  pgm_cg_batch_env = pgm_opt_check;
   if (e) {
+    pgm_pred_mode = 0; cpuls_device = 0;
     if (!strcmp(e, "delta3")) pgm_pred_mode = 1;
     else if (!strcmp(e, "delta4")) pgm_pred_mode = 2;
     else if (!strcmp(e, "delta4ls")) pgm_pred_mode = 3;
@@ -100,12 +282,14 @@ static void pgm_pred_init() {
     else if (!strcmp(e, "mu5")) pgm_pred_mode = 5;
     else if (!strcmp(e, "delta8")) pgm_pred_mode = 6;   // b + LS quartic over 8 Delta points
     else if (!strcmp(e, "xl")) pgm_pred_mode = 7;        // extended-Lagrangian 0-SCF (2 sweeps/step, no CG)
+    else if (!strcmp(e, "cpuls")) pgm_pred_mode = 8;     // CLAUDE: exact CPU field-anchored LS predictor (order 3, step 2), host math
+    else if (!strcmp(e, "cpulsd")) { pgm_pred_mode = 8; cpuls_device = 1; }  // CLAUDE: same, device math (production path)
   }
   { const char* w = getenv("PGM_XL_W"); if (w) pgm_xl_w = atof(w); if (pgm_pred_mode == 7) fprintf(stderr, "PGM XL: w = %.3f kappa %.2f alpha %.3f\n", pgm_xl_w, pgm_xl_kappa, pgm_xl_alpha);
   }
   const char* f = getenv("PGM_FUSED");
-  pgm_fused = ((f && atoi(f) > 0 && (pgm_pred_mode == 4 || pgm_pred_mode == 5)) || pgm_pred_mode == 7) ? 1 : 0;
-  { const char* ov = getenv("PGM_OVERLAP"); pgm_overlap = (ov && atoi(ov) > 0) ? 1 : 0; }
+  if (f || e) pgm_fused = ((f && atoi(f) > 0 && (pgm_pred_mode == 4 || pgm_pred_mode == 5)) || pgm_pred_mode == 7) ? 1 : 0;
+  { const char* ov = getenv("PGM_OVERLAP"); if (ov) pgm_overlap = (atoi(ov) > 0) ? 1 : 0; }
   const char* c16 = getenv("PGM_CACHE16");
 #ifndef use_DPFP
   pgm_cache16 = (c16 && atoi(c16) > 0) ? 1 : 0;
@@ -114,8 +298,9 @@ static void pgm_pred_init() {
   if (pk) pgm_peek_w = atof(pk);
   const char* bsz = getenv("PGM_CG_BATCH");
   if (bsz) pgm_cg_batch_env = atoi(bsz);
-  fprintf(stderr, "PGM GPU predictor mode = %d (%s), CG batch override = %d, fused = %d, peek = %.2f, cache16 = %d\n",
-          pgm_pred_mode, e ? e : "default", pgm_cg_batch_env, pgm_fused, pgm_peek_w, pgm_cache16);
+  if (e || f || bsz || getenv("PGM_OVERLAP"))
+    fprintf(stderr, "PGM GPU solver (environment override): predictor mode = %d (%s), check = %d, fused = %d, overlap = %d\n",
+            pgm_pred_mode, e ? e : "mdin", pgm_cg_batch_env, pgm_fused, pgm_overlap);
 }
 
 // Helper: check CUDA graph API return code
@@ -326,6 +511,9 @@ extern "C" void pgm_gpu_init_(int* natom)
   gpu->pgm_scf_local_cut   = 3.0;
   gpu->pgm_scf_sor_coeff   = 0.65;
   gpu->sim.scfLocalCut2    = (PMEFloat)(3.0 * 3.0);
+  gpu->sim.pgmIGVDW        = 0;
+  gpu->sim.pgmGVDWRepForm  = 0;
+  gpu->sim.pgmBRepScale    = (PMEFloat)1.0;
 
   // CUDA graph for CG iteration (eliminates kernel launch overhead)
   gpu->pgmStream = 0;
@@ -356,6 +544,21 @@ extern "C" void pgm_gpu_set_params_(double* ew_coeff, double* tol, int* max_iter
   gpu->pgm_scf_maxiter = *max_iter;
   gpu->pgm_scf_solv_opt    = *solver;
   gpu->pgm_scf_local_niter = *precond;
+}
+
+//---------------------------------------------------------------------------------------------
+// pgm_gpu_set_options_: GPU solver and van der Waals options from the &pol_gauss namelist
+//---------------------------------------------------------------------------------------------
+extern "C" void pgm_gpu_set_options_(int* pred, int* check, int* overlap, int* power,
+                                     int* igvdw, int* rep_form, double* b_rep_scale)
+{
+  pgm_opt_pred    = *pred;
+  pgm_opt_check   = *check;
+  pgm_opt_overlap = *overlap;
+  pgm_opt_power   = *power;
+  gpu->sim.pgmIGVDW       = *igvdw;
+  gpu->sim.pgmGVDWRepForm = *rep_form;
+  gpu->sim.pgmBRepScale   = (PMEFloat)(*b_rep_scale);
 }
 
 //---------------------------------------------------------------------------------------------
@@ -789,12 +992,18 @@ static GpuBuffer<double>* pgm_saved_CGx = NULL;
 static GpuBuffer<double>* pgm_saved_hist[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 static double* pgm_saved_hist_ptrs[8];
 static int     pgm_saved_history_count = 0;
+static GpuBuffer<unsigned int>* pgm_saved_lookup = NULL;
 
 static bool pgm_pred_done = false;
 static void pgm_run_predictor(gpuContext gpu, bool needColdStart, int stride)
 {
   pgm_pred_init();
   if (pgm_pred_mode > 0 && !pgm_b_prev) pgm_b_prev = new GpuBuffer<double>(3 * stride);
+  if (pgm_pred_mode == 8) {
+    if (pgm_fused) { fprintf(stderr, "FATAL: PGM_GPU_PRED=cpuls requires PGM_FUSED=0\n"); exit(EXIT_FAILURE); }
+    if (cpuls_device) cpulsd_predict(gpu, stride); else cpuls_predict(gpu, stride);
+    return;
+  }
   if (needColdStart) {
     // Genuine cold start (first step, no history)
     cudaMemcpyAsync(gpu->sim.pPGMCGx, gpu->sim.pPGMCGb,
@@ -882,9 +1091,13 @@ extern "C" void pgm_gpu_save_dipole_state_()
   // Lazy allocation
   if (!pgm_saved_CGx) {
     pgm_saved_CGx = new GpuBuffer<double>(size);
+    pgm_saved_lookup = new GpuBuffer<unsigned int>(gpu->sim.atoms);
     for (int i = 0; i < 8; i++)
       pgm_saved_hist[i] = new GpuBuffer<double>(size);
   }
+
+  cudaMemcpy(pgm_saved_lookup->_pDevData, gpu->sim.pImageAtomLookup,
+             gpu->sim.atoms * sizeof(unsigned int), cudaMemcpyDeviceToDevice);
 
   // Save current converged dipoles (CGx)
   cudaMemcpy(pgm_saved_CGx->_pDevData, gpu->sim.pPGMCGx,
@@ -898,6 +1111,7 @@ extern "C" void pgm_gpu_save_dipole_state_()
   }
 
   pgm_saved_history_count = gpu->pgm_dip_history_count;
+  if (pgm_pred_mode == 8) cpuls_save_state(gpu);
 }
 
 extern "C" void pgm_gpu_restore_dipole_state_()
@@ -910,14 +1124,20 @@ extern "C" void pgm_gpu_restore_dipole_state_()
   cudaMemcpy(gpu->sim.pPGMCGx, pgm_saved_CGx->_pDevData,
              size * sizeof(double), cudaMemcpyDeviceToDevice);
 
+  kPGMRemapDipHistory(gpu, gpu->sim.pPGMCGx, pgm_saved_CGx->_pDevData,
+                     pgm_saved_lookup->_pDevData);
+
   // Restore history pointer order and data
   for (int i = 0; i < 8; i++) {
     gpu->pgm_dip_hist_dev[i] = pgm_saved_hist_ptrs[i];
     cudaMemcpy(gpu->pgm_dip_hist_dev[i], pgm_saved_hist[i]->_pDevData,
                size * sizeof(double), cudaMemcpyDeviceToDevice);
+    kPGMRemapDipHistory(gpu, gpu->pgm_dip_hist_dev[i], pgm_saved_hist[i]->_pDevData,
+                       pgm_saved_lookup->_pDevData);
   }
 
   gpu->pgm_dip_history_count = pgm_saved_history_count;
+  if (pgm_pred_mode == 8) cpuls_restore_state(gpu, pgm_saved_lookup->_pDevData);
 }
 
 //---------------------------------------------------------------------------------------------
@@ -994,6 +1214,7 @@ extern "C" void pgm_gpu_cleanup_()
 
   // MC barostat dipole save buffers
   delete pgm_saved_CGx;  pgm_saved_CGx = NULL;
+  delete pgm_saved_lookup; pgm_saved_lookup = NULL;
   for (int i = 0; i < 8; i++) { delete pgm_saved_hist[i]; pgm_saved_hist[i] = NULL; }
 
   // CUDA graph cleanup
@@ -1119,6 +1340,7 @@ static void pgm_gpu_pme_pipeline(bool need_energy)
   gpu_build_neighbor_list_();
   bool pgm_fused_active = false;
   bool needColdStart = gpu->bNewNeighborList;  // true iff NL rebuilt THIS call
+  if (needColdStart) pgm_power_skip = true;
   gpu->bNewNeighborList = gpu->bNewNeighborList || had_pending_nl;
   PGM_EVENT_RECORD(1);
 
@@ -1344,6 +1566,7 @@ static void pgm_gpu_pme_pipeline(bool need_energy)
     needColdStart = false;  // history is now valid in new ordering
   }
 
+  if (pgm_pred_mode == 8 && needColdStart && cpuls_cnt[0] > 0) { cpuls_remap(gpu, stride); needColdStart = false; }
   if (!pgm_pred_done) pgm_run_predictor(gpu, needColdStart, stride);
   pgm_pred_done = false;
 
@@ -1407,6 +1630,14 @@ static void pgm_gpu_pme_pipeline(bool need_energy)
 
     // p = zpc + beta * p
     kPGMPCGUpdateP(gpu);
+  }
+  // CLAUDE 2026-10-08: final peek after PCG convergence, as in CPU pGM_pkcg (ind_dip += scf_sor_coefficient * rv).
+  // Weight from env PGM_PCG_PEEK: a number, or "cpu" = use scf_sor_coefficient from &pol_gauss. Absent/0 = original GPU behaviour.
+  { static double pcg_peek = -1.0;
+    if (pcg_peek < 0.0) { const char* e = getenv("PGM_PCG_PEEK"); pcg_peek = 0.0;
+      if (e) pcg_peek = (!strcmp(e, "cpu")) ? gpu->pgm_scf_sor_coeff : atof(e);
+      fprintf(stderr, "PGM PCG final peek weight = %.4f (scf_solv_opt=%d)\n", pcg_peek, gpu->pgm_scf_solv_opt); }
+    if (pcg_peek > 0.0 && gpu->pgm_scf_solv_opt == 3) kPGMAxpy(gpu, gpu->sim.pPGMCGx, gpu->sim.pPGMCGr, pcg_peek);
   }
 
   } else {
@@ -1592,6 +1823,39 @@ static void pgm_gpu_pme_pipeline(bool need_energy)
 
   } // end solver selection (scf_solv_opt)
 
+  // Every CG/PCG branch reads the recurrence norm before leaving its loop.
+  // Do not accept an unconverged cap-limited state as an induced-dipole solution.
+  // The experimental XL zero-SCF branch deliberately sets maxiter=0.
+  if (maxiter > 0 && iter >= maxiter && !(r_norm <= tol)) {
+    fprintf(stderr,
+            "FATAL PGM GPU SCF: iteration cap exhausted without convergence "
+            "(solver=%d, iterations=%d, cap=%d, checked recurrence norm=%.17e, "
+            "tolerance=%.17e).\n",
+            gpu->pgm_scf_solv_opt, iter, maxiter, r_norm, tol);
+    fflush(stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  if (pgm_power_every < 0) { const char* e = getenv("PGM_POWER"); pgm_power_every = e ? ((atoi(e) > 0) ? atoi(e) : 0) : pgm_opt_power;
+#ifndef use_DPFP
+    if (pgm_power_every > 0) fprintf(stderr, "PGM POWER: note: in SPFP the stored residual contains rounding contributions; use DPFP for the estimate\n");
+#endif
+  }
+  if (pgm_power_every > 0) {
+    int n3 = 3 * gpu->sim.atoms;
+    if (!pgm_power_xprev) { pgm_power_xprev = new GpuBuffer<double>(3 * stride); pgm_power_part = new GpuBuffer<double>(256); pgm_power_skip = true; }
+    double dh = cpuls_dev_power(gpu->sim.pPGMCGr, gpu->sim.pPGMCGx, pgm_power_xprev->_pDevData, gpu->sim.pPGMPolarizability, n3, pgm_power_part->_pDevData, pgm_power_skip ? 1 : 0);
+    if (!pgm_power_skip) { pgm_power_sum += dh; pgm_power_n++; pgm_power_sum_all += dh; pgm_power_n_all++; }
+    pgm_power_skip = false;
+    if (pgm_power_n >= pgm_power_every) {
+      // dH per step in e^2/A (Gaussian units of the solver) -> kcal/mol, rate per ns at the actual time step
+      const double cc = 332.05382, per_ns = 1.0e3 / pgm_power_dt;
+      fprintf(stderr, "PGM POWER: induction power (eq 12) block %.4f kcal/mol/ns  cumulative %.4f kcal/mol/ns  (steps %ld / %ld)\n",
+              cc * per_ns * pgm_power_sum / pgm_power_n, cc * per_ns * pgm_power_sum_all / pgm_power_n_all, pgm_power_n, pgm_power_n_all);
+      pgm_power_sum = 0.0; pgm_power_n = 0;
+    }
+  }
+  if (pgm_pred_mode == 8) { if (cpuls_device) cpulsd_update(gpu, stride); else cpuls_update(gpu, stride); }
   // 7e. Store induced dipoles
   kPGMStoreInducedDipoles(gpu);
   if (pgm_pred_mode == 7 && pgm_fused_active) {
@@ -1724,6 +1988,7 @@ extern "C" void pgm_gpu_pme_ene_(double* ewaldcof, double* vol,
     double ekcmt[3], int* nstep, double* dt,
     double atm_crd[][3], double atm_frc[][3])
 {
+  pgm_power_dt = *dt;
   PRINTMETHOD("pgm_gpu_pme_ene");
 
   // Run full PGM pipeline with energy
@@ -1790,6 +2055,7 @@ extern "C" void pgm_gpu_pme_force_(double* ewaldcof, double* vol,
     double virial[3], double ekcmt[3], int* nstep, double* dt,
     double atm_crd[][3], double atm_frc[][3])
 {
+  pgm_power_dt = *dt;
   PRINTMETHOD("pgm_gpu_pme_force");
 
   // Run full PGM pipeline without energy

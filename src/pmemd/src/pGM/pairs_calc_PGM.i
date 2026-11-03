@@ -57,14 +57,9 @@
 #undef _VAC
 #define _VAC _vac
 #endif
-#ifdef NEED_DEVDW
+#ifdef NEED_GVDW
 #undef _VDW
-#define _VDW _devdw
-#else
-#ifdef NEED_BHVDW
-#undef _VDW
-#define _VDW _bhvdw
-#endif
+#define _VDW _gvdw
 #endif
 #endif
 #else /* IS _FIELD_ONLY_ */
@@ -228,8 +223,10 @@ subroutine PGM_SUBS &
   double precision      :: fswitchinv
 #endif /* _USE_SAVED_BFACT_ */
 
-#if defined(NEED_DEVDW) || defined(NEED_BHVDW)
-  double precision      :: aexpij, cexpij, expaij, expcij
+#ifdef NEED_GVDW
+  double precision      :: yg, yg2, expy2g, erfyg, kapg, exprep, gx, bx, ax, fx, apx, gpx, fpx
+  double precision, parameter :: inv_sqrtpi = 0.56418958354775628695d0
+  double precision, parameter :: pi_gvdw = 3.14159265358979323846d0
 #endif
 
 !  i = img_atm_map(img_i)  ! inherited from get_direct_fld_PGM/get_nb_energy_PGM, i points to atom i
@@ -1385,8 +1382,8 @@ subroutine PGM_SUBS &
       if (ic .gt. 0) then
 #endif
 
-#if ! defined(NEED_DEVDW) && ! defined(NEED_BHVDW)
-! Non-DEVDW code starts here
+#ifndef NEED_GVDW
+! LJ 12-6
         r6 = delr2inv * delr2inv * delr2inv
 #ifdef FSWITCH
 #ifdef _USE_SAVED_BFACT_
@@ -1428,52 +1425,46 @@ subroutine PGM_SUBS &
           df = (12.0 * f12 - 6.0 * f6) * delr2inv
 #endif /* FSWITCH */
 
-! Non-DEVDW code ends here
-#else /* NEED_DEVDW || NEED_BHVDW */
-! DEVDW code starts here
-
-! Implement Eq. (5) of Huang, Duan, Wu, and Luo, DEGAUSS: A Novel Softcore Force Field Using
-! Double Exponential Van der Waals and Gaussian Charge for Molecular Dynamics Simulations I:
-! Theory and Validation, JCTC
-
-        delrinv  = sqrt(delr2inv)
-        delr   = 1.0d0/delrinv  ! delrinv already calculated??
-
-#ifdef NEED_DEVDW
-! de_a_r(ic): alpha_ij / r_min(ij)
-! de_c_r(ic): beta_ij / r_min(ij)
-        aexpij = de_a_r(ic) * delr    ! alpha_ij * r / r_min
-        cexpij = de_c_r(ic) * delr    ! beta_ij * r / r_min
-
-! cn1(ic): pre-computed epsilon * beta * exp(alpha) / (alpha-beta)
-! cn2(ic):              epsilon * alpha * exp(beta) / (alpha-beta)
-! use bspline to tablet the expnontial function?
-        expaij = cn1(ic) * exp(-aexpij)
-        expcij = cn2(ic) * exp(-cexpij)
-
+#else /* NEED_GVDW */
+! Gaussian VDW (GVDW):
+!   U = A_ij exp(-b kappa_ij^2 r^2) - C6_ij F(kappa_ij r) / r^6     (gvdw_rep_form = 0)
+!   U = A_ij exp(-b kappa_ij r)     - C6_ij F(kappa_ij r) / r^6     (gvdw_rep_form = 1)
+!   F(x) = A(x)^2 + g(x)^2/2,  A(x) = erf(x) - 2x exp(-x^2)/sqrt(pi) - g(x),
+!   g(x) = 4 x^3 exp(-x^2)/(3 sqrt(pi)),  kappa_ij = (r_i^2 + r_j^2)^(-1/2) from the pGM Gaussian radii.
+!   A_ij = cn1(ic), C6_ij = cn2(ic) (topology LJ arrays hold GVDW coefficients); b = b_rep_scale.
+        delrinv = sqrt(delr2inv)
+        kapg   = sqrt(one / (r_gauss_img(img_i) + r_gauss_img(img_j)))
+        yg     = kapg / delrinv
+        yg2    = yg * yg
+        expy2g = exp(-yg2)
+        erfyg  = erf(yg)
+        r6     = delr2inv * delr2inv * delr2inv
+        gx  = (4.0d0 / 3.0d0) * inv_sqrtpi * yg * yg2 * expy2g
+        bx  = erfyg - two * inv_sqrtpi * yg * expy2g
+        ax  = bx - gx
+        fx  = ax * ax + 0.5d0 * gx * gx
+        apx = (8.0d0 / 3.0d0) * inv_sqrtpi * yg2 * yg2 * expy2g
+        gpx = 4.0d0 * inv_sqrtpi * yg2 * (one - (two / three) * yg2) * expy2g
+        fpx = two * ax * apx + gx * gpx
+        if (gvdw_rep_form .eq. 0) then
+          exprep = cn1(ic) * exp(-b_rep_scale * yg2)
+          df = two * b_rep_scale * kapg * kapg * exprep
+        else
+          exprep = cn1(ic) * exp(-b_rep_scale * yg)
+          df = b_rep_scale * kapg * exprep * delrinv
+        end if
+        if (yg .gt. 0.01d0) then
 #ifdef NEED_ENE
-        evdw_stk = evdw_stk + expaij - expcij
+          evdw_stk = evdw_stk + exprep - cn2(ic) * fx * r6
 #endif /* NEED_ENE */
-
-        df     = - (expaij * aexpij - expcij * cexpij) * delr2inv
-
-! DEVDW code ends here
-#else /* NEED_DEVDW */
-#ifdef NEED_BHVDW
-! Buckingham exp-6 potential
-        aexpij = bh_a_r(ic) * delr
-        expaij = cn1(ic) * exp(-aexpij)
-        f6 = cn2(ic) * (delr2inv * delr2inv * delr2inv)
-
+          df = df + cn2(ic) * (kapg * fpx * delrinv - 6.0d0 * fx * delr2inv) * r6
+        else
 #ifdef NEED_ENE
-        evdw_stk = evdw_stk + expaij - f6
+          ! F(x)/x^6 -> 8/(9 pi) as x -> 0
+          evdw_stk = evdw_stk + exprep - cn2(ic) * (8.0d0 / (9.0d0 * pi_gvdw)) * kapg**6
 #endif /* NEED_ENE */
-
-        df     = - (expaij * aexpij - 6.0d0 * f6) * delr2inv
-
-#endif /* NEED_BHVDW */
-#endif /* NEED_DEVDW */
-#endif /* NEED_DEVDW || NEED_BHVDW */
+        end if
+#endif /* NEED_GVDW */
 
 #ifdef HAS_10_12
       else if( ic.lt.0 ) then
@@ -1564,9 +1555,6 @@ subroutine PGM_SUBS &
 #ifdef _EFTBL_
 #undef _EFTBL_
 #endif
-#ifdef NEED_DEVDW
-#undef NEED_DEVDW
-#endif
-#ifdef NEED_BHVDW
-#undef NEED_BHVDW
+#ifdef NEED_GVDW
+#undef NEED_GVDW
 #endif

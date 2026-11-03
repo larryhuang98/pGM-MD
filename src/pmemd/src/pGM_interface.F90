@@ -328,7 +328,8 @@ subroutine pGM_NonBond_eval(atm_cnt, img_frc, &          ! natom, img_frc
 #ifndef MPI
   use pGM_gpu_interface_mod
   use pol_gauss_mdin_dat_mod, only : dipole_scf_tol, scf_cg_niter, &
-      scf_solv_opt, scf_local_niter, scf_local_cut, scf_sor_coefficient
+      scf_solv_opt, scf_local_niter, scf_local_cut, scf_sor_coefficient, &
+      scf_gpu_pred, scf_gpu_check, scf_gpu_overlap, pgm_power, igvdw, gvdw_rep_form, b_rep_scale
   use pol_gauss_multipoles_mod, only : covalent_dip, ncovalent, gbl_perm_chg, r_gauss
   use pol_gauss_induced, only : polarizability
 #endif
@@ -526,6 +527,8 @@ subroutine pGM_NonBond_eval(atm_cnt, img_frc, &          ! natom, img_frc
                                 dipole_scf_tol, scf_cg_niter)
     call pGM_GPU_set_pcg_params(scf_solv_opt, scf_local_niter, &
                                  scf_local_cut, scf_sor_coefficient)
+    call pgm_gpu_set_options(scf_gpu_pred, scf_gpu_check, scf_gpu_overlap, pgm_power, &
+                             igvdw, gvdw_rep_form, b_rep_scale)
   end if
   return  ! Everything else handled by pgm_gpu_pme_ene/force from pme_force.F90
 
@@ -1504,9 +1507,7 @@ subroutine bcast_pGM_parameter
 
   use prmtop_dat_mod
   use parallel_dat_mod
-  use mdin_ctrl_dat_mod, only : ipgm, idegauss
-  use altvdw_var_mod, only : idevdw, ibuckvdw, altvdw_ctrl_int_cnt, &
-                             degauss_bcast, devdw_bcast, buckvdw_bcast
+  use mdin_ctrl_dat_mod, only : ipgm
 
   implicit none
 
@@ -1519,9 +1520,6 @@ subroutine bcast_pGM_parameter
   double precision :: buf(pgm_ctrl_dbl_cnt)
   common / pgm_ctrl_dbl /buf
   save :: / pgm_ctrl_dbl /
-  integer          :: ibuf_vdw(altvdw_ctrl_int_cnt)
-  common / altvdw_ctrl_cmn /ibuf_vdw
-  save :: / altvdw_ctrl_cmn /
  
   call mpi_bcast(ibuf, pgm_ctrl_int_cnt, MPI_INTEGER, 0, pmemd_comm, ier)
   call mpi_bcast(buf, pgm_ctrl_dbl_cnt, MPI_DOUBLE_PRECISION, 0, pmemd_comm, ier)
@@ -1549,11 +1547,6 @@ end if
   call mpi_bcast(pGM_gbl_atm_mol_map,natom,MPI_INTEGER,0,pmemd_comm,ier)
 
   call pGM_INDUCED_bcast(natom)
-
-  call mpi_bcast(ibuf_vdw, altvdw_ctrl_int_cnt, MPI_INTEGER, 0, pmemd_comm, ier)
-  call degauss_bcast(natom, nttyp, idegauss)
-  call devdw_bcast(nttyp, idevdw)
-  call buckvdw_bcast(nttyp, ibuckvdw)
 
 #endif
 

@@ -24,7 +24,9 @@ subroutine POL_GAUSS_read_mdin(mdin, ipgm0)
                      pgm_dump_enable, pgm_dump_stride, pgm_dump_first, pgm_dump_last, &
                      pgm_dump_b, pgm_dump_mu, pgm_dump_crd, pgm_dump_op, pgm_dump_short, &
                      pgm_dump_hist, pgm_dump_hist_kmax, pgm_dump_frames_n, pgm_dump_frames, &
-                     pgm_dump_dir
+                     pgm_dump_dir, &
+                     igvdw, gvdw_rep_form, b_rep_scale, &
+                     scf_gpu_pred, scf_gpu_check, scf_gpu_overlap, pgm_power
 
   err = 0
 
@@ -50,7 +52,7 @@ subroutine POL_GAUSS_read_mdin(mdin, ipgm0)
   dipole_scf_init=3
   dipole_scf_init_step = 2
   dipole_scf_init_order=3
-  scf_solv_opt = 2
+  scf_solv_opt = -1    ! resolved below: 1 (diagonal CG) for CUDA, 2 for CPU
   scf_sor_niter = 100
   scf_cg_niter = 25
   scf_local_niter = 3
@@ -58,6 +60,13 @@ subroutine POL_GAUSS_read_mdin(mdin, ipgm0)
   dipole_scf_use_cg = 0
 
   densitycontrol  = -1.0
+  igvdw = 0
+  gvdw_rep_form = 0
+  b_rep_scale = 1.0d0
+  scf_gpu_pred = 1
+  scf_gpu_check = 3
+  scf_gpu_overlap = 1
+  pgm_power = 0
 
 #if 0
   do_recip=1
@@ -96,6 +105,15 @@ subroutine POL_GAUSS_read_mdin(mdin, ipgm0)
     err = err + 1     ! quit for now
   end if
 
+  if (scf_solv_opt .lt. 0) then
+#ifdef CUDA
+    scf_solv_opt = 1
+#else
+    scf_solv_opt = 2
+#endif
+  end if
+
+
   write(mdout,'(A)')'|'
   write(mdout,'(A)')'| pGM-related parameters:'
   write(mdout,'(A)')'|'
@@ -130,9 +148,41 @@ subroutine POL_GAUSS_read_mdin(mdin, ipgm0)
   write(mdout,'(A,E15.7)')'| erfc_tol =              ', erfc_tol
   write(mdout,'(A,E15.7)')'| ee_gauss_cut =          ', ee_gauss_cut
   write(mdout,'(A,E15.7)')'| densitycontrol =        ', densitycontrol
+  write(mdout,'(A,I5)')   '| igvdw =                 ', igvdw
+  if (igvdw .eq. 1) then
+    write(mdout,'(A,I5)')   '| gvdw_rep_form =         ', gvdw_rep_form
+    write(mdout,'(A,E15.7)')'| b_rep_scale =           ', b_rep_scale
+  end if
+#ifdef CUDA
+  write(mdout,'(A,I5)')   '| scf_gpu_pred =          ', scf_gpu_pred
+  write(mdout,'(A,I5)')   '| scf_gpu_check =         ', scf_gpu_check
+  write(mdout,'(A,I5)')   '| scf_gpu_overlap =       ', scf_gpu_overlap
+  write(mdout,'(A,I5)')   '| pgm_power =             ', pgm_power
+#endif
   write(mdout,'(A)')'| '
 
 ! Logically, legality check of input data should follow reading
+
+  if ( igvdw .ne. 0 .and. igvdw .ne. 1 ) then
+    write(mdout,'(/,a)') ' pGM: igvdw must be 0 (Lennard-Jones) or 1 (Gaussian VDW)'
+    err = err + 1
+  end if
+  if ( igvdw .eq. 1 .and. (gvdw_rep_form .ne. 0 .and. gvdw_rep_form .ne. 1) ) then
+    write(mdout,'(/,a)') ' pGM: gvdw_rep_form must be 0 (Gaussian) or 1 (Slater)'
+    err = err + 1
+  end if
+  if ( igvdw .eq. 1 .and. b_rep_scale .le. 0.d0 ) then
+    write(mdout,'(/,a)') ' pGM: b_rep_scale must be positive'
+    err = err + 1
+  end if
+  if ( scf_gpu_pred .lt. 0 .or. scf_gpu_pred .gt. 2 ) then
+    write(mdout,'(/,a)') ' pGM: scf_gpu_pred must be 0 (quadratic), 1 (cubic), or 2 (MOE)'
+    err = err + 1
+  end if
+  if ( scf_gpu_check .lt. 1 .or. scf_gpu_check .gt. 8 ) then
+    write(mdout,'(/,a)') ' pGM: scf_gpu_check must be between 1 and 8'
+    err = err + 1
+  end if
 
   if ( dipole_scf_init_order > 3 ) then
     write(mdout,'(/,a)') ' pGM_Induced_eval: dipole_scf_init_order too high'

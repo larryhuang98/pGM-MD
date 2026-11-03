@@ -37,6 +37,18 @@ module pol_gauss_mdin_dat_mod
   double precision       :: ee_gauss_cut = 3.12342d0 ! corresponding to max error of 10^-5 in erfc
   double precision       :: densitycontrol = -1.0d0
 
+  ! van der Waals model for pGM: igvdw = 0, Lennard-Jones 12-6 (default);
+  ! igvdw = 1, Gaussian VDW with per-type A_rep (topology ACOEF) and C6 (topology BCOEF)
+  integer                :: igvdw = 0
+  integer                :: gvdw_rep_form = 0      ! 0: A exp(-b kappa^2 r^2); 1: A exp(-b kappa r)
+  double precision       :: b_rep_scale = 1.0d0
+
+  ! GPU induction solver (pmemd.pgm.cuda only)
+  integer                :: scf_gpu_pred = 1       ! 0 quadratic, 1 cubic + combined field (default), 2 MOE
+  integer                :: scf_gpu_check = 3      ! CG iterations between convergence tests (warm start)
+  integer                :: scf_gpu_overlap = 1    ! concurrent direct/reciprocal space evaluation
+  integer                :: pgm_power = 0          ! >0: print eq-12 induction power every pgm_power steps
+
   ! RL: Turning on dipole printing
   integer                :: dipole_print = 0
   integer                :: saved_nprint = 0
@@ -63,17 +75,18 @@ module pol_gauss_mdin_dat_mod
 
   common / pgm_ctrl_int /nspm_lcl, do_pol_gauss_nonbond, dipole_scf_use_cg, scf_sor_niter, scf_cg_niter, & !5
             pol_gauss_verbose, scf_solv_opt, scf_local_niter, dipole_scf_init_step, dipole_scf_init, & !10
-            dipole_scf_init_order, use_average, dipole_print, saved_nprint !14 ! RL
+            dipole_scf_init_order, use_average, dipole_print, saved_nprint, & !14 ! RL
+            igvdw, gvdw_rep_form, scf_gpu_pred, scf_gpu_check, scf_gpu_overlap, pgm_power !20
 
   save :: / pgm_ctrl_int /
 
   common / pgm_ctrl_dbl /dipole_scf_tol, scf_sor_coefficient, scf_local_cut, ee_dsum_cut, ee_damped_cut, & ! 5
-            erfc_tol, ee_gauss_cut, densitycontrol   !8
+            erfc_tol, ee_gauss_cut, densitycontrol, b_rep_scale   !9
 
   save :: / pgm_ctrl_dbl /
 
-  integer, parameter    :: pgm_ctrl_int_cnt = 14 ! RL
-  integer, parameter    :: pgm_ctrl_dbl_cnt = 8
+  integer, parameter    :: pgm_ctrl_int_cnt = 20
+  integer, parameter    :: pgm_ctrl_dbl_cnt = 9
 
 !---------------------------------------------------------
 end module pol_gauss_mdin_dat_mod
