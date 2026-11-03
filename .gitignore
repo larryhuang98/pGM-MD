@@ -1,0 +1,4 @@
+openmm/build/
+runs/
+*.pyc
+__pycache__/

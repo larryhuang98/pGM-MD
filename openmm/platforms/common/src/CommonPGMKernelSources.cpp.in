@@ -1,0 +1,5 @@
+#include "CommonPGMKernelSources.h"
+
+using namespace PGMPlugin;
+using namespace std;
+

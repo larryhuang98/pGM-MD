@@ -1,0 +1,16 @@
+#ifndef OPENMM_COMMONPGMKERNELSOURCES_H_
+#define OPENMM_COMMONPGMKERNELSOURCES_H_
+
+#include <string>
+
+namespace PGMPlugin {
+
+/** The source code of the Common kernels (generated from kernels/*.cc). */
+class CommonPGMKernelSources {
+public:
+@KERNEL_FILE_DECLARATIONS@
+};
+
+} // namespace PGMPlugin
+
+#endif
