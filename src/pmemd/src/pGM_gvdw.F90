@@ -20,12 +20,26 @@ module pgm_gvdw_mod
   implicit none
 
   private
-  public :: pgm_gvdw_pair
+  public :: pgm_gvdw_pair, pgm_gvdw_set_rgauss, gvdw_rgauss
+
+  ! Copy of the pGM r_gauss array (original atom order).  Kept here so that the
+  ! AMBER 1-4 code can use it without depending on the pGM multipole module
+  ! (which would create a module cycle through parallel_mod and prfs_mod).
+  double precision, allocatable, save :: gvdw_rgauss(:)
 #ifdef CUDA
   public :: pgm_gvdw_gpu_nb14_setup
 #endif
 
 contains
+
+subroutine pgm_gvdw_set_rgauss(n, rg)
+  implicit none
+  integer, intent(in)          :: n
+  double precision, intent(in) :: rg(n)
+  if (allocated(gvdw_rgauss)) deallocate(gvdw_rgauss)
+  allocate(gvdw_rgauss(n))
+  gvdw_rgauss(1:n) = rg(1:n)
+end subroutine pgm_gvdw_set_rgauss
 
 !*******************************************************************************
 ! pgm_gvdw_pair: energy e and df = -(dU/dr)/r of one GVDW pair
@@ -80,7 +94,6 @@ end subroutine pgm_gvdw_pair
 subroutine pgm_gvdw_gpu_nb14_setup(nb14_cnt, nb14, ntypes, iac, ico, cn1, cn2)
 
   use pol_gauss_mdin_dat_mod, only : igvdw
-  use pol_gauss_multipoles_mod, only : r_gauss
 
   implicit none
 
@@ -105,7 +118,7 @@ subroutine pgm_gvdw_gpu_nb14_setup(nb14_cnt, nb14, ntypes, iac, ico, cn1, cn2)
     ij(2, n) = j
     coef(1, n) = cn1(ic)
     coef(2, n) = cn2(ic)
-    coef(3, n) = 1.d0 / sqrt(r_gauss(i) + r_gauss(j))
+    coef(3, n) = 1.d0 / sqrt(gvdw_rgauss(i) + gvdw_rgauss(j))
   end do
   call pgm_gpu_nb14_gvdw_setup(nb14_cnt, ij, coef)
   deallocate(ij, coef)

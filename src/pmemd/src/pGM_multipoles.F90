@@ -8,6 +8,7 @@
 module pol_gauss_multipoles_mod
 
    use pgm_interface_data_mod, only : betamax
+   use pgm_gvdw_mod, only : pgm_gvdw_set_rgauss
 #ifdef MPI
   use parallel_dat_mod
 #endif
@@ -463,6 +464,7 @@ function pGM_MPOLE_readparm(nf,num_atoms)
   ! b_polar is read in as radii
   ! preprocess radius and beta for efficient combination
   r_gauss(1:num_atoms) = 2.0d0*b_polar(1:num_atoms)**2 ! this is to be consistent with pyresp
+  call pgm_gvdw_set_rgauss(num_atoms, r_gauss)   ! copy for the 1-4 GVDW code
   !r_gauss(1:num_atoms) = 1.0d0*b_polar(1:num_atoms)**2 ! this is the original condition used for MD testing.
   !r_polar(1:num_atoms) = 1.0d0/b_polar(1:num_atoms)
 
@@ -530,6 +532,7 @@ end if
   call mpi_bcast(covalent_monop, natom, MPI_DOUBLE_PRECISION, 0, pmemd_comm, ier)
   call mpi_bcast(b_polar, natom, MPI_DOUBLE_PRECISION, 0, pmemd_comm, ier)
   call mpi_bcast(r_gauss, natom, MPI_DOUBLE_PRECISION, 0, pmemd_comm, ier)
+  call pgm_gvdw_set_rgauss(natom, r_gauss)
   call mpi_bcast(covalent_atm, ncovalent, MPI_INTEGER, 0, pmemd_comm, ier)
   call mpi_bcast(covalent_dip, ncovalent, MPI_DOUBLE_PRECISION, 0, pmemd_comm, ier)
 
