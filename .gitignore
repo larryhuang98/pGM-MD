@@ -6,3 +6,4 @@ openmm/build-gcc11/
 build_omm_login.out
 core/tests/run_dump
 core/tests/test_gvdw
+core/tests/test_core
