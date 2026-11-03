@@ -1,7 +1,7 @@
 #include "CommonPGMKernels.h"
 #include "CommonPGMKernelSources.h"
 #include "internal/PGMForceImpl.h"
-#include "pgm_constants.h"
+#include "pgm_math.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/common/ComputeForceInfo.h"
 #include "openmm/common/ContextSelector.h"
@@ -60,37 +60,6 @@ public:
 private:
     CommonCalcPGMForceKernel& owner;
 };
-
-static vector<double> bsplineModuli(int K, int p) {
-    // |sum_k M_p(k+1) exp(2 pi i m k / K)|^2, zeros replaced by the mean of the neighbours
-    vector<double> M(p+1, 0.0), tmp(p+1, 0.0);
-    M[0] = 1.0;
-    for (int k = 2; k <= p; k++) {
-        for (int j = 0; j < k; j++) {
-            double cur = (j < k-1 ? M[j] : 0.0), prev = (j > 0 ? M[j-1] : 0.0);
-            tmp[j] = (j*cur+(k-j)*prev)/(k-1);
-        }
-        for (int j = 0; j < k; j++)
-            M[j] = tmp[j];
-    }
-    vector<double> data(K, 0.0);
-    for (int k = 0; k < p-1 && k < K; k++)
-        data[k] = M[k+1];
-    vector<double> mod(K);
-    for (int m = 0; m < K; m++) {
-        double sc = 0, ss = 0;
-        for (int k = 0; k < K; k++) {
-            double arg = 2*M_PI*m*k/K;
-            sc += data[k]*cos(arg);
-            ss += data[k]*sin(arg);
-        }
-        mod[m] = sc*sc+ss*ss;
-    }
-    for (int m = 0; m < K; m++)
-        if (mod[m] < 1e-7)
-            mod[m] = 0.5*(mod[(m-1+K)%K]+mod[(m+1)%K]);
-    return mod;
-}
 
 CommonCalcPGMForceKernel::CommonCalcPGMForceKernel(string name, const Platform& platform, ComputeContext& cc, const System& system) :
         CalcPGMForceKernel(name, platform), cc(cc), system(system), hasInitializedKernels(false), lastIterations(0),
@@ -301,9 +270,9 @@ void CommonCalcPGMForceKernel::initialize(const System& system, const PGMForce& 
         moduliX.initialize(cc, gridX, elementSize, "pgmModuliX");
         moduliY.initialize(cc, gridY, elementSize, "pgmModuliY");
         moduliZ.initialize(cc, gridZ, elementSize, "pgmModuliZ");
-        moduliX.upload(bsplineModuli(gridX, pmeOrder), true);
-        moduliY.upload(bsplineModuli(gridY, pmeOrder), true);
-        moduliZ.upload(bsplineModuli(gridZ, pmeOrder), true);
+        moduliX.upload(pgmcore::bsplineModuli(gridX, pmeOrder), true);
+        moduliY.upload(pgmcore::bsplineModuli(gridY, pmeOrder), true);
+        moduliZ.upload(pgmcore::bsplineModuli(gridZ, pmeOrder), true);
         fft = cc.createFFT(gridX, gridY, gridZ, true);
         ComputeProgram pme = cc.compileProgram(CommonPGMKernelSources::pgmPme, defines);
         spreadKernel = pme->createKernel("gridSpread");

@@ -172,8 +172,10 @@ mixed (pocl), 1 fs, 0.8 nm, beta 4, 48^3, tol 1e-5, mu4, peek 0.65: total energy
   in every pass of the solver, not exclusions.
 * **Serialization**: proxies write `version`; a new property must be read with a default so that old
   files stay readable.
-* **Shared code**: `core/gvdw_kernel.h` and `core/pgm_constants.h` are header-only and meant for every
-  engine (the GROMACS module includes `gvdw_kernel.h` for its GVDW); `pgm_core` is the reference all ports are
+* **Shared code**: `core/pgm_math.h` (erf/erfc multipole kernels, the stable Ewald pair kernels
+  `ewaldPairKernels`, B-spline moduli, Ewald coefficient, minimum image), `core/gvdw_kernel.h` (the GVDW
+  pair) and `core/pgm_constants.h` are header-only, one copy for pgm_core, this plugin's host code and the
+  GROMACS module (copied next to it by `g1_install.sh`); `pgm_core` is the reference all ports are
   checked against.
 * Not yet: alchemical lambda / energy parameter derivatives, per-term energies and the strain
   derivative in the API, quadrupoles, charge flux, external fields, virtual sites.
@@ -184,8 +186,12 @@ mixed (pocl), 1 fs, 0.8 nm, beta 4, 48^3, tol 1e-5, mu4, peek 0.65: total energy
   truncated-octahedron box (CPU platform and brute force agree): compare on the CPU platform.
 * pocl (OpenCL on the CPU, used for testing without a GPU: `runs/ocl_env.sh`) gives wrong double-precision
   FFTs, for OpenMM's own PME too; mixed and single precision are fine.
-* The CG solver keeps its vectors in `real` (float in mixed precision): induced-dipole tolerances below
-  about 1e-6 are not reached reliably in mixed precision (use double precision for tight tolerances).
+* Mixed precision has an accuracy floor in the induced dipoles of about 2e-5 (max) / 5e-6 (rms) relative
+  to double precision (water512, `tests/mixed_cg.py`), the same without PME and for every tolerance from
+  1e-5 to 1e-8: it comes from the pair fields evaluated in single precision (float positions, as in all
+  of OpenMM's mixed-precision forces), not from the CG, so keeping the CG vectors in double would not
+  change it.  Tolerances below ~1e-5 buy nothing in mixed precision; use double precision for tight
+  solves.  Energy: 2e-7 relative.
 * The GPU CG runs in one work group (at most 512 threads, fewer if the device allows fewer): fine for
   thousands of atoms, a bottleneck for very large systems.
 * Not implemented yet: quadrupoles, charge flux, DE van der Waals, virtual sites, external fields; the strain derivative is computed by pgm_core but not exposed.

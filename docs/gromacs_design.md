@@ -100,7 +100,7 @@ rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
 
 * direct space: the local nbnxm CPU cluster lists (`pairlistSets().pairlistSet(Local).cpuLists()`,
   `getLocalAtomOrder()`), exclusion masks ignored, overlapping (diagonal) cluster pairs counted with
-  nbnxm index j > i, pairs beyond rcoulomb skipped; kernels in double;
+  nbnxm index j > i, pairs beyond rcoulomb skipped; kernels in double (G2 below for how);
 * PME of charges and dipoles with the GROMACS FFT (`gmx_parallel_3dfft`, one rank; the complex grid is
   y-major / x-minor as in `pme_solve`, whatever `complex_order` says), splines theta, dtheta, d2theta of
   order 4-12, influence function with OpenMM's B-spline moduli;
@@ -109,9 +109,7 @@ rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
 * outputs: forces into `ForceWithVirial` with the analytical virial Xi = S^T/2 (pairs, covalent chain
   rule, reciprocal including the dipole term, background); energies: Coulomb (SR) = direct, Coul. recip.
   = reciprocal + self + background, "pGM Polariz." = sum |mu|^2/(2 alpha);
-* OpenMP: the i-cluster entries of all lists dealt out dynamically into per-thread pair vectors, per-thread
-  field/force buffers, atoms (splines, gather), per-thread spread grids, the threaded `gmx_parallel_3dfft`,
-  convolution; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
+* OpenMP: see G2; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
 * `GMX_PGM_DUMP=file`: the first force call's settings, terms, virial, per-atom positions, parameters,
   forces, dipoles and the covalent list, in the global order; `core/tests/run_dump` recomputes it with
   pgm_core, `tests/compare_gmx.py` compares it with a pGM-JAX reference.
@@ -144,10 +142,9 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
 * GROMACS-side input checks: finite epsilon-r, no energy groups (one CoulombSR pair), every atom in
   `[ pgm_atoms ]`, no 1-4 electrostatics, `-nb cpu`, one rank, no MTS; polarizabilities <= 1e-9 nm^3
   count as zero.
-* Speed of this reference (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms per
-  step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms, final
-  forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels
-  per pair in double; the PME is a plain per-thread-grid spread / FFT / gather.  Speed is G2's job.
+* Speed of the first G1 version (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms
+  per step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms,
+  final forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  G2 below.
 
 ### GVDW (done)
 
@@ -168,8 +165,10 @@ The Gaussian-density van der Waals of pmemd-pgm (`igvdw = 1`; OpenMM's `GVDWForc
   forces and virial into ForceWithVirial; energies: LJ (SR) (combination rule), "GVDW pairs"
   (overrides), Disper. corr. (tail);
 * converter: `prmtop_to_gmx.py --gvdw slater|gauss [--gvdw-params A_kcal C6_kcalA6 b]` writes pmemd's
-  global parameters as `[ pgm_gvdw ]` on every atom with LJ epsilon > 0 and zeroes the atom types'
-  epsilon (molecules with 1-4 pairs not yet: their LJ would come from the zeroed types).
+  global parameters (full double precision) as `[ pgm_gvdw ]` on every atom with LJ epsilon > 0, writes
+  the 1-4 Lennard-Jones parameters of every `[ pairs ]` line explicitly (from gen-pairs/fudgeLJ/comb-rule
+  or `[ pairtypes ]`) and then zeroes the epsilon of the atom types and `[ nonbond_params ]`: the 1-4 LJ
+  stays as it was, GVDW acts on the non-excluded pairs, as in pmemd-pgm.
 
 Validation (`tests/gmx/gvdw_sp.sh`, `gvdw_extra.sh`, `tests/compare_gmx_gvdw.py`; the GVDW manuscript's
 512-water box, rvdw 1.0 nm, against an independent NumPy sum and pmemd-pgm):
@@ -182,25 +181,58 @@ Validation (`tests/gmx/gvdw_sp.sh`, `gvdw_extra.sh`, `tests/compare_gmx_gvdw.py`
 | gmx (mixed) energy vs NumPy | 9e-8 (float parameters in the tpr) | 4e-7 |
 | gmx (mixed) forces max diff | 5e-5 | 9e-5 |
 
+Molecules with 1-4 pairs (`tests/gmx/gvdw_14.sh` + `gvdw_14_compare.py`: the Amber pGM test molecule
+qm7b_7203, 20 atoms, 46 1-4 pairs, alone in a 4 nm box, rvdw 1.2 nm, converted with LJ, Slater and Gauss
+GVDW, against OpenMM's `pgm_prmtop` NoCutoff on the same coordinates): GVDW = LJ (SR) to 1e-13 kJ/mol,
+LJ-14 identical in all three conversions and = OpenMM's 1-4 LJ to 2e-6 (ParmEd's 8-digit parameters), bonds,
+angles, dihedrals to 1e-6, Coulomb-14 = 0.
+
 Overrides (an O-H pair of every water, A 300, C6 0.002, B 1.5) to 1e-15, the tail -88.19541348 kJ/mol =
 formula = OpenMM's, Pres. DC = E/V.  NVE (mixed, pGM + GVDW Slater, 1 fs, 4 ps, tol 1e-5, mu4, peek 0.65):
 total energy fluctuation 0.33 kJ/mol, drift -0.21 kJ/mol over 4 ps; 4.0 CG iterations; 4.6 ns/day.
 Direct-space shifts are now built in double from the box (mixed builds: forces 25x closer to double).
 
-### G2 plan (next)
+### G2 (done): CPU speed
 
-Measured costs of the G1 reference (above) set the order:
+Water512, 8 OpenMP threads, `-pin on` (the node's logical CPUs are interleaved over 4 NUMA nodes;
+unpinned threads cost ~30%), `GMX_PGM_TIMING=1`:
 
-1. **PME** (half the step): spread/gather of order 6 over 216 grid points per atom, 7 solves per step.
-   Use GROMACS's `PmeAndFftGrids` thread-overlap decomposition (spread into thread-local subgrids with
-   halo reduction, as `spread_on_grid`) instead of full per-thread grids; mixed precision on the grid;
-   reuse the splines across the CG solves (already done) and gather field and field gradient in one pass.
-2. **Pair setup**: evaluate G1, G2 (and G0, G3 for the final pass) in SIMD over the 4xM cluster pairs
-   (`gmx::SimdReal`, erfc via `pmeForceCorrection`-style polynomials for beta and the exact series /
-   recursion for the Gaussian a_ij), store them per cluster pair in the list order (float in mixed
-   precision), so each CG pass is a streaming SIMD loop: load x_i, d_i (4 atoms), x_j, d_j (M atoms),
-   G1, G2 tile, accumulate E_i in registers, E_j with the nbnxm j-force reduction pattern.
-3. **CG vectors** in nbnxm atom order (no gathers through `getLocalAtomOrder` per pass).
+| | G1 | G2 |
+|---|---|---|
+| NVE 1 fs, 36^3, double (`nve_w512.sh double`) | 4.4 ns/day | 11.1 ns/day |
+| NVE 1 fs, 36^3, mixed | | 11.0 ns/day |
+| NPT 2 fs, 48^3, mixed (`npt_w512.sh`) | 7.4 ns/day | 15.4 ns/day |
+| ms per force call (double): pair setup / field passes / PME / final forces | 4.7 / 2.2 / 9.6 / 1.4 | 1.5 / 1.5 / 3.0 / 0.9 |
 
-Check: the same G1 validation (gmx_d against pgm_core to 1e-12, mixed against double), then speed against
-pmemd.pgm (CPU) and OpenMM (CPU / pocl).
+What changed:
+
+1. **Pair candidates cached per pair search.**  At `doNeighborSearch` steps every atom pair of the nbnxm
+   cluster pairs (not only those within the atomic rlist: the cluster bounding boxes are part of the Verlet
+   buffer, filtering them out raised the mixed NVE drift from -0.07 to 1.0 kJ/mol / 4 ps) is stored once,
+   in segments of one i atom and one shift, with its GVDW eligibility (exclusions and overrides checked
+   there, not at every step).  Each step compacts the pairs within rc into structure-of-arrays segments.
+2. **SIMD kernels.**  G_0..G_3 in the erfc form Bc(beta) - Bc(a) (`pgmcore::ewaldPairKernels`, now also
+   pgm_core's and the OpenMM kernels' form) with GROMACS's double-precision SIMD `erfc`/`exp`
+   (AVX2: 4 pairs), the few pairs with a r < 1 (bonded neighbours) again from the series.
+3. **Pair passes** run over the i-segments: atom i's field and force in registers, j scattered.
+4. **PME**: grid indices precomputed per atom (no modulo in the inner loops); the z dimension padded by
+   order - 1 so an atom's z points are contiguous (z splines stored in that order); owner-computes
+   spreading over tiles of (x, y) columns at least `order` wide (each atom listed in its <= 4 tiles; no
+   per-thread grids, no reduction, no colouring), the padding folded into the FFT grid; gathers with
+   contiguous z.
+
+Accuracy unchanged: gmx_d vs pgm_core 1e-15 relative energy, 4e-11 forces, 3e-16 dipoles; mixed 3e-11 /
+9e-4; GVDW to 1e-16 (NumPy), pmemd -2e-5 / -4e-5 kcal/mol; NVE mixed 4 ps: fluctuation 0.37-0.44 kJ/mol,
+drift -0.04 to -0.28 kJ/mol (the trajectory depends on the thread count's summation order).
+
+### Next
+
+1. **G3 (GPU)**: the pair passes and the PME on the GPU (the nbnxm GPU lists; the CG in one kernel
+   sequence as in the OpenMM plugin), the GPU PME grids.
+2. **G4 (domain decomposition)**: the pair passes over local + non-local atoms, halo exchange of the
+   dipoles each CG iteration, PME with the GROMACS PME decomposition.
+3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
+   (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
+
+Check: the same validations (`tests/validate_all.sh`), then speed against pmemd.pgm (CPU / GPU) and
+OpenMM.

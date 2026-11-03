@@ -114,9 +114,6 @@ private:
     void solve();
 };
 
-/** Radial kernels B_0..B_{nmax-1} of erf(a r)/r: series for (a r)^2 < 1, closed form elsewhere. */
-void erfKernels(double a, double r, int nmax, double* B);
-
 } // namespace pgmcore
 
 #endif

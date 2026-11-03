@@ -76,6 +76,12 @@ one digit per order at a r ~ 0.7 in float32; md/kernels.py `erf_kernels`).
     G_n = B_n[erf(a_ij r)/r] - B_n[erf(beta r)/r]          (= B_n[erfc(beta r)/r] - B_n[erfc(a_ij r)/r])
     U_dir = sum q_i q_j G0 + (q_i d_j.x - q_j d_i.x) G1 + (d_i.d_j) G1 - (d_i.x)(d_j.x) G2
 
+Numerically (`core/pgm_math.h` `ewaldPairKernels`, used by pgm_core, the GROMACS module and the
+OpenMM kernels): for a_ij r < 1 the difference of the two erf series; for a_ij r >= 1 the erfc form
+Bc(beta) - Bc(a_ij), Bc_n = [(2n-1) Bc_{n-1} + (2a^2)^(n-1) 2a exp(-a^2 r^2)/sqrt(pi)] / r^2 (all terms
+positive), which avoids the cancellation of the 1/r^(2n+1) parts at long range (the erf form loses
+~5 digits of G_0 at r_c).
+
 (beta: Ewald coefficient; pairs beyond r_c are assumed to have erfc(beta r) and erfc(a_ij r)
 negligible, which holds since a_ij > beta in practice: water a_OH = 8.7 /nm, beta ~ 3.5 /nm.  The
 OpenMM plugin checks it: erfc(a_min r_c), a_min = 1/(2 R_max), must not exceed the Ewald error

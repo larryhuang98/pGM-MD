@@ -1,5 +1,5 @@
 #include "pgm_core.h"
-#include "pgm_constants.h"
+#include "pgm_math.h"
 #include "pocketfft_hdronly.h"
 #include <algorithm>
 #include <cmath>
@@ -10,39 +10,8 @@ using namespace std;
 
 namespace pgmcore {
 
-static const double SQRT_PI = 1.7724538509055160273;
-
 static inline double dot(const V3& a, const V3& b) {
     return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
-}
-
-void erfKernels(double a, double r, int nmax, double* B) {
-    double x = a*r, s = x*x;
-    double c0 = 2.0*a/SQRT_PI, a2 = 2.0*a*a;
-    if (s < 1.0) {
-        // B_n = c0 (2a^2)^n sum_m (-s)^m / (m! (2m+2n+1)), m = 0..14
-        double t[15];
-        t[0] = 1.0;
-        for (int m = 1; m < 15; m++)
-            t[m] = t[m-1]*(-s)/m;
-        double pw = 1.0;
-        for (int k = 0; k < nmax; k++) {
-            double sum = 0.0;
-            for (int m = 14; m >= 0; m--)
-                sum += t[m]/(2*m+2*k+1);
-            B[k] = c0*pw*sum;
-            pw *= a2;
-        }
-    }
-    else {
-        double c = c0*exp(-s), ir2 = 1.0/(r*r);
-        B[0] = erf(x)/r;
-        double pw = 1.0;
-        for (int k = 1; k < nmax; k++) {
-            B[k] = ((2*k-1)*B[k-1]-pw*c)*ir2;
-            pw *= a2;
-        }
-    }
 }
 
 static void applyPolarizabilityThreshold(Topology& top) {
@@ -79,14 +48,6 @@ void Engine::setTopology(const Topology& t) {
 
 // ------------------------------------------------------------------------- geometry
 
-static void minImage(V3& x, const V3 box[3]) {
-    for (int c = 2; c >= 0; c--) {
-        double k = round(x[c]/box[c][c]);
-        for (int j = 0; j < 3; j++)
-            x[j] -= k*box[c][j];
-    }
-}
-
 void Engine::perm_dipoles() {
     perm.assign(n, V3{0, 0, 0});
     for (size_t m = 0; m < top.covAtom.size(); m++) {
@@ -103,7 +64,6 @@ void Engine::perm_dipoles() {
 void Engine::build_pairs() {
     pairs.clear();
     double rc2 = s.cutoff*s.cutoff;
-    double Bb[4];
     for (int i = 0; i < n; i++)
         for (int j = i+1; j < n; j++) {
             Pair p;
@@ -118,12 +78,10 @@ void Engine::build_pairs() {
             }
             double r = sqrt(dot(p.x, p.x));
             double a = 1.0/sqrt(2.0*(top.radius[i]*top.radius[i]+top.radius[j]*top.radius[j]));
-            erfKernels(a, r, 4, p.G);
-            if (s.periodic) {
-                erfKernels(s.beta, r, 4, Bb);
-                for (int k = 0; k < 4; k++)
-                    p.G[k] -= Bb[k];
-            }
+            if (s.periodic)
+                ewaldPairKernels(a, s.beta, r, 4, p.G);
+            else
+                erfKernels(a, r, 4, p.G);
             pairs.push_back(p);
         }
 }
@@ -192,37 +150,6 @@ void Engine::setup_pme() {
             }
             gridIndex[a][i] = base;
         }
-}
-
-static vector<double> bsplineModuli(int K, int p) {
-    // |sum_k M_p(k+1) exp(2 pi i m k / K)|^2, zeros replaced by the mean of the neighbours (OpenMM)
-    vector<double> M(p+1, 0.0), tmp(p+1, 0.0);
-    M[0] = 1.0;   // M_1 at 0 (fr = 0): M_k(j) for j = 0..k-1
-    for (int k = 2; k <= p; k++) {
-        for (int j = 0; j < k; j++) {
-            double cur = (j < k-1 ? M[j] : 0.0), prev = (j > 0 ? M[j-1] : 0.0);
-            tmp[j] = (j*cur+(k-j)*prev)/(k-1);
-        }
-        for (int j = 0; j < k; j++)
-            M[j] = tmp[j];
-    }
-    vector<double> data(K, 0.0);
-    for (int k = 0; k < p-1 && k < K; k++)
-        data[k] = M[k+1];
-    vector<double> mod(K);
-    for (int m = 0; m < K; m++) {
-        double sc = 0, ss = 0;
-        for (int k = 0; k < K; k++) {
-            double arg = 2*M_PI*m*k/K;
-            sc += data[k]*cos(arg);
-            ss += data[k]*sin(arg);
-        }
-        mod[m] = sc*sc+ss*ss;
-    }
-    for (int m = 0; m < K; m++)
-        if (mod[m] < 1e-7)
-            mod[m] = 0.5*(mod[(m-1+K)%K]+mod[(m+1)%K]);
-    return mod;
 }
 
 void Engine::compute_influence() {

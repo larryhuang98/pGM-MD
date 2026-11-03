@@ -6,9 +6,9 @@
  * sum runs over the nbnxm cluster pair lists, which keep all pairs within the cut-off, excluded pairs
  * included (pGM electrostatics have no exclusions; the nbnxm kernels compute Lennard-Jones only).
  *
- * Phase G1: scalar CPU implementation (double-precision kernels), single rank, the reference of the SIMD and
- * GPU kernels.  Forces go to the ForceWithVirial buffer with the analytical strain derivative as the
- * virial.
+ * CPU implementation (phases G1 + G2: double-precision kernels, the pair kernels in double SIMD, OpenMP),
+ * single rank, the reference of the GPU kernels.  Forces go to the ForceWithVirial buffer with the
+ * analytical strain derivative as the virial.
  *
  * GVDW (Gaussian-density van der Waals, pmemd-pgm igvdw = 1), if the topology has [ pgm_gvdw ]: pairs
  * within rvdw over the same pair lists, the topology's exclusions applied, [ pgm_gvdw_pairs ] overrides,

@@ -36,15 +36,19 @@
 #include "gromacs/nbnxm/pairlistset.h"
 #include "gromacs/nbnxm/pairlistsets.h"
 #include "gromacs/pbcutil/ishift.h"
+#include "gromacs/simd/simd.h"
+#include "gromacs/simd/simd_math.h"
 #include "gromacs/topology/idef.h"
 #include "gromacs/topology/ifunc.h"
 #include "gromacs/utility/fatalerror.h"
 #include "gromacs/utility/gmxassert.h"
 #include "gromacs/utility/gmxmpi.h"
 #include "gromacs/utility/gmxomp.h"
+#include "gromacs/utility/alignedallocator.h"
 #include "gromacs/utility/listoflists.h"
 
-#include "gvdw_kernel.h" // the GVDW pair (pgm-native core/, copied next to this file)
+#include "gvdw_kernel.h" // pgm-native core/, copied next to this file: the GVDW pair
+#include "pgm_math.h"    // and the shared numerics (erf kernels, B-spline moduli, minimum image)
 
 namespace gmx
 {
@@ -52,9 +56,12 @@ namespace gmx
 namespace
 {
 
-constexpr double c_sqrtPi = 1.7724538509055160273;
-//! polarizabilities at or below this [nm^3] are not polarizable (pmemd-pgm; core/pgm_constants.h)
-constexpr double c_minPolarizability = 1e-9;
+// the numerics shared with pgm_core and the OpenMM plugin (pgm-native core/pgm_math.h)
+using pgmcore::bsplineModuli;
+using pgmcore::ewaldCoefficient;
+constexpr double c_sqrtPi = pgmcore::SQRT_PI;
+//! polarizabilities at or below this [nm^3] are not polarizable (pmemd-pgm)
+constexpr double c_minPolarizability = pgmcore::MIN_POLARIZABILITY;
 //! largest PME order (readir: pme-order <= 12)
 constexpr int c_maxPmeOrder = 12;
 
@@ -63,115 +70,58 @@ inline double dot3(const DVec& a, const DVec& b)
     return a[XX] * b[XX] + a[YY] * b[YY] + a[ZZ] * b[ZZ];
 }
 
-/*! \brief Radial kernels B_0..B_{nmax-1} of erf(a r)/r, B_n = -(1/r d/dr) B_{n-1}:
- * a series for (a r)^2 < 1, the upward recursion elsewhere. */
-void erfKernels(double a, double r, int nmax, double* B)
-{
-    const double x = a * r, s = x * x;
-    const double c0 = 2.0 * a / c_sqrtPi, a2 = 2.0 * a * a;
-    if (s < 1.0)
-    {
-        // B_n = c0 (2a^2)^n sum_m (-s)^m / (m! (2m+2n+1)), m = 0..14
-        double t[15];
-        t[0] = 1.0;
-        for (int m = 1; m < 15; m++)
-        {
-            t[m] = t[m - 1] * (-s) / m;
-        }
-        double pw = 1.0;
-        for (int k = 0; k < nmax; k++)
-        {
-            double sum = 0.0;
-            for (int m = 14; m >= 0; m--)
-            {
-                sum += t[m] / (2 * m + 2 * k + 1);
-            }
-            B[k] = c0 * pw * sum;
-            pw *= a2;
-        }
-    }
-    else
-    {
-        const double c = c0 * std::exp(-s), ir2 = 1.0 / (r * r);
-        B[0]           = std::erf(x) / r;
-        double pw      = 1.0;
-        for (int k = 1; k < nmax; k++)
-        {
-            B[k] = ((2 * k - 1) * B[k - 1] - pw * c) * ir2;
-            pw *= a2;
-        }
-    }
-}
+using PairBuffer = std::vector<double, AlignedAllocator<double>>;
 
-//! Ewald coefficient beta with erfc(beta rc) = rtol, in double (calc_ewaldcoeff_q in real)
-double ewaldCoefficient(double rc, double rtol)
-{
-    double beta = 5, low = 0, high;
-    int    n = 0;
-    do
-    {
-        n++;
-        beta *= 2;
-    } while (std::erfc(beta * rc) > rtol);
-    n += 60;
-    high = beta;
-    for (int i = 0; i < n; i++)
-    {
-        beta = 0.5 * (low + high);
-        if (std::erfc(beta * rc) > rtol)
-        {
-            low = beta;
-        }
-        else
-        {
-            high = beta;
-        }
-    }
-    return beta;
-}
+#if GMX_SIMD && GMX_SIMD_HAVE_DOUBLE
+constexpr int c_pairSimdWidth = GMX_SIMD_DOUBLE_WIDTH;
+#else
+constexpr int c_pairSimdWidth = 1;
+#endif
 
-//! |sum_k M_p(k+1) exp(2 pi i m k / K)|^2, zeros replaced by the mean of the neighbours
-std::vector<double> bsplineModuli(int K, int p)
+/*! \brief The Ewald pair kernels G_n = Bc_n(beta) - Bc_n(a), n = 0..3, of erfc(x r)/r (the form of
+ * pgmcore::ewaldPairKernels for a r >= 1) for n pairs, n a multiple of c_pairSimdWidth, arrays aligned.
+ * In double-precision SIMD where available (erfc and exp to the last bits). */
+void erfcPairKernels(const double* r, const double* a, int n, double beta, double* G0, double* G1, double* G2, double* G3)
 {
-    std::vector<double> M(p + 1, 0.0), tmp(p + 1, 0.0);
-    M[0] = 1.0;
-    for (int k = 2; k <= p; k++)
+#if GMX_SIMD && GMX_SIMD_HAVE_DOUBLE
+    const SimdDouble vBeta(beta), cBeta(2.0 * beta / c_sqrtPi), b2(2.0 * beta * beta), b4(4.0 * beta * beta * beta * beta);
+    const SimdDouble c2sqpi(2.0 / c_sqrtPi), two(2.0), three(3.0), five(5.0);
+    for (int k = 0; k < n; k += c_pairSimdWidth)
     {
-        for (int j = 0; j < k; j++)
-        {
-            const double cur = (j < k - 1 ? M[j] : 0.0), prev = (j > 0 ? M[j - 1] : 0.0);
-            tmp[j]           = (j * cur + (k - j) * prev) / (k - 1);
-        }
-        for (int j = 0; j < k; j++)
-        {
-            M[j] = tmp[j];
-        }
+        const SimdDouble vr    = load<SimdDouble>(r + k);
+        const SimdDouble va    = load<SimdDouble>(a + k);
+        const SimdDouble invR  = inv(vr);
+        const SimdDouble invR2 = invR * invR;
+        const SimdDouble xb    = vBeta * vr;
+        const SimdDouble cb    = cBeta * exp(-(xb * xb));
+        const SimdDouble Bb0   = erfc(xb) * invR;
+        const SimdDouble Bb1   = (Bb0 + cb) * invR2;
+        const SimdDouble Bb2   = fma(three, Bb1, b2 * cb) * invR2;
+        const SimdDouble Bb3   = fma(five, Bb2, b4 * cb) * invR2;
+        const SimdDouble xa    = va * vr;
+        const SimdDouble a2    = two * va * va;
+        const SimdDouble ca    = c2sqpi * va * exp(-(xa * xa));
+        const SimdDouble Ba0   = erfc(xa) * invR;
+        const SimdDouble Ba1   = (Ba0 + ca) * invR2;
+        const SimdDouble Ba2   = fma(three, Ba1, a2 * ca) * invR2;
+        const SimdDouble Ba3   = fma(five, Ba2, a2 * a2 * ca) * invR2;
+        store(G0 + k, Bb0 - Ba0);
+        store(G1 + k, Bb1 - Ba1);
+        store(G2 + k, Bb2 - Ba2);
+        store(G3 + k, Bb3 - Ba3);
     }
-    std::vector<double> data(K, 0.0);
-    for (int k = 0; k < p - 1 && k < K; k++)
+#else
+    for (int k = 0; k < n; k++)
     {
-        data[k] = M[k + 1];
+        double Gk[4], Bb[4];
+        pgmcore::erfcKernels(beta, r[k], 4, Gk);
+        pgmcore::erfcKernels(a[k], r[k], 4, Bb);
+        G0[k] = Gk[0] - Bb[0];
+        G1[k] = Gk[1] - Bb[1];
+        G2[k] = Gk[2] - Bb[2];
+        G3[k] = Gk[3] - Bb[3];
     }
-    std::vector<double> mod(K);
-    for (int m = 0; m < K; m++)
-    {
-        double sc = 0, ss = 0;
-        for (int k = 0; k < K; k++)
-        {
-            const double arg = 2 * M_PI * m * k / K;
-            sc += data[k] * std::cos(arg);
-            ss += data[k] * std::sin(arg);
-        }
-        mod[m] = sc * sc + ss * ss;
-    }
-    for (int m = 0; m < K; m++)
-    {
-        if (mod[m] < 1e-7)
-        {
-            mod[m] = 0.5 * (mod[(m - 1 + K) % K] + mod[(m + 1) % K]);
-        }
-    }
-    return mod;
+#endif
 }
 
 } // namespace
@@ -192,7 +142,8 @@ public:
                    ArrayRef<const RVec>          shiftVectors,
                    ArrayRef<const int>           globalIndex,
                    ForceWithVirial*              forceWithVirial,
-                   gmx_enerdata_t*               enerd);
+                   gmx_enerdata_t*               enerd,
+                   bool                          doPairSearch);
 
     // settings
     double rc_, beta_, ke_, tol_, peek_;
@@ -217,21 +168,26 @@ public:
     double                         gvdwEnergy_ = 0, gvdwPairEnergy_ = 0, gvdwTail_ = 0;
     double                         gvdwS_[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     void                           gvdwOverridesAndTail();
-    //! one combination-rule GVDW pair of the pair loop (x = r_i - r_j + shift): skips excluded and overridden pairs
-    void gvdwPairInLoop(int ai, int aj, const DVec& x, double r2, std::vector<DVec>& F, double* sum) const
+    //! whether the pair takes part in the combination-rule GVDW: both atoms GVDW atoms, not excluded, not overridden
+    bool gvdwRulePair(int ai, int aj) const
     {
+        if (!gvdw_ || !gvdwActive_[ai] || !gvdwActive_[aj])
+        {
+            return false;
+        }
         for (const int e : (*excls_)[ai])
         {
             if (e == aj)
             {
-                return;
+                return false;
             }
         }
-        if (!gvdwPairSet_.empty()
-            && gvdwPairSet_.count(static_cast<int64_t>(std::min(ai, aj)) * n_ + std::max(ai, aj)))
-        {
-            return;
-        }
+        return gvdwPairSet_.empty()
+               || gvdwPairSet_.count(static_cast<int64_t>(std::min(ai, aj)) * n_ + std::max(ai, aj)) == 0;
+    }
+    //! one combination-rule GVDW pair of the pair loop (x = r_i - r_j + shift)
+    void gvdwPairInLoop(int ai, int aj, const DVec& x, double r2, std::vector<DVec>& F, double* sum) const
+    {
         const double r   = std::sqrt(r2);
         const double bij = 1.0 / std::sqrt(2.0 * (radius_[ai] * radius_[ai] + radius_[aj] * radius_[aj]));
         double       dEdR;
@@ -258,21 +214,52 @@ public:
     std::vector<double> covStrength_;
 
     // geometry
-    struct Pair
-    {
-        int    i, j;
-        DVec   x; // r_i - r_j (+ shift)
-        double G[4];
-    };
     std::vector<DVec> pos_;
     double            box_[DIM][DIM], recip_[DIM][DIM], volume_ = 0;
-    std::vector<std::vector<Pair>> pairs_;   // per thread
+
+    /*! \brief The pairs of one thread's share of the pair list (cache-line aligned: the vector headers of
+     * different threads do not share cache lines).
+     *
+     * The candidates are taken from the nbnxm cluster lists at the pair-search steps: every atom pair
+     * of the listed cluster pairs, each once, in segments of one i atom and one periodic shift.  At
+     * every step the pairs within the cut-off are compacted into structure-of-arrays segments of one i
+     * atom (r_i - r_j + shift and the kernels G_0..G_3), so the pair passes accumulate atom i in registers.
+     */
+    struct alignas(64) ThreadPairs
+    {
+        std::vector<int>  candSegI, candSegShift, candSegBegin, candJ; // candSegBegin: one past the end too
+        std::vector<char> candGvdw; // the candidate takes part in the combination-rule GVDW
+        std::vector<int>    segI, segBegin, j; // within the cut-off at this step; segBegin: + end
+        std::vector<double> x[DIM];
+        PairBuffer       G[4], r, a; // kernels; |r_ij| and the Gaussian pair exponent (padded)
+        size_t              numPairs() const { return j.size(); }
+    };
+    std::vector<ThreadPairs>        tp_;
     std::vector<std::array<int, 2>> ciItems_; // (pair list, i-cluster entry)
+    bool                            haveCandidates_ = false;
+    //! the candidate pairs from the current nbnxm lists (at pair-search steps)
+    void searchCandidates(const nonbonded_verlet_t& nbv);
 
     // OpenMP: per-thread scratch for the scatter loops
     int                              nt_ = 1;
     std::vector<std::vector<DVec>>   threadVec_;
-    std::vector<std::vector<double>> threadGrid_;
+    /* PME grids in double with the z dimension padded by order - 1 (kzPad_ = nz + order - 1): an atom
+     * with z base point b covers the padded points b .. b + order - 1 contiguously (grid point
+     * (t - order + 1) mod nz), so the inner spreading and gathering loops run over contiguous memory with
+     * the z splines in that order (zTheta_ ...).  Spreading is owner-computes over tiles of (x, y) grid
+     * columns: each tile adds the parts of its atoms that fall into its columns, no two tiles write the
+     * same point, no per-thread grids, no colouring. */
+    int                 kzPad_ = 0;
+    std::vector<double> zTheta_, zDTheta_, zD2Theta_; // per atom, the z splines of padded points b + m
+    int                 numTiles_[2] = { 1, 1 };
+    std::vector<int>    columnTile_[2]; // tile of each x (y) grid index
+    std::vector<int>    tileStart_, tileAtoms_;
+    std::vector<double> spreadGrid_; // nx*ny*kzPad_
+    void                assignTiles();
+    size_t              padIndex(int g1, int g2) const
+    {
+        return (static_cast<size_t>(g1) * grid_[YY] + g2) * kzPad_;
+    }
     //! sum the per-thread vectors 0..nt_-1 into out
     void reduceThreadVec(std::vector<DVec>& out);
 
@@ -289,7 +276,9 @@ public:
     // wall-clock seconds per phase (GMX_PGM_TIMING): pair setup, splines + influence, pair passes of the
     // field, PME, final forces
     double tPairs_ = 0, tSplines_ = 0, tFieldPairs_ = 0, tPme_ = 0, tFinal_ = 0;
-    double numCandidates_ = 0, numPairs_ = 0;
+    // within PME: spreading (with the grid reduction), the two FFTs, the convolution, the gathers
+    double tSpread_ = 0, tFft_ = 0, tConv_ = 0, tGather_ = 0;
+    double numCandidates_ = 0, numPairs_ = 0, numSearches_ = 0;
     static double now()
     {
         return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -306,20 +295,20 @@ public:
     std::vector<double>  moduli_[DIM];
     std::vector<double>  influence_; // per complex grid element
     double               influenceBox_[DIM][DIM] = {}; // the box influence_ was computed for
-    std::vector<int>     gridIndex_[DIM];
+    std::vector<int>     gridIndex_[DIM]; // per atom and spline point j: grid index (base - j) mod K
     std::vector<double>  theta_[DIM], dtheta_[DIM], d2theta_[DIM];
-    std::vector<double>  phi_; // reciprocal potential on the grid (real layout, nx*ny*nz)
+    std::vector<double>  phi_; // reciprocal potential on the padded grid (nx*ny*kzPad_, see padIndex)
 
     void setTopology(int n, ArrayRef<const real> charges, const InteractionDefinitions& idef);
     void setBox(const matrix box);
-    void buildPairs(ArrayRef<const RVec> x, const nonbonded_verlet_t& nbv, ArrayRef<const RVec> shiftVectors);
+    void buildPairs();
     void minImage(DVec& v) const;
     void permanentDipoles();
     void splines();
     void computeInfluence();
     std::vector<DVec> fractionalDipoles(const std::vector<DVec>& d) const;
     double pmePotential(const std::vector<double>* q, const std::vector<DVec>& d, double* strain);
-    void   pmeField(std::vector<DVec>& E) const;
+    void   pmeField(std::vector<DVec>& E);
     std::vector<DVec> field(const std::vector<double>* q, const std::vector<DVec>& d);
     void              solve();
     //! local -> global order (history), and back
@@ -353,10 +342,6 @@ public:
     size_t realIndex(int g1, int g2, int g3) const
     {
         return (static_cast<size_t>(g1) * rSize_[YY] + g2) * rSize_[ZZ] + g3;
-    }
-    size_t phiIndex(int g1, int g2, int g3) const
-    {
-        return (static_cast<size_t>(g1) * grid_[YY] + g2) * grid_[ZZ] + g3;
     }
 };
 
@@ -393,7 +378,7 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
     if (fplog)
     {
         fprintf(fplog,
-                "\npGM electrostatics (G1, CPU; double-precision kernels, PME grid in real):\n"
+                "\npGM electrostatics (CPU; double-precision kernels and PME spreading, FFT in real):\n"
                 "  rcoulomb %g nm, Ewald coefficient %.10g 1/nm, PME grid %d x %d x %d, order %d\n"
                 "  Coulomb constant %.10g, dipole tolerance %g, max. iterations %d, predictor %d, "
                 "peek %g\n  GVDW (if the topology has [ pgm_gvdw ]): rvdw %g nm, %s repulsion, dispersion "
@@ -430,8 +415,14 @@ PgmElectrostatics::Impl::~Impl()
                     "PME %.2f, final forces (excl. PME) %.2f\n",
                     1e3 * tPairs_ / numCalls_, 1e3 * tSplines_ / numCalls_, 1e3 * tFieldPairs_ / numCalls_,
                     1e3 * tPme_ / numCalls_, 1e3 * tFinal_ / numCalls_);
-            fprintf(stderr, "pGM pairs per call: %.0f cluster-list atom pairs, %.0f within the cut-off; %d threads\n",
-                    numCandidates_ / numCalls_, numPairs_ / numCalls_, nt_);
+            fprintf(stderr,
+                    "pGM PME ms per call: spread %.2f, FFTs %.2f, convolution %.2f, gathers %.2f\n",
+                    1e3 * tSpread_ / numCalls_, 1e3 * tFft_ / numCalls_, 1e3 * tConv_ / numCalls_,
+                    1e3 * tGather_ / numCalls_);
+            fprintf(stderr,
+                    "pGM pairs: %.0f cluster-list atom pairs per pair search (%.0f searches), %.0f within the "
+                    "cut-off per call; %d threads\n",
+                    numCandidates_ / std::max(1.0, numSearches_), numSearches_, numPairs_ / numCalls_, nt_);
         }
     }
     if (fft_)
@@ -583,19 +574,90 @@ void PgmElectrostatics::Impl::setBox(const matrix box)
 
 void PgmElectrostatics::Impl::minImage(DVec& v) const
 {
-    for (int c = ZZ; c >= XX; c--)
-    {
-        const double k = std::round(v[c] / box_[c][c]);
-        for (int j = 0; j < DIM; j++)
-        {
-            v[j] -= k * box_[c][j];
-        }
-    }
+    pgmcore::minImage(v, box_);
 }
 
-void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
-                                         const nonbonded_verlet_t& nbv,
-                                         ArrayRef<const RVec>      shiftVectors)
+void PgmElectrostatics::Impl::searchCandidates(const nonbonded_verlet_t& nbv)
+{
+    const auto& lists = nbv.pairlistSets().pairlistSet(InteractionLocality::Local).cpuLists();
+    if (lists.empty())
+    {
+        gmx_fatal(FARGS, "pGM electrostatics need the CPU pair lists (mdrun -nb cpu)");
+    }
+    // every atom pair of the cluster pairs is a candidate, as for the nbnxm LJ kernels: filtering at
+    // the atomic list radius would drop the extra buffer the cluster bounding boxes give (water512
+    // NVE, mixed: energy drift 1.0 instead of -0.07 kJ/mol over 4 ps)
+    ArrayRef<const int> atomOrder = nbv.getLocalAtomOrder();
+    // work items: the i-cluster entries of all lists, dealt out dynamically
+    ciItems_.clear();
+    for (int l = 0; l < lists.ssize(); l++)
+    {
+        for (int c = 0; c < static_cast<int>(lists[l].ci.size()); c++)
+        {
+            ciItems_.push_back({ l, c });
+            const nbnxn_ci_t& ci = lists[l].ci[c];
+            numCandidates_ += static_cast<double>(ci.cj_ind_end - ci.cj_ind_start) * lists[l].na_ci * lists[l].na_cj;
+        }
+    }
+    numSearches_++;
+    const int numItems = ciItems_.size();
+    tp_.resize(nt_);
+#pragma omp parallel num_threads(nt_)
+    {
+        ThreadPairs& T = tp_[gmx_omp_get_thread_num()];
+        T.candSegI.clear();
+        T.candSegShift.clear();
+        T.candSegBegin.clear();
+        T.candJ.clear();
+        T.candGvdw.clear();
+#pragma omp for schedule(dynamic, 8)
+        for (int item = 0; item < numItems; item++)
+        {
+            const NbnxnPairlistCpu& nbl     = lists[ciItems_[item][0]];
+            const nbnxn_ci_t&       ciEntry = nbl.ci[ciItems_[item][1]];
+            const int               naci = nbl.na_ci, nacj = nbl.na_cj;
+            const int               ish     = ciEntry.shift & NBNXN_CI_SHIFT;
+            const bool              central = (ish == c_centralShiftIndex);
+            const int i0 = ciEntry.ci * naci;
+            for (int ii = 0; ii < naci; ii++)
+            {
+                const int ai = atomOrder[i0 + ii];
+                if (ai < 0)
+                {
+                    continue;
+                }
+                const int start = T.candJ.size();
+                for (int cjIndex = ciEntry.cj_ind_start; cjIndex < ciEntry.cj_ind_end; cjIndex++)
+                {
+                    const int j0 = nbl.cj.cj(cjIndex) * nacj;
+                    // nbnxm counts the pairs of overlapping cluster pairs (the diagonal) once: j > i;
+                    // the exclusion masks are ignored: pGM electrostatics have no exclusions
+                    const bool overlap = central && i0 < j0 + nacj && j0 < i0 + naci;
+                    for (int jj = 0; jj < nacj; jj++)
+                    {
+                        const int aj = atomOrder[j0 + jj];
+                        if (aj < 0 || (overlap && j0 + jj <= i0 + ii) || aj == ai)
+                        {
+                            continue;
+                        }
+                        T.candJ.push_back(aj);
+                        T.candGvdw.push_back(gvdwRulePair(ai, aj) ? 1 : 0);
+                    }
+                }
+                if (static_cast<int>(T.candJ.size()) > start)
+                {
+                    T.candSegI.push_back(ai);
+                    T.candSegShift.push_back(ish);
+                    T.candSegBegin.push_back(start);
+                }
+            }
+        }
+        T.candSegBegin.push_back(T.candJ.size());
+    }
+    haveCandidates_ = true;
+}
+
+void PgmElectrostatics::Impl::buildPairs()
 {
     const double rc2   = rc_ * rc_;
     const double rvdw2 = rvdw_ * rvdw_;
@@ -605,110 +667,96 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
     {
         v.assign(gvdw_ ? n_ : 0, DVec{ 0, 0, 0 });
     }
-    const auto&  lists = nbv.pairlistSets().pairlistSet(InteractionLocality::Local).cpuLists();
-    if (lists.empty())
-    {
-        gmx_fatal(FARGS, "pGM electrostatics need the CPU pair lists (mdrun -nb cpu)");
-    }
-    ArrayRef<const int> atomOrder = nbv.getLocalAtomOrder();
-    // work items: the i-cluster entries of all lists, dealt out dynamically; one pair vector per thread
-    ciItems_.clear();
-    for (int l = 0; l < lists.ssize(); l++)
-    {
-        for (int c = 0; c < static_cast<int>(lists[l].ci.size()); c++)
-        {
-            ciItems_.push_back({ l, c });
-        }
-    }
-    const int numItems = ciItems_.size();
-    for (int item = 0; item < numItems; item++)
-    {
-        const NbnxnPairlistCpu& nbl = lists[ciItems_[item][0]];
-        const nbnxn_ci_t&       ci  = nbl.ci[ciItems_[item][1]];
-        numCandidates_ += static_cast<double>(ci.cj_ind_end - ci.cj_ind_start) * nbl.na_ci * nbl.na_cj;
-    }
-    pairs_.resize(nt_);
-    for (auto& v : pairs_)
-    {
-        v.clear();
-    }
+    const int numLists = tp_.size();
 #pragma omp parallel num_threads(nt_)
     {
-        // fill a local vector (no false sharing of the vector headers in pairs_), keep its capacity
-        std::vector<Pair> pairs;
-        pairs.swap(pairs_[gmx_omp_get_thread_num()]);
-        double             Bb[4];
-        std::vector<DVec>& Fg = gvdwForce_[gmx_omp_get_thread_num()];
+        std::vector<DVec>& Fg      = gvdwForce_[gmx_omp_get_thread_num()];
         double             sum[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // GVDW energy, strain (9)
-#pragma omp for schedule(dynamic, 8)
-        for (int item = 0; item < numItems; item++)
+        double             Gk[4];
+#pragma omp for schedule(static)
+        for (int l = 0; l < numLists; l++)
         {
-            const NbnxnPairlistCpu& nbl     = lists[ciItems_[item][0]];
-            const nbnxn_ci_t&       ciEntry = nbl.ci[ciItems_[item][1]];
-            const int               naci = nbl.na_ci, nacj = nbl.na_cj;
-            const int  ish     = ciEntry.shift & NBNXN_CI_SHIFT;
-            const bool central = (ish == c_centralShiftIndex);
-            // the shift in double from the box (shiftVectors holds the same in real)
-            const IVec t = shiftIndexToXYZ(ish);
-            DVec       sv;
-            for (int d = 0; d < DIM; d++)
+            ThreadPairs& T = tp_[l];
+            T.segI.clear();
+            T.segBegin.clear();
+            T.j.clear();
+            for (auto& v : T.x)
             {
-                sv[d] = t[XX] * box_[XX][d] + t[YY] * box_[YY][d] + t[ZZ] * box_[ZZ][d];
+                v.clear();
             }
-            GMX_UNUSED_VALUE(shiftVectors);
-            const int  i0 = ciEntry.ci * naci;
-            for (int cjIndex = ciEntry.cj_ind_start; cjIndex < ciEntry.cj_ind_end; cjIndex++)
+            // the pairs within the cut-off (and the GVDW of those within rvdw)
+            const int numSeg = T.candSegI.size();
+            for (int sg = 0; sg < numSeg; sg++)
             {
-                const int j0 = nbl.cj.cj(cjIndex) * nacj;
-                // nbnxm counts the pairs of overlapping cluster pairs (the diagonal) once: j > i;
-                // the exclusion masks are ignored: pGM electrostatics have no exclusions
-                const bool overlap = central && i0 < j0 + nacj && j0 < i0 + naci;
-                for (int ii = 0; ii < naci; ii++)
+                const int  ai = T.candSegI[sg];
+                const IVec t  = shiftIndexToXYZ(T.candSegShift[sg]);
+                DVec       xi = pos_[ai];
+                for (int d = 0; d < DIM; d++)
                 {
-                    const int ai = atomOrder[i0 + ii];
-                    if (ai < 0)
+                    xi[d] += t[XX] * box_[XX][d] + t[YY] * box_[YY][d] + t[ZZ] * box_[ZZ][d];
+                }
+                const int start = T.j.size();
+                for (int k = T.candSegBegin[sg]; k < T.candSegBegin[sg + 1]; k++)
+                {
+                    const int    aj = T.candJ[k];
+                    const DVec   dx = xi - pos_[aj];
+                    const double r2 = dot3(dx, dx);
+                    if (T.candGvdw[k] && r2 < rvdw2)
                     {
-                        continue;
+                        gvdwPairInLoop(ai, aj, dx, r2, Fg, sum);
                     }
-                    for (int jj = 0; jj < nacj; jj++)
+                    if (r2 < rc2)
                     {
-                        const int aj = atomOrder[j0 + jj];
-                        if (aj < 0 || (overlap && j0 + jj <= i0 + ii) || aj == ai)
-                        {
-                            continue;
-                        }
-                        Pair p;
-                        p.i = ai;
-                        p.j = aj;
+                        T.j.push_back(aj);
                         for (int d = 0; d < DIM; d++)
                         {
-                            p.x[d] = (static_cast<double>(x[ai][d]) + sv[d]) - static_cast<double>(x[aj][d]);
+                            T.x[d].push_back(dx[d]);
                         }
-                        const double r2 = dot3(p.x, p.x);
-                        if (gvdw_ && gvdwActive_[ai] && gvdwActive_[aj] && r2 < rvdw2)
-                        {
-                            gvdwPairInLoop(ai, aj, p.x, r2, Fg, sum);
-                        }
-                        if (r2 >= rc2)
-                        {
-                            continue;
-                        }
-                        const double r = std::sqrt(r2);
-                        const double a = 1.0
-                                         / std::sqrt(2.0
-                                                     * (radius_[ai] * radius_[ai] + radius_[aj] * radius_[aj]));
-                        erfKernels(a, r, 4, p.G);
-                        erfKernels(beta_, r, 4, Bb);
-                        for (int k = 0; k < 4; k++)
-                        {
-                            p.G[k] -= Bb[k];
-                        }
-                        pairs.push_back(p);
+                    }
+                }
+                if (static_cast<int>(T.j.size()) > start)
+                {
+                    T.segI.push_back(ai);
+                    T.segBegin.push_back(start);
+                }
+            }
+            T.segBegin.push_back(T.j.size());
+            // the kernels G_n = B_n[erf(a r)/r] - B_n[erf(beta r)/r] (pgmcore::ewaldPairKernels): all
+            // pairs in the erfc form in SIMD, then the few with a r < 1 (bonded neighbours) again from the series
+            const int np    = T.j.size();
+            const int npPad = ((np + c_pairSimdWidth - 1) / c_pairSimdWidth) * c_pairSimdWidth;
+            for (auto* v : { &T.G[0], &T.G[1], &T.G[2], &T.G[3], &T.r, &T.a })
+            {
+                v->resize(npPad);
+            }
+            for (int sg = 0; sg < static_cast<int>(T.segI.size()); sg++)
+            {
+                const double rgi = 2.0 * radius_[T.segI[sg]] * radius_[T.segI[sg]];
+                for (int k = T.segBegin[sg]; k < T.segBegin[sg + 1]; k++)
+                {
+                    const int aj = T.j[k];
+                    T.r[k] = std::sqrt(T.x[XX][k] * T.x[XX][k] + T.x[YY][k] * T.x[YY][k] + T.x[ZZ][k] * T.x[ZZ][k]);
+                    T.a[k] = 1.0 / std::sqrt(rgi + 2.0 * radius_[aj] * radius_[aj]);
+                }
+            }
+            for (int k = np; k < npPad; k++)
+            {
+                T.r[k] = 1.0;
+                T.a[k] = 1.0;
+            }
+            erfcPairKernels(T.r.data(), T.a.data(), npPad, beta_, T.G[0].data(), T.G[1].data(), T.G[2].data(), T.G[3].data());
+            for (int k = 0; k < np; k++)
+            {
+                if (T.a[k] * T.r[k] < 1.0)
+                {
+                    pgmcore::ewaldPairKernels(T.a[k], beta_, T.r[k], 4, Gk);
+                    for (int n = 0; n < 4; n++)
+                    {
+                        T.G[n][k] = Gk[n];
                     }
                 }
             }
         }
-        pairs.swap(pairs_[gmx_omp_get_thread_num()]);
         for (int k = 0; k < 10; k++)
         {
 #pragma omp atomic
@@ -809,16 +857,87 @@ void PgmElectrostatics::Impl::permanentDipoles()
     }
 }
 
+void PgmElectrostatics::Impl::assignTiles()
+{
+    // tiles at least order points wide: an atom's order x (y) points fall into at most two tiles
+    const int p = order_;
+    for (int a = 0; a < 2; a++)
+    {
+        numTiles_[a]  = std::max(1, grid_[a] / p);
+        const int w   = grid_[a] / numTiles_[a];
+        columnTile_[a].resize(grid_[a]);
+        for (int g = 0; g < grid_[a]; g++)
+        {
+            columnTile_[a][g] = std::min(g / w, numTiles_[a] - 1);
+        }
+    }
+    const int numTiles = numTiles_[XX] * numTiles_[YY];
+    // the (at most four) tiles of each atom, as a list per tile
+    std::vector<int> count(numTiles + 1, 0);
+    auto             tilesOf = [&](int i, int* out) {
+        int tx[2], ty[2], nx = 0, ny = 0;
+        for (int j = 0; j < p; j++)
+        {
+            const int t = columnTile_[XX][gridIndex_[XX][i * p + j]];
+            if (nx == 0 || (tx[0] != t && (nx == 1 || tx[1] != t)))
+            {
+                tx[nx++] = t;
+            }
+            const int u = columnTile_[YY][gridIndex_[YY][i * p + j]];
+            if (ny == 0 || (ty[0] != u && (ny == 1 || ty[1] != u)))
+            {
+                ty[ny++] = u;
+            }
+        }
+        int m = 0;
+        for (int a = 0; a < nx; a++)
+        {
+            for (int b = 0; b < ny; b++)
+            {
+                out[m++] = tx[a] * numTiles_[YY] + ty[b];
+            }
+        }
+        return m;
+    };
+    int tl[4];
+    for (int i = 0; i < n_; i++)
+    {
+        const int m = tilesOf(i, tl);
+        for (int k = 0; k < m; k++)
+        {
+            count[tl[k] + 1]++;
+        }
+    }
+    for (int t = 0; t < numTiles; t++)
+    {
+        count[t + 1] += count[t];
+    }
+    tileStart_ = count;
+    tileAtoms_.resize(count[numTiles]);
+    for (int i = 0; i < n_; i++)
+    {
+        const int m = tilesOf(i, tl);
+        for (int k = 0; k < m; k++)
+        {
+            tileAtoms_[count[tl[k]]++] = i;
+        }
+    }
+}
+
 void PgmElectrostatics::Impl::splines()
 {
     const int p = order_;
     for (int a = 0; a < DIM; a++)
     {
-        gridIndex_[a].resize(n_);
+        gridIndex_[a].resize(n_ * p);
         theta_[a].resize(n_ * p);
         dtheta_[a].resize(n_ * p);
         d2theta_[a].resize(n_ * p);
     }
+    kzPad_ = grid_[ZZ] + p - 1;
+    zTheta_.resize(n_ * p);
+    zDTheta_.resize(n_ * p);
+    zD2Theta_.resize(n_ * p);
 #pragma omp parallel for num_threads(nt_) schedule(static)
     for (int i = 0; i < n_; i++)
     {
@@ -847,9 +966,23 @@ void PgmElectrostatics::Impl::splines()
                 dtheta_[a][i * p + j]  = get(p - 1, j) - get(p - 1, j - 1);
                 d2theta_[a][i * p + j] = get(p - 2, j) - 2 * get(p - 2, j - 1) + get(p - 2, j - 2);
             }
-            gridIndex_[a][i] = base;
+            for (int j = 0; j < p; j++)
+            {
+                gridIndex_[a][i * p + j] = (base - j + grid_[a]) % grid_[a];
+            }
+            if (a == ZZ)
+            {
+                // padded z points base + m hold grid point base - (p - 1 - m): spline index j = p - 1 - m
+                for (int m = 0; m < p; m++)
+                {
+                    zTheta_[i * p + m]   = theta_[ZZ][i * p + p - 1 - m];
+                    zDTheta_[i * p + m]  = dtheta_[ZZ][i * p + p - 1 - m];
+                    zD2Theta_[i * p + m] = d2theta_[ZZ][i * p + p - 1 - m];
+                }
+            }
         }
     }
+    assignTiles();
 }
 
 void PgmElectrostatics::Impl::computeInfluence()
@@ -918,59 +1051,87 @@ std::vector<DVec> PgmElectrostatics::Impl::fractionalDipoles(const std::vector<D
 double PgmElectrostatics::Impl::pmePotential(const std::vector<double>* q, const std::vector<DVec>& d, double* strain)
 {
     const int K1 = grid_[XX], K2 = grid_[YY], K3 = grid_[ZZ], p = order_;
+    const double tp0 = now();
     std::fill(realGrid_, realGrid_ + static_cast<size_t>(rSize_[XX]) * rSize_[YY] * rSize_[ZZ], static_cast<real>(0));
-    phi_.resize(static_cast<size_t>(K1) * K2 * K3);
-    // spread in double on per-thread grids, sum them into the FFT grid
-    const size_t      gridSize = static_cast<size_t>(K1) * K2 * K3;
+    // spread in double into the padded grid, owner-computes over the tiles (assignTiles), then fold
+    // the padding into the FFT grid
+    const size_t      gridSize = static_cast<size_t>(K1) * K2 * kzPad_;
     std::vector<DVec> e        = fractionalDipoles(d);
+    spreadGrid_.resize(gridSize);
+    phi_.resize(gridSize);
 #pragma omp parallel num_threads(nt_)
     {
-#pragma omp for schedule(static)
-        for (int t = 0; t < nt_; t++) // all of them, also of threads that do not take part
+#pragma omp for schedule(dynamic, 1)
+        for (int tile = 0; tile < numTiles_[XX] * numTiles_[YY]; tile++)
         {
-            threadGrid_[t].assign(gridSize, 0.0);
-        }
-        std::vector<double>& grid = threadGrid_[gmx_omp_get_thread_num()];
-#pragma omp for schedule(static)
-        for (int i = 0; i < n_; i++)
-        {
-            const double qi = (q ? (*q)[i] : 0.0);
-            for (int j1 = 0; j1 < p; j1++)
+            const int tx = tile / numTiles_[YY], ty = tile % numTiles_[YY];
+            // zero the tile's columns
+            for (int g1 = 0; g1 < K1; g1++)
             {
-                const int    g1 = ((gridIndex_[XX][i] - j1) % K1 + K1) % K1;
-                const double t1 = theta_[XX][i * p + j1], u1 = dtheta_[XX][i * p + j1];
-                for (int j2 = 0; j2 < p; j2++)
+                if (columnTile_[XX][g1] != tx)
                 {
-                    const int    g2 = ((gridIndex_[YY][i] - j2) % K2 + K2) % K2;
-                    const double t2 = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2];
-                    const double a0 = qi * t1 * t2 + e[i][XX] * u1 * t2 + e[i][YY] * t1 * u2;
-                    const double a3 = e[i][ZZ] * t1 * t2;
-                    for (int j3 = 0; j3 < p; j3++)
+                    continue;
+                }
+                for (int g2 = 0; g2 < K2; g2++)
+                {
+                    if (columnTile_[YY][g2] == ty)
                     {
-                        const int g3 = ((gridIndex_[ZZ][i] - j3) % K3 + K3) % K3;
-                        grid[phiIndex(g1, g2, g3)] += a0 * theta_[ZZ][i * p + j3] + a3 * dtheta_[ZZ][i * p + j3];
+                        std::fill_n(spreadGrid_.data() + padIndex(g1, g2), kzPad_, 0.0);
+                    }
+                }
+            }
+            for (int ia = tileStart_[tile]; ia < tileStart_[tile + 1]; ia++)
+            {
+                const int     i  = tileAtoms_[ia];
+                const double  qi = (q ? (*q)[i] : 0.0);
+                const int     zb = gridIndex_[ZZ][i * p];
+                const double* th = zTheta_.data() + i * p;
+                const double* dt = zDTheta_.data() + i * p;
+                for (int j1 = 0; j1 < p; j1++)
+                {
+                    const int g1 = gridIndex_[XX][i * p + j1];
+                    if (columnTile_[XX][g1] != tx)
+                    {
+                        continue;
+                    }
+                    const double t1 = theta_[XX][i * p + j1], u1 = dtheta_[XX][i * p + j1];
+                    for (int j2 = 0; j2 < p; j2++)
+                    {
+                        const int g2 = gridIndex_[YY][i * p + j2];
+                        if (columnTile_[YY][g2] != ty)
+                        {
+                            continue;
+                        }
+                        const double t2  = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2];
+                        const double a0  = qi * t1 * t2 + e[i][XX] * u1 * t2 + e[i][YY] * t1 * u2;
+                        const double a3  = e[i][ZZ] * t1 * t2;
+                        double*      row = spreadGrid_.data() + padIndex(g1, g2) + zb;
+                        for (int m = 0; m < p; m++)
+                        {
+                            row[m] += a0 * th[m] + a3 * dt[m];
+                        }
                     }
                 }
             }
         }
+        // fold: grid point z is padded point z + p - 1, and z + p - 1 - nz for the top p - 1 points
 #pragma omp for schedule(static)
         for (int g1 = 0; g1 < K1; g1++)
         {
             for (int g2 = 0; g2 < K2; g2++)
             {
+                const double* row = spreadGrid_.data() + padIndex(g1, g2);
                 for (int g3 = 0; g3 < K3; g3++)
                 {
-                    double sum = 0;
-                    for (int t = 0; t < nt_; t++)
-                    {
-                        sum += threadGrid_[t][phiIndex(g1, g2, g3)];
-                    }
-                    realGrid_[realIndex(g1, g2, g3)] = sum;
+                    realGrid_[realIndex(g1, g2, g3)] =
+                            row[g3 + p - 1] + (g3 + p - 1 >= K3 ? row[g3 + p - 1 - K3] : 0.0);
                 }
             }
         }
     }
+    const double tp1 = now();
     fftExecute(GMX_FFT_REAL_TO_COMPLEX);
+    const double tp2 = now();
 
     const int c0 = cOrder_[0], c1 = cOrder_[1], c2 = cOrder_[2];
     double    energy = 0.0;
@@ -1029,23 +1190,29 @@ double PgmElectrostatics::Impl::pmePotential(const std::vector<double>* q, const
             }
         }
     }
+    const double tp3 = now();
     fftExecute(GMX_FFT_COMPLEX_TO_REAL);
+    tSpread_ += tp1 - tp0;
+    tFft_ += (tp2 - tp1) + (now() - tp3);
+    tConv_ += tp3 - tp2;
 #pragma omp parallel for num_threads(nt_) schedule(static)
     for (int g1 = 0; g1 < K1; g1++)
     {
         for (int g2 = 0; g2 < K2; g2++)
         {
-            for (int g3 = 0; g3 < K3; g3++)
+            double* row = phi_.data() + padIndex(g1, g2);
+            for (int t = 0; t < kzPad_; t++)
             {
-                phi_[phiIndex(g1, g2, g3)] = realGrid_[realIndex(g1, g2, g3)];
+                row[t] = realGrid_[realIndex(g1, g2, (t - (p - 1) + K3) % K3)];
             }
         }
     }
     return energy;
 }
 
-void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E) const
+void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E)
 {
+    const double tg0 = now();
     const int K1 = grid_[XX], K2 = grid_[YY], K3 = grid_[ZZ], p = order_;
 #pragma omp parallel for num_threads(nt_) schedule(static)
     for (int i = 0; i < n_; i++)
@@ -1053,21 +1220,24 @@ void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E) const
         double f[3] = { 0, 0, 0 };
         for (int j1 = 0; j1 < p; j1++)
         {
-            const int    g1 = ((gridIndex_[XX][i] - j1) % K1 + K1) % K1;
+            const int    g1 = gridIndex_[XX][i * p + j1];
             const double t1 = theta_[XX][i * p + j1], u1 = dtheta_[XX][i * p + j1];
             for (int j2 = 0; j2 < p; j2++)
             {
-                const int    g2 = ((gridIndex_[YY][i] - j2) % K2 + K2) % K2;
-                const double t2 = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2];
-                for (int j3 = 0; j3 < p; j3++)
+                const int     g2  = gridIndex_[YY][i * p + j2];
+                const double  t2  = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2];
+                const double* row = phi_.data() + padIndex(g1, g2) + gridIndex_[ZZ][i * p];
+                const double* th  = zTheta_.data() + i * p;
+                const double* dt  = zDTheta_.data() + i * p;
+                double        s0 = 0, s3 = 0; // sum theta3 phi, sum dtheta3 phi
+                for (int m = 0; m < p; m++)
                 {
-                    const int    g3 = ((gridIndex_[ZZ][i] - j3) % K3 + K3) % K3;
-                    const double t3 = theta_[ZZ][i * p + j3], u3 = dtheta_[ZZ][i * p + j3];
-                    const double ph = phi_[phiIndex(g1, g2, g3)];
-                    f[0] += u1 * t2 * t3 * ph;
-                    f[1] += t1 * u2 * t3 * ph;
-                    f[2] += t1 * t2 * u3 * ph;
+                    s0 += th[m] * row[m];
+                    s3 += dt[m] * row[m];
                 }
+                f[0] += u1 * t2 * s0;
+                f[1] += t1 * u2 * s0;
+                f[2] += t1 * t2 * s3;
             }
         }
         for (int k = 0; k < DIM; k++)
@@ -1075,13 +1245,14 @@ void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E) const
             E[i][k] -= K1 * recip_[k][XX] * f[0] + K2 * recip_[k][YY] * f[1] + K3 * recip_[k][ZZ] * f[2];
         }
     }
+    tGather_ += now() - tg0;
 }
 
 std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, const std::vector<DVec>& d)
 {
     const double      t0 = now();
     std::vector<DVec> E(n_, DVec{ 0, 0, 0 });
-    const int         numLists = pairs_.size();
+    const int         numLists = tp_.size();
     for (auto& v : threadVec_)
     {
         v.assign(n_, DVec{ 0, 0, 0 });
@@ -1092,18 +1263,28 @@ std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, c
 #pragma omp for schedule(static)
         for (int l = 0; l < numLists; l++)
         {
-            for (const Pair& p : pairs_[l])
+            const ThreadPairs& T = tp_[l];
+            for (int sg = 0; sg < static_cast<int>(T.segI.size()); sg++)
             {
-                const DVec&  x  = p.x;
-                const double qi = (q ? (*q)[p.i] : 0.0), qj = (q ? (*q)[p.j] : 0.0);
-                const DVec&  di = d[p.i];
-                const DVec&  dj = d[p.j];
-                const double djx = dot3(dj, x), dix = dot3(di, x);
-                for (int k = 0; k < DIM; k++)
+                const int    i  = T.segI[sg];
+                const double qi = (q ? (*q)[i] : 0.0);
+                const DVec   di = d[i];
+                DVec         Ei{ 0, 0, 0 };
+                for (int k = T.segBegin[sg]; k < T.segBegin[sg + 1]; k++)
                 {
-                    Et[p.i][k] += qj * x[k] * p.G[1] - dj[k] * p.G[1] + djx * x[k] * p.G[2];
-                    Et[p.j][k] += -qi * x[k] * p.G[1] - di[k] * p.G[1] + dix * x[k] * p.G[2];
+                    const int    j   = T.j[k];
+                    const DVec   x(T.x[XX][k], T.x[YY][k], T.x[ZZ][k]);
+                    const double G1 = T.G[1][k], G2 = T.G[2][k];
+                    const double qj  = (q ? (*q)[j] : 0.0);
+                    const DVec&  dj  = d[j];
+                    const double djx = dot3(dj, x), dix = dot3(di, x);
+                    for (int c = 0; c < DIM; c++)
+                    {
+                        Ei[c] += qj * x[c] * G1 - dj[c] * G1 + djx * x[c] * G2;
+                        Et[j][c] += -qi * x[c] * G1 - di[c] * G1 + dix * x[c] * G2;
+                    }
                 }
+                Et[i] += Ei;
             }
         }
     }
@@ -1287,14 +1468,14 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
                                         ArrayRef<const RVec>          shiftVectors,
                                         ArrayRef<const int>           globalIndex,
                                         ForceWithVirial*              forceWithVirial,
-                                        gmx_enerdata_t*               enerd)
+                                        gmx_enerdata_t*               enerd,
+                                        bool                          doPairSearch)
 {
     excls_ = &exclusions;
     // the local atom order changes at repartitioning (also on a single rank): parameters are read
     // from the local topology at every call, the predictor history is kept in the global order
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
     threadVec_.resize(nt_);
-    threadGrid_.resize(nt_);
     if (fftThreads_ != nt_)
     {
         initFft(nt_);
@@ -1309,20 +1490,25 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     setBox(box);
     permanentDipoles();
     double t0 = now();
-    buildPairs(xIn, nbv, shiftVectors);
+    if (doPairSearch || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_)
+    {
+        searchCandidates(nbv);
+    }
+    GMX_UNUSED_VALUE(shiftVectors);
+    buildPairs();
     gvdwOverridesAndTail();
     const double tPairs1 = now();
     tPairs_ += tPairs1 - t0;
-    for (const auto& v : pairs_)
+    for (const auto& T : tp_)
     {
-        numPairs_ += v.size();
+        numPairs_ += T.numPairs();
     }
     if (numCalls_ == 0 && std::getenv("GMX_PGM_TIMING"))
     {
         fprintf(stderr, "pGM pairs per thread:");
-        for (const auto& v : pairs_)
+        for (const auto& T : tp_)
         {
-            fprintf(stderr, " %zu", v.size());
+            fprintf(stderr, " %zu", T.numPairs());
         }
         fprintf(stderr, " (%d i-cluster items)\n", static_cast<int>(ciItems_.size()));
     }
@@ -1356,7 +1542,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     // pairs: per-thread forces in threadVec_, fields in threadE, strain and energy
     std::vector<std::vector<DVec>>      threadE(nt_, std::vector<DVec>(n_, DVec{ 0, 0, 0 }));
     std::array<double, 10>              threadSum{}; // S (9), direct energy: summed over threads
-    const int                           numLists = pairs_.size();
+    const int                           numLists = tp_.size();
     for (auto& v : threadVec_)
     {
         v.assign(n_, DVec{ 0, 0, 0 });
@@ -1370,30 +1556,40 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
 #pragma omp for schedule(static)
         for (int l = 0; l < numLists; l++)
         {
-            for (const Pair& p : pairs_[l])
+            const ThreadPairs& T = tp_[l];
+            for (int sg = 0; sg < static_cast<int>(T.segI.size()); sg++)
             {
-                const DVec&   x  = p.x;
-                const double  qi = q[p.i], qj = q[p.j];
-                const DVec&   di = d[p.i];
-                const DVec&   dj = d[p.j];
-                const double  dix = dot3(di, x), djx = dot3(dj, x), didj = dot3(di, dj);
-                const double* G = p.G;
-                sum[9] += qi * qj * G[0] + (qi * djx - qj * dix) * G[1] + didj * G[1] - dix * djx * G[2];
-                const double sc =
-                        -qi * qj * G[1] - (qi * djx - qj * dix) * G[2] - didj * G[2] + dix * djx * G[3];
-                for (int k = 0; k < DIM; k++)
+                const int    i  = T.segI[sg];
+                const double qi = q[i];
+                const DVec   di = d[i];
+                DVec         Fi{ 0, 0, 0 }, Ei{ 0, 0, 0 };
+                for (int k = T.segBegin[sg]; k < T.segBegin[sg + 1]; k++)
                 {
-                    const double dedx = sc * x[k] + (qi * dj[k] - qj * di[k]) * G[1]
-                                        - (djx * di[k] + dix * dj[k]) * G[2];
-                    for (int b = 0; b < DIM; b++)
+                    const int    j  = T.j[k];
+                    const DVec   x(T.x[XX][k], T.x[YY][k], T.x[ZZ][k]);
+                    const double G[4] = { T.G[0][k], T.G[1][k], T.G[2][k], T.G[3][k] };
+                    const double qj   = q[j];
+                    const DVec&  dj   = d[j];
+                    const double dix = dot3(di, x), djx = dot3(dj, x), didj = dot3(di, dj);
+                    sum[9] += qi * qj * G[0] + (qi * djx - qj * dix) * G[1] + didj * G[1] - dix * djx * G[2];
+                    const double sc =
+                            -qi * qj * G[1] - (qi * djx - qj * dix) * G[2] - didj * G[2] + dix * djx * G[3];
+                    for (int c = 0; c < DIM; c++)
                     {
-                        sum[3 * k + b] += dedx * x[b];
+                        const double dedx = sc * x[c] + (qi * dj[c] - qj * di[c]) * G[1]
+                                            - (djx * di[c] + dix * dj[c]) * G[2];
+                        for (int b = 0; b < DIM; b++)
+                        {
+                            sum[3 * c + b] += dedx * x[b];
+                        }
+                        Fi[c] -= dedx;
+                        Ft[j][c] += dedx;
+                        Ei[c] += qj * x[c] * G[1] - dj[c] * G[1] + djx * x[c] * G[2];
+                        Et[j][c] += -qi * x[c] * G[1] - di[c] * G[1] + dix * x[c] * G[2];
                     }
-                    Ft[p.i][k] -= dedx;
-                    Ft[p.j][k] += dedx;
-                    Et[p.i][k] += qj * x[k] * G[1] - dj[k] * G[1] + djx * x[k] * G[2];
-                    Et[p.j][k] += -qi * x[k] * G[1] - di[k] * G[1] + dix * x[k] * G[2];
                 }
+                Ft[i] += Fi;
+                Et[i] += Ei;
             }
         }
         for (int k = 0; k < 10; k++)
@@ -1435,7 +1631,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     // reciprocal forces: -[q grad phi + (grad grad phi) . d]
     {
-        const int         K1 = grid_[XX], K2 = grid_[YY], K3 = grid_[ZZ], p = order_;
+        const int         p = order_;
         std::vector<DVec> e = fractionalDipoles(d);
 #pragma omp parallel for num_threads(nt_) schedule(static)
         for (int i = 0; i < n_; i++)
@@ -1443,30 +1639,34 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             double f1[3] = { 0, 0, 0 }, f2[3][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
             for (int j1 = 0; j1 < p; j1++)
             {
-                const int    g1 = ((gridIndex_[XX][i] - j1) % K1 + K1) % K1;
+                const int    g1 = gridIndex_[XX][i * p + j1];
                 const double t1 = theta_[XX][i * p + j1], u1 = dtheta_[XX][i * p + j1],
                              v1 = d2theta_[XX][i * p + j1];
                 for (int j2 = 0; j2 < p; j2++)
                 {
-                    const int    g2 = ((gridIndex_[YY][i] - j2) % K2 + K2) % K2;
-                    const double t2 = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2],
+                    const int     g2 = gridIndex_[YY][i * p + j2];
+                    const double  t2 = theta_[YY][i * p + j2], u2 = dtheta_[YY][i * p + j2],
                                  v2 = d2theta_[YY][i * p + j2];
-                    for (int j3 = 0; j3 < p; j3++)
+                    const double* row = phi_.data() + padIndex(g1, g2) + gridIndex_[ZZ][i * p];
+                    const double* th  = zTheta_.data() + i * p;
+                    const double* dt  = zDTheta_.data() + i * p;
+                    const double* d2t = zD2Theta_.data() + i * p;
+                    double        s0 = 0, s1 = 0, s2 = 0; // sums of theta3, dtheta3, d2theta3 times phi
+                    for (int m = 0; m < p; m++)
                     {
-                        const int    g3 = ((gridIndex_[ZZ][i] - j3) % K3 + K3) % K3;
-                        const double t3 = theta_[ZZ][i * p + j3], u3 = dtheta_[ZZ][i * p + j3],
-                                     v3 = d2theta_[ZZ][i * p + j3];
-                        const double ph = phi_[phiIndex(g1, g2, g3)];
-                        f1[0] += u1 * t2 * t3 * ph;
-                        f1[1] += t1 * u2 * t3 * ph;
-                        f1[2] += t1 * t2 * u3 * ph;
-                        f2[0][0] += v1 * t2 * t3 * ph;
-                        f2[1][1] += t1 * v2 * t3 * ph;
-                        f2[2][2] += t1 * t2 * v3 * ph;
-                        f2[0][1] += u1 * u2 * t3 * ph;
-                        f2[0][2] += u1 * t2 * u3 * ph;
-                        f2[1][2] += t1 * u2 * u3 * ph;
+                        s0 += th[m] * row[m];
+                        s1 += dt[m] * row[m];
+                        s2 += d2t[m] * row[m];
                     }
+                    f1[0] += u1 * t2 * s0;
+                    f1[1] += t1 * u2 * s0;
+                    f1[2] += t1 * t2 * s1;
+                    f2[0][0] += v1 * t2 * s0;
+                    f2[1][1] += t1 * v2 * s0;
+                    f2[2][2] += t1 * t2 * s2;
+                    f2[0][1] += u1 * u2 * s0;
+                    f2[0][2] += u1 * t2 * s1;
+                    f2[1][2] += t1 * u2 * s1;
                 }
             }
             f2[1][0] = f2[0][1];
@@ -1672,9 +1872,10 @@ void PgmElectrostatics::calculate(ArrayRef<const RVec>          x,
                                   ArrayRef<const int>           globalIndex,
                                   ForceWithVirial*              forceWithVirial,
                                   gmx_enerdata_t*               enerd,
-                                  const StepWorkload& /*stepWork*/)
+                                  const StepWorkload&           stepWork)
 {
-    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex, forceWithVirial, enerd);
+    impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex,
+                     forceWithVirial, enerd, stepWork.doNeighborSearch);
 }
 
 ArrayRef<const DVec> PgmElectrostatics::inducedDipoles() const

@@ -1,7 +1,7 @@
 // Finite-difference checks of pgm_core: forces and the strain derivative (virial) for random water-like
 // molecules in a triclinic box (PME) and without a box, all levels on (charges, covalent dipoles,
 // induced dipoles solved tightly).
-//   g++ -O2 -std=c++17 -I.. ../pgm_core.cpp test_core.cpp -o test_core && ./test_core
+//   g++ -O2 -std=c++17 -pthread -I.. ../pgm_core.cpp test_core.cpp -o test_core && ./test_core
 #include "pgm_core.h"
 #include <cmath>
 #include <cstdio>

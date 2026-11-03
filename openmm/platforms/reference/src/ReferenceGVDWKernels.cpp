@@ -1,5 +1,6 @@
 #include "ReferenceGVDWKernels.h"
 #include "gvdw_kernel.h"
+#include "pgm_math.h"
 #include "internal/GVDWForceImpl.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/internal/ContextImpl.h"
@@ -25,13 +26,6 @@ static vector<Vec3>& extractForces(ContextImpl& context) {
 static Vec3* extractBoxVectors(ContextImpl& context) {
     ReferencePlatform::PlatformData* data = reinterpret_cast<ReferencePlatform::PlatformData*>(context.getPlatformData());
     return (Vec3*) data->periodicBoxVectors;
-}
-
-/** Minimum image of d in OpenMM's reduced triclinic box (c, then b, then a). */
-static void minimumImage(Vec3& d, const Vec3* box) {
-    d -= box[2]*floor(d[2]/box[2][2]+0.5);
-    d -= box[1]*floor(d[1]/box[1][1]+0.5);
-    d -= box[0]*floor(d[0]/box[0][0]+0.5);
 }
 
 void ReferenceCalcGVDWForceKernel::setParameters(const GVDWForce& force) {
@@ -107,7 +101,7 @@ double ReferenceCalcGVDWForceKernel::execute(ContextImpl& context, bool includeF
             int i = active[ii], j = active[jj];
             Vec3 d = pos[i]-pos[j];
             if (periodic)
-                minimumImage(d, box);
+                pgmcore::minImage(d, box);
             double r2 = d.dot(d);
             if (useCutoff && r2 >= rc2)
                 continue;
@@ -117,7 +111,7 @@ double ReferenceCalcGVDWForceKernel::execute(ContextImpl& context, bool includeF
     for (const Exception& e : exceptions) {
         Vec3 d = pos[e.i]-pos[e.j];
         if (exceptionsPeriodic)
-            minimumImage(d, box);
+            pgmcore::minImage(d, box);
         addPair(e.i, e.j, d, sqrt(d.dot(d)), e.A, e.C6, e.B);
     }
     if (dispersionCorrection)

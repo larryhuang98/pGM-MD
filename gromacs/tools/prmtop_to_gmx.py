@@ -13,8 +13,9 @@ settles for rigid water).  Then, for every [ moleculetype ], this script:
 * with --gvdw: replaces the Lennard-Jones by GVDW (pmemd-pgm igvdw = 1): pmemd's global gvdw_arep,
   gvdw_c6, b_rep_scale (the GVDW manuscript's water models, or --gvdw-params A_kcal C6_kcalA6 b) as
   [ pgm_gvdw ] on every atom with an LJ epsilon > 0, every atom type's epsilon set to 0; set
-  pgm-gvdw-rep-form in the mdp (1 Slater, 0 Gaussian).  Molecules with 1-4 pairs are not converted yet
-  (their LJ would come from the zeroed atom types).
+  pgm-gvdw-rep-form in the mdp (1 Slater, 0 Gaussian).  The [ pairs ] get their 1-4 LJ parameters
+  written out (from gen-pairs/fudgeLJ or [ pairtypes ]), so the 1-4 Lennard-Jones stays as it was, as in
+  pmemd-pgm, which applies GVDW to the non-excluded pairs only.
 
 Needs ParmEd (e.g. the SE3nv environment on rayl8).
 """
@@ -88,14 +89,12 @@ def main(prmtop, rst7, outbase, gvdw=None):
         for k in range(n):
             lines.append(f"{k + 1:7d} {1:5d} {radius[g0 + k]:16.8e} {alpha[g0 + k]:16.8e}")
         if gvdw is not None:
-            if "[ pairs ]" in blk:
-                raise NotImplementedError(f"molecule {name}: 1-4 pairs with GVDW are not converted yet")
             arep, c6, b = gvdw[:3]
             sa, sc = math.sqrt(arep * 4.184), math.sqrt(c6 * 4.184 * 1e-6)
             lines += ["", "[ pgm_gvdw ]", ";   atom funct  sqrtA(sqrt(kJ/mol))  sqrtC6(sqrt(kJ/mol nm^6))  b"]
             for k in range(n):
                 if s.atoms[g0 + k].epsilon > 0:
-                    lines.append(f"{k + 1:7d} {1:5d} {sa:16.10e} {sc:16.10e} {b:12.6f}")
+                    lines.append(f"{k + 1:7d} {1:5d} {sa:.16e} {sc:.16e} {b!r}")
         lines += ["", "[ pgm_dipoles ]", ";     ai     aj funct  strength(e nm)  p_ai += c unit(r_aj - r_ai)"]
         for k in range(n):
             for m in range(start[g0 + k], start[g0 + k + 1]):
@@ -108,19 +107,78 @@ def main(prmtop, rst7, outbase, gvdw=None):
         out.append(blk[:tail.start()] + ins + blk[tail.start():] if tail else blk.rstrip("\n") + "\n" + ins)
     text = "".join(out)
     if gvdw is not None:
+        text = _explicit_pair_parameters(text)
         text = _zero_atomtype_epsilon(text)
     open(outbase + ".top", "w").write(text)
     print(f"wrote {outbase}.top, {outbase}.gro: {len(s.atoms)} atoms, {len(instances)} molecule types, "
           f"{len(partners)} covalent dipoles")
 
 
+def _explicit_pair_parameters(text):
+    """Give every [ pairs ] line without parameters its 1-4 Lennard-Jones parameters explicitly.
+
+    The pair parameters GROMACS would generate from the atom types (gen-pairs, fudgeLJ, comb-rule) or take
+    from [ pairtypes ] are written on the line, so that zeroing the atom-type epsilon for GVDW leaves the
+    1-4 Lennard-Jones untouched (pmemd-pgm with igvdw = 1 keeps the scaled 1-4 LJ; GVDW acts on the
+    non-excluded pairs only).
+    """
+    sec = _sections(text)
+    d = sec["defaults"][0].split()
+    comb, genpairs, fudge = int(d[1]), d[2].lower() == "yes", float(d[3])
+    types = {}
+    for ln in sec.get("atomtypes", []):
+        f = ln.split()
+        types[f[0]] = (float(f[-2]), float(f[-1]))
+    pairtypes = {}
+    for ln in sec.get("pairtypes", []):
+        f = ln.split()
+        if int(f[2]) != 1:
+            raise NotImplementedError(f"[ pairtypes ] funct {f[2]}")
+        pairtypes[(f[0], f[1])] = pairtypes[(f[1], f[0])] = (float(f[3]), float(f[4]))
+
+    def combine(ti, tj):
+        if (ti, tj) in pairtypes:
+            return pairtypes[(ti, tj)]
+        if not genpairs:
+            raise ValueError(f"no [ pairtypes ] entry for {ti} {tj} and gen-pairs = no")
+        (si, ei), (sj, ej) = types[ti], types[tj]
+        if comb == 2:                                   # sigma, epsilon; Lorentz-Berthelot
+            return 0.5 * (si + sj), fudge * math.sqrt(ei * ej)
+        if comb == 1:                                   # c6, c12: both geometric and scaled
+            return fudge * math.sqrt(si * sj), fudge * math.sqrt(ei * ej)
+        return math.sqrt(si * sj), fudge * math.sqrt(ei * ej)   # comb 3: sigma geometric
+
+    out = []
+    for blk in re.split(r"(?m)^(?=\[ moleculetype \])", text):
+        if not blk.startswith("[ moleculetype ]"):
+            out.append(blk)
+            continue
+        atype = {int(ln.split()[0]): ln.split()[1] for ln in _sections(blk).get("atoms", [])}
+        lines, inside = [], False
+        for ln in blk.splitlines(keepends=True):
+            t = ln.split(";")[0].strip()
+            if t.startswith("["):
+                inside = t.replace(" ", "") == "[pairs]"
+            elif inside and t and not t.startswith("#"):
+                f = t.split()
+                if int(f[2]) != 1:
+                    raise NotImplementedError(f"[ pairs ] funct {f[2]}")
+                if len(f) == 3:
+                    p, q = combine(atype[int(f[0])], atype[int(f[1])])
+                    ln = f"{int(f[0]):7d} {int(f[1]):6d} {1:5d} {p:16.10e} {q:16.10e}\n"
+            lines.append(ln)
+        out.append("".join(lines))
+    return "".join(out)
+
+
 def _zero_atomtype_epsilon(text):
-    """Set the epsilon (last column) of every [ atomtypes ] line to 0: GVDW replaces the Lennard-Jones."""
+    """Set the epsilon (last column) of every [ atomtypes ] and [ nonbond_params ] line to 0: GVDW
+    replaces the Lennard-Jones of the non-excluded pairs ([ pairs ] keep theirs, see above)."""
     out, inside = [], False
     for ln in text.splitlines(keepends=True):
         t = ln.strip()
         if t.startswith("["):
-            inside = t.replace(" ", "") == "[atomtypes]"
+            inside = t.replace(" ", "") in ("[atomtypes]", "[nonbond_params]")
         elif inside and t and not t.startswith(";") and not t.startswith("#"):
             f = ln.split(";")[0].split()
             f[-1] = "0"
