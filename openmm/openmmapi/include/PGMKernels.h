@@ -1,6 +1,7 @@
 #ifndef PGM_KERNELS_H_
 #define PGM_KERNELS_H_
 
+#include "GVDWForce.h"
 #include "PGMForce.h"
 #include "openmm/KernelImpl.h"
 #include "openmm/Platform.h"
@@ -28,6 +29,21 @@ public:
     virtual int getInducedDipoleIterations() = 0;
     virtual void copyParametersToContext(OpenMM::ContextImpl& context, const PGMForce& force) = 0;
     virtual void getPMEParameters(double& alpha, int& nx, int& ny, int& nz) const = 0;
+};
+
+/**
+ * The kernel of GVDWForce: energy and forces.
+ */
+class CalcGVDWForceKernel : public OpenMM::KernelImpl {
+public:
+    static std::string Name() {
+        return "CalcGVDWForce";
+    }
+    CalcGVDWForceKernel(std::string name, const OpenMM::Platform& platform) : OpenMM::KernelImpl(name, platform) {
+    }
+    virtual void initialize(const OpenMM::System& system, const GVDWForce& force) = 0;
+    virtual double execute(OpenMM::ContextImpl& context, bool includeForces, bool includeEnergy) = 0;
+    virtual void copyParametersToContext(OpenMM::ContextImpl& context, const GVDWForce& force) = 0;
 };
 
 } // namespace PGMPlugin

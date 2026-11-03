@@ -9,6 +9,7 @@ namespace std {
 };
 
 %{
+#include "GVDWForce.h"
 #include "PGMForce.h"
 #include "OpenMM.h"
 #include "OpenMMAmoeba.h"
@@ -134,6 +135,51 @@ public:
           def getTotalDipoles(self, context):
               return self.getPermanentDipoles(context)+self.getInducedDipoles(context)
         %}
+    }
+};
+
+class GVDWForce : public OpenMM::Force {
+public:
+    enum NonbondedMethod { NoCutoff = 0, CutoffNonPeriodic = 1, CutoffPeriodic = 2 };
+    enum RepulsionForm { Gaussian = 0, Slater = 1 };
+    GVDWForce();
+    int getNumParticles() const;
+    int addParticle(double radius, double sqrtA, double sqrtC6, double b);
+    %apply double& OUTPUT {double& radius};
+    %apply double& OUTPUT {double& sqrtA};
+    %apply double& OUTPUT {double& sqrtC6};
+    %apply double& OUTPUT {double& b};
+    void getParticleParameters(int index, double& radius, double& sqrtA, double& sqrtC6, double& b) const;
+    %clear double& radius;
+    %clear double& sqrtA;
+    %clear double& sqrtC6;
+    %clear double& b;
+    void setParticleParameters(int index, double radius, double sqrtA, double sqrtC6, double b);
+    int getNumExclusions() const;
+    int addExclusion(int particle1, int particle2);
+    %apply int& OUTPUT {int& particle1};
+    %apply int& OUTPUT {int& particle2};
+    void getExclusionParticles(int index, int& particle1, int& particle2) const;
+    %clear int& particle1;
+    %clear int& particle2;
+    void setExclusionParticles(int index, int particle1, int particle2);
+    NonbondedMethod getNonbondedMethod() const;
+    void setNonbondedMethod(NonbondedMethod method);
+    double getCutoffDistance() const;
+    void setCutoffDistance(double distance);
+    RepulsionForm getRepulsionForm() const;
+    void setRepulsionForm(RepulsionForm form);
+    bool getUseDispersionCorrection() const;
+    void setUseDispersionCorrection(bool use);
+    void updateParametersInContext(OpenMM::Context& context);
+    bool usesPeriodicBoundaryConditions() const;
+    %extend {
+        static PGMPlugin::GVDWForce& cast(OpenMM::Force& force) {
+            return dynamic_cast<PGMPlugin::GVDWForce&>(force);
+        }
+        static bool isinstance(OpenMM::Force& force) {
+            return (dynamic_cast<PGMPlugin::GVDWForce*>(&force) != NULL);
+        }
     }
 };
 

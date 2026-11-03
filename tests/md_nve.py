@@ -1,4 +1,4 @@
-"""NVE molecular dynamics with PGMForce + LJ: energy conservation and timing.
+"""NVE molecular dynamics with PGMForce + LJ or GVDW: energy conservation and timing.
 
     python md_nve.py PRMTOP RST7 [--platform OpenCL] [--precision mixed] [--steps 200] [--dt-fs 1.0]
 
@@ -30,10 +30,15 @@ ap.add_argument("--grid", type=int, nargs=3, default=[36, 36, 36])
 ap.add_argument("--predictor", default="mu4")
 ap.add_argument("--peek", type=float, default=0.65)
 ap.add_argument("--seed", type=int, default=1)
+ap.add_argument("--cutoff", type=float, default=0.9)
+ap.add_argument("--vdw", default="lj", help="lj | gvdw | none")
+ap.add_argument("--gvdw", default="slater", help="pgm_prmtop.PGM3P_GVDW key (with --vdw gvdw)")
+ap.add_argument("--lrc", action="store_true", help="vdW dispersion correction")
 a = ap.parse_args()
 
 system, top, pgm = pgm_prmtop.create_system(
-    a.prmtop, cutoff=0.9, ewald_beta=a.beta, grid=tuple(a.grid), dipole_tol=a.tol, peek=a.peek, predictor=a.predictor,
+    a.prmtop, cutoff=a.cutoff, ewald_beta=a.beta, grid=tuple(a.grid), dipole_tol=a.tol, peek=a.peek, predictor=a.predictor,
+    vdw=a.vdw, gvdw=a.gvdw if a.vdw == "gvdw" else None, lj_lrc=a.lrc,
 )  # fmt: skip
 crd = app.AmberInpcrdFile(a.rst7)
 system.setDefaultPeriodicBoxVectors(*crd.boxVectors)
@@ -47,7 +52,7 @@ ctx.setPeriodicBoxVectors(*crd.boxVectors)
 ctx.applyConstraints(1e-8)
 ctx.setVelocitiesToTemperature(298 * unit.kelvin, a.seed)
 ctx.applyVelocityConstraints(1e-8)
-print(f"# {a.platform} {a.precision}, dt {a.dt_fs} fs, tol {a.tol}, predictor {a.predictor}, peek {a.peek}")
+print(f"# vdw {a.vdw}{' ' + a.gvdw if a.vdw == 'gvdw' else ''}, cutoff {a.cutoff}; {a.platform} {a.precision}, dt {a.dt_fs} fs, tol {a.tol}, predictor {a.predictor}, peek {a.peek}")
 print("# step    epot            ekin          etot            iters")
 rows = []
 t0 = time.time()

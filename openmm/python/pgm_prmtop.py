@@ -12,7 +12,12 @@ What it builds (docs/spec.md):
   tables, the exclusions and the 1-4 LJ pairs of the prmtop), cut at the cutoff without a switch and
   without OpenMM's dispersion correction;
 * the LJ long-range correction of Amber's vdwmeth = 1 (pGM-JAX lj_lrc): -2 pi/(3 V rc^3) sum_ij B_ij over
-  all ordered atom pairs, as a CustomVolumeForce (only the r^-6 term, unlike OpenMM's correction).
+  all ordered atom pairs, as a CustomVolumeForce (only the r^-6 term, unlike OpenMM's correction);
+* or, with vdw="gvdw", GVDWForce (the Gaussian-density van der Waals of pmemd-pgm igvdw = 1) in place
+  of the Lennard-Jones: the pGM radii, GVDW parameters from `gvdw` (pmemd-pgm's global
+  gvdw_arep / gvdw_c6 / b_rep_scale on the atoms that carry LJ, as pmemd-pgm, or per atom type), the
+  prmtop's exclusions; the 1-4 pairs keep their scaled Lennard-Jones (NonbondedForce exceptions);
+  dispersion correction of the C6 term with lj_lrc.
 
 Units: OpenMM's (nm, kJ/mol).
 """
@@ -29,6 +34,18 @@ from openmm import app, unit
 import openmmpgm
 
 KCAL = 4.184
+
+# pmemd-pgm GVDW water models of the GVDW manuscript (Huang, Luo, Duan; O-O only): &pol_gauss values
+PGM3P_GVDW = {
+    "slater": {"rep": "slater", "arep": 87500.0, "c6": 594.825035, "b": 4.52},
+    "gauss": {"rep": "gauss", "arep": 422.0, "c6": 594.825035, "b": 0.9453},
+}
+
+
+def gvdw_from_pmemd(arep_kcal: float, c6_kcal_A6: float, b: float) -> tuple[float, float, float]:
+    """Return per-atom (sqrt A [sqrt(kJ/mol)], sqrt C6 [sqrt(kJ/mol nm^6)], b) for pmemd-pgm's GVDW pair
+    parameters gvdw_arep [kcal/mol], gvdw_c6 [kcal/mol A^6], b_rep_scale."""
+    return math.sqrt(arep_kcal * KCAL), math.sqrt(c6_kcal_A6 * KCAL * 1e-6), float(b)
 
 
 def read_sections(path: str, names: tuple[str, ...] | None = None) -> dict:
@@ -122,6 +139,8 @@ def create_system(
     polarization: bool = True,
     lj: bool = True,
     lj_lrc: bool = True,
+    vdw: str = "lj",
+    gvdw: dict | str | None = None,
     rigid_water: bool = True,
     constraints=None,
     coulomb: float | None = None,
@@ -137,7 +156,16 @@ def create_system(
     cutoff [nm] applies to the direct-space electrostatics and the LJ; ewald_beta [1/nm] and grid set
     the PME (ewald_beta = 0: chosen from ewald_tol as NonbondedForce does).  predictor: "none", "mu3",
     "mu4".  coulomb: the Coulomb constant (None: OpenMM's; pmemd-pgm's is 332.05382 * 0.4184).
+
+    vdw: "lj" (the prmtop's Lennard-Jones), "gvdw" or "none" (lj=False is "none").  gvdw: a key of
+    PGM3P_GVDW, a pmemd-style dict {"rep": "slater"|"gauss", "arep": kcal/mol, "c6": kcal/mol A^6,
+    "b": b_rep_scale} applied to every atom with a nonzero LJ epsilon (pmemd-pgm's rule), or
+    {"rep": ..., "types": {amber_atom_type: (sqrtA, sqrtC6, b)}} in OpenMM units.
     """
+    if not lj:
+        vdw = "none"
+    if vdw not in ("lj", "gvdw", "none"):
+        raise ValueError(f"vdw must be lj, gvdw or none, not {vdw!r}")
     amber = app.AmberPrmtopFile(prmtop)
     method = app.CutoffPeriodic if periodic else app.NoCutoff
     kw = {"nonbondedCutoff": cutoff * unit.nanometer} if periodic else {}
@@ -161,13 +189,15 @@ def create_system(
     nb.setUseSwitchingFunction(False)
     nb.setReactionFieldDielectric(1.0)
     nb.setForceGroup(lj_group)
-    if not lj:
+    if vdw == "none":
         system.removeForce([k for k, f in enumerate(system.getForces()) if isinstance(f, mm.NonbondedForce)][0])
-    elif periodic and lj_lrc:
+    elif vdw == "lj" and periodic and lj_lrc:
         c = 2.0 * math.pi * lj_tail_constant(par["sections"]) / (3.0 * cutoff**3)
         tail = mm.CustomVolumeForce(f"-{float(c):.17g}/v")
         tail.setForceGroup(lj_group)
         system.addForce(tail)
+    elif vdw == "gvdw":
+        add_gvdw(system, nb, par, gvdw, cutoff, periodic, lj_lrc, lj_group)
 
     # pGM electrostatics
     pgm = openmmpgm.PGMForce()
@@ -196,3 +226,42 @@ def create_system(
     pgm.setForceGroup(pgm_group)
     system.addForce(pgm)
     return system, amber.topology, pgm
+
+
+def add_gvdw(system, nb, par, gvdw, cutoff, periodic, lrc, group):
+    """Replace the Lennard-Jones of `nb` (a charge-free NonbondedForce of `system`) by a GVDWForce."""
+    if gvdw is None:
+        raise ValueError("vdw='gvdw' needs the gvdw parameters (e.g. gvdw='slater')")
+    if isinstance(gvdw, str):
+        gvdw = PGM3P_GVDW[gvdw]
+    n = system.getNumParticles()
+    eps = np.array([nb.getParticleParameters(i)[2].value_in_unit(unit.kilojoule_per_mole) for i in range(n)])
+    if "types" in gvdw:
+        types = par["sections"]["AMBER_ATOM_TYPE"]
+        prm = [gvdw["types"].get(t, (0.0, 0.0, 1.0)) for t in types]
+    else:
+        one = gvdw_from_pmemd(gvdw["arep"], gvdw["c6"], gvdw["b"])
+        prm = [one if e > 0 else (0.0, 0.0, 1.0) for e in eps]
+    f = openmmpgm.GVDWForce()
+    f.setRepulsionForm({"gauss": openmmpgm.GVDWForce.Gaussian, "slater": openmmpgm.GVDWForce.Slater}[gvdw["rep"]])
+    for i in range(n):
+        f.addParticle(float(par["radius"][i]), *(float(v) for v in prm[i]))
+    for k in range(nb.getNumExceptions()):
+        i, j, _, _, _ = nb.getExceptionParameters(k)
+        f.addExclusion(i, j)
+    if periodic:
+        f.setNonbondedMethod(openmmpgm.GVDWForce.CutoffPeriodic)
+        f.setCutoffDistance(cutoff)
+        f.setUseDispersionCorrection(lrc)
+    else:
+        f.setNonbondedMethod(openmmpgm.GVDWForce.NoCutoff)
+    f.setForceGroup(group)
+    system.addForce(f)
+    # the Lennard-Jones goes; the scaled 1-4 Lennard-Jones (exceptions with epsilon != 0) stays
+    for i in range(n):
+        q, sig, _ = nb.getParticleParameters(i)
+        nb.setParticleParameters(i, q, sig, 0.0)
+    if not any(nb.getExceptionParameters(k)[4].value_in_unit(unit.kilojoule_per_mole) != 0
+               for k in range(nb.getNumExceptions())):
+        system.removeForce([k for k, g in enumerate(system.getForces()) if isinstance(g, mm.NonbondedForce)][0])
+    return f

@@ -2,3 +2,7 @@ openmm/build/
 runs/
 *.pyc
 __pycache__/
+openmm/build-gcc11/
+build_omm_login.out
+core/tests/run_dump
+core/tests/test_gvdw
