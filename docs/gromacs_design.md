@@ -133,12 +133,13 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
 * NVE, 1 fs, 4 ps, rigid water (SETTLE), plain LJ cut-off, Verlet buffer tolerance 1e-4, dipole tol
   1e-5, mu4 predictor, peek 0.65: total energy fluctuation 0.36 kJ/mol, drift -0.07 kJ/mol over 4 ps;
   4.0 CG iterations per step.
-* NPT 298 K / 1 bar (`tests/gmx/npt.mdp`: the pmemd.pgm.cuda settings of pGM-JAX docs/dielectric.md,
-  9 A, beta 4/nm, 48^3 order 6, DispCorr EnerPres = vdwmeth 1, tol 1e-5, SETTLE, 2 fs; v-rescale,
-  C-rescale), 150 ps from the 1.018 g/cm^3 start: 6.0 CG iterations per step, 7.4 ns/day; pressure
-  -8 +- 23 bar; density 1.0183 g/cm^3 over 30-150 ps, still drifting down (-8 kg/m^3 over the window)
-  towards pmemd's 1.0097 +- 0.0002.  Extended by 600 ps (`runs/gmx_w512/npt_ext.sh`, average from
-  100 ps in `npt_ext.out`) for the converged number.
+* NPT 298 K / 1 bar (`tests/gmx/npt.mdp`: 0.9 nm, beta 4/nm, 48^3 order 6, DispCorr EnerPres = the LJ
+  tail, tol 1e-5, SETTLE, 2 fs; v-rescale, C-rescale), 7.4 ns/day, 6.0 CG iterations per step.  The box
+  (`examples/water512/pgm3p25_512.prmtop`) is pGM-JAX's README box: pGM3P-25 electrostatics on TIP3P's
+  geometry and LJ, whose reference density is 1.018 g/cm^3 (pGM-JAX, 14.9 ns, same box and settings,
+  docs/dielectric.md); pmemd's 1.0097 is the paper's geometry and LJ, another model.  GROMACS after
+  343 ps (average from 100 ps): density 1.0201 +- 0.0013 g/cm^3, pressure 46 +- 34 bar, T 298.5 K.
+  The run continues to 750 ps (`runs/gmx_w512/npt_ext.sh`, `npt_ext.out`).
 * Speed of this reference (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms per
   step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms, final
   forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels
