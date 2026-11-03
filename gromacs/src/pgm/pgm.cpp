@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <deque>
 #include <vector>
 
@@ -205,7 +206,8 @@ public:
     };
     std::vector<DVec> pos_;
     double            box_[DIM][DIM], recip_[DIM][DIM], volume_ = 0;
-    std::vector<std::vector<Pair>> pairs_; // per nbnxm pair list (one per thread)
+    std::vector<std::vector<Pair>> pairs_;   // per thread
+    std::vector<std::array<int, 2>> ciItems_; // (pair list, i-cluster entry)
 
     // OpenMP: per-thread scratch for the scatter loops
     int                              nt_ = 1;
@@ -224,13 +226,26 @@ public:
     double                         lastResidual_   = 0;
     long                           numCalls_ = 0, sumIterations_ = 0;
 
+    // wall-clock seconds per phase (GMX_PGM_TIMING): pair setup, splines + influence, pair passes of the
+    // field, PME, final forces
+    double tPairs_ = 0, tSplines_ = 0, tFieldPairs_ = 0, tPme_ = 0, tFinal_ = 0;
+    double numCandidates_ = 0, numPairs_ = 0;
+    static double now()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     // PME
-    gmx_parallel_3dfft_t fft_ = nullptr;
+    gmx_parallel_3dfft_t fft_        = nullptr;
+    int                  fftThreads_ = 0;
+    void                 initFft(int numThreads);
+    void                 fftExecute(gmx_fft_direction dir);
     real*                realGrid_    = nullptr;
     t_complex*           complexGrid_ = nullptr;
     ivec                 rNData_, rOffset_, rSize_, cOrder_, cNData_, cOffset_, cSize_;
     std::vector<double>  moduli_[DIM];
     std::vector<double>  influence_; // per complex grid element
+    double               influenceBox_[DIM][DIM] = {}; // the box influence_ was computed for
     std::vector<int>     gridIndex_[DIM];
     std::vector<double>  theta_[DIM], dtheta_[DIM], d2theta_[DIM];
     std::vector<double>  phi_; // reciprocal potential on the grid (real layout, nx*ny*nz)
@@ -304,25 +319,6 @@ PgmElectrostatics::Impl::Impl(const t_inputrec& ir, FILE* fplog)
         moduli_[d] = bsplineModuli(grid_[d], order_);
     }
 
-    MPI_Comm comm[2] = { MPI_COMM_NULL, MPI_COMM_NULL };
-    ivec     ndata   = { grid_[XX], grid_[YY], grid_[ZZ] };
-    gmx_parallel_3dfft_init(&fft_, ndata, &realGrid_, &complexGrid_, comm, TRUE, 1);
-    gmx_parallel_3dfft_real_limits(fft_, rNData_, rOffset_, rSize_);
-    gmx_parallel_3dfft_complex_limits(fft_, cOrder_, cNData_, cOffset_, cSize_);
-    // the complex grid is stored y major, x minor (as in pme_solve: (iy size_z + iz) size_x + ix); the
-    // limits are indexed by dimension; complex_order reports {0, 1, 2} regardless
-    cOrder_[0] = YY;
-    cOrder_[1] = ZZ;
-    cOrder_[2] = XX;
-    for (int d = 0; d < DIM; d++)
-    {
-        GMX_RELEASE_ASSERT(rNData_[d] == grid_[d] && rOffset_[d] == 0 && cOffset_[d] == 0,
-                           "pGM: the PME FFT must be local");
-    }
-    GMX_RELEASE_ASSERT(cNData_[XX] == grid_[XX] && cNData_[YY] == grid_[YY]
-                               && cNData_[ZZ] == grid_[ZZ] / 2 + 1,
-                       "pGM: unexpected complex FFT layout");
-
     if (fplog)
     {
         fprintf(fplog,
@@ -352,10 +348,64 @@ PgmElectrostatics::Impl::~Impl()
                 "pGM: %ld force calls, %.2f conjugate-gradient iterations per call\n",
                 numCalls_,
                 static_cast<double>(sumIterations_) / numCalls_);
+        if (std::getenv("GMX_PGM_TIMING"))
+        {
+            fprintf(stderr,
+                    "pGM ms per call: pair setup %.2f, splines+influence %.2f, field pair passes %.2f, "
+                    "PME %.2f, final forces (excl. PME) %.2f\n",
+                    1e3 * tPairs_ / numCalls_, 1e3 * tSplines_ / numCalls_, 1e3 * tFieldPairs_ / numCalls_,
+                    1e3 * tPme_ / numCalls_, 1e3 * tFinal_ / numCalls_);
+            fprintf(stderr, "pGM pairs per call: %.0f cluster-list atom pairs, %.0f within the cut-off; %d threads\n",
+                    numCandidates_ / numCalls_, numPairs_ / numCalls_, nt_);
+        }
     }
     if (fft_)
     {
         gmx_parallel_3dfft_destroy(fft_); // frees fft_
+    }
+}
+
+void PgmElectrostatics::Impl::initFft(int numThreads)
+{
+    if (fft_)
+    {
+        gmx_parallel_3dfft_destroy(fft_); // frees fft_ and the grids
+        fft_ = nullptr;
+    }
+    MPI_Comm comm[2] = { MPI_COMM_NULL, MPI_COMM_NULL };
+    ivec     ndata   = { grid_[XX], grid_[YY], grid_[ZZ] };
+    gmx_parallel_3dfft_init(&fft_, ndata, &realGrid_, &complexGrid_, comm, TRUE, numThreads);
+    gmx_parallel_3dfft_real_limits(fft_, rNData_, rOffset_, rSize_);
+    gmx_parallel_3dfft_complex_limits(fft_, cOrder_, cNData_, cOffset_, cSize_);
+    // the complex grid is stored y major, x minor (as in pme_solve: (iy size_z + iz) size_x + ix); the
+    // limits are indexed by dimension; complex_order reports {0, 1, 2} regardless
+    cOrder_[0] = YY;
+    cOrder_[1] = ZZ;
+    cOrder_[2] = XX;
+    for (int d = 0; d < DIM; d++)
+    {
+        GMX_RELEASE_ASSERT(rNData_[d] == grid_[d] && rOffset_[d] == 0 && cOffset_[d] == 0,
+                           "pGM: the PME FFT must be local");
+    }
+    GMX_RELEASE_ASSERT(cNData_[XX] == grid_[XX] && cNData_[YY] == grid_[YY]
+                               && cNData_[ZZ] == grid_[ZZ] / 2 + 1,
+                       "pGM: unexpected complex FFT layout");
+
+    fftThreads_ = numThreads;
+    influence_.clear();
+}
+
+void PgmElectrostatics::Impl::fftExecute(gmx_fft_direction dir)
+{
+    if (fftThreads_ == 1)
+    {
+        gmx_parallel_3dfft_execute(fft_, dir, 0, nullptr);
+        return;
+    }
+    // as in pme.cpp: every thread of the team calls execute with its index
+#pragma omp parallel num_threads(fftThreads_)
+    {
+        gmx_parallel_3dfft_execute(fft_, dir, gmx_omp_get_thread_num(), nullptr);
     }
 }
 
@@ -451,18 +501,39 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
         gmx_fatal(FARGS, "pGM electrostatics need the CPU pair lists (mdrun -nb cpu)");
     }
     ArrayRef<const int> atomOrder = nbv.getLocalAtomOrder();
-    const int           numLists  = lists.ssize();
-    pairs_.resize(numLists);
-#pragma omp parallel for num_threads(nt_) schedule(static)
-    for (int l = 0; l < numLists; l++)
+    // work items: the i-cluster entries of all lists, dealt out dynamically; one pair vector per thread
+    ciItems_.clear();
+    for (int l = 0; l < lists.ssize(); l++)
     {
-        const NbnxnPairlistCpu& nbl   = lists[l];
-        std::vector<Pair>&      pairs = pairs_[l];
-        pairs.clear();
-        double    Bb[4];
-        const int naci = nbl.na_ci, nacj = nbl.na_cj;
-        for (const nbnxn_ci_t& ciEntry : nbl.ci)
+        for (int c = 0; c < static_cast<int>(lists[l].ci.size()); c++)
         {
+            ciItems_.push_back({ l, c });
+        }
+    }
+    const int numItems = ciItems_.size();
+    for (int item = 0; item < numItems; item++)
+    {
+        const NbnxnPairlistCpu& nbl = lists[ciItems_[item][0]];
+        const nbnxn_ci_t&       ci  = nbl.ci[ciItems_[item][1]];
+        numCandidates_ += static_cast<double>(ci.cj_ind_end - ci.cj_ind_start) * nbl.na_ci * nbl.na_cj;
+    }
+    pairs_.resize(nt_);
+    for (auto& v : pairs_)
+    {
+        v.clear();
+    }
+#pragma omp parallel num_threads(nt_)
+    {
+        // fill a local vector (no false sharing of the vector headers in pairs_), keep its capacity
+        std::vector<Pair> pairs;
+        pairs.swap(pairs_[gmx_omp_get_thread_num()]);
+        double Bb[4];
+#pragma omp for schedule(dynamic, 8)
+        for (int item = 0; item < numItems; item++)
+        {
+            const NbnxnPairlistCpu& nbl     = lists[ciItems_[item][0]];
+            const nbnxn_ci_t&       ciEntry = nbl.ci[ciItems_[item][1]];
+            const int               naci = nbl.na_ci, nacj = nbl.na_cj;
             const int  ish     = ciEntry.shift & NBNXN_CI_SHIFT;
             const bool central = (ish == c_centralShiftIndex);
             const DVec sv(shiftVectors[ish][XX], shiftVectors[ish][YY], shiftVectors[ish][ZZ]);
@@ -514,6 +585,7 @@ void PgmElectrostatics::Impl::buildPairs(ArrayRef<const RVec>      x,
                 }
             }
         }
+        pairs.swap(pairs_[gmx_omp_get_thread_num()]);
     }
 }
 
@@ -591,11 +663,25 @@ void PgmElectrostatics::Impl::splines()
 void PgmElectrostatics::Impl::computeInfluence()
 {
     const int c0 = cOrder_[0], c1 = cOrder_[1], c2 = cOrder_[2];
+    bool same = (influence_.size() == static_cast<size_t>(cSize_[c0]) * cSize_[c1] * cSize_[c2]);
+    for (int a = 0; a < DIM; a++)
+    {
+        for (int b = 0; b < DIM; b++)
+        {
+            same = same && influenceBox_[a][b] == box_[a][b];
+            influenceBox_[a][b] = box_[a][b];
+        }
+    }
+    if (same)
+    {
+        return;
+    }
     influence_.assign(static_cast<size_t>(cSize_[c0]) * cSize_[c1] * cSize_[c2], 0.0);
     const double fac = M_PI * M_PI / (beta_ * beta_);
-    int          k[DIM];
+#pragma omp parallel for num_threads(nt_) schedule(static)
     for (int i0 = 0; i0 < cNData_[c0]; i0++)
     {
+        int k[DIM];
         for (int i1 = 0; i1 < cNData_[c1]; i1++)
         {
             for (int i2 = 0; i2 < cNData_[c2]; i2++)
@@ -645,12 +731,13 @@ double PgmElectrostatics::Impl::pmePotential(const std::vector<double>* q, const
     // spread in double on per-thread grids, sum them into the FFT grid
     const size_t      gridSize = static_cast<size_t>(K1) * K2 * K3;
     std::vector<DVec> e        = fractionalDipoles(d);
-    for (auto& grid : threadGrid_) // all of them: a thread may not take part
-    {
-        grid.assign(gridSize, 0.0);
-    }
 #pragma omp parallel num_threads(nt_)
     {
+#pragma omp for schedule(static)
+        for (int t = 0; t < nt_; t++) // all of them, also of threads that do not take part
+        {
+            threadGrid_[t].assign(gridSize, 0.0);
+        }
         std::vector<double>& grid = threadGrid_[gmx_omp_get_thread_num()];
 #pragma omp for schedule(static)
         for (int i = 0; i < n_; i++)
@@ -691,53 +778,66 @@ double PgmElectrostatics::Impl::pmePotential(const std::vector<double>* q, const
             }
         }
     }
-    gmx_parallel_3dfft_execute(fft_, GMX_FFT_REAL_TO_COMPLEX, 0, nullptr);
+    fftExecute(GMX_FFT_REAL_TO_COMPLEX);
 
     const int c0 = cOrder_[0], c1 = cOrder_[1], c2 = cOrder_[2];
     double    energy = 0.0;
-    int       k[DIM];
-    for (int i0 = 0; i0 < cNData_[c0]; i0++)
+#pragma omp parallel num_threads(nt_) reduction(+ : energy)
     {
-        for (int i1 = 0; i1 < cNData_[c1]; i1++)
+        double strainLocal[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        int    k[DIM];
+#pragma omp for schedule(static)
+        for (int i0 = 0; i0 < cNData_[c0]; i0++)
         {
-            for (int i2 = 0; i2 < cNData_[c2]; i2++)
+            for (int i1 = 0; i1 < cNData_[c1]; i1++)
             {
-                const size_t idx = (static_cast<size_t>(i0) * cSize_[c1] + i1) * cSize_[c2] + i2;
-                k[c0]            = i0;
-                k[c1]            = i1;
-                k[c2]            = i2;
-                const double g   = influence_[idx];
-                const double w   = (k[ZZ] == 0 || (K3 % 2 == 0 && k[ZZ] == K3 / 2) ? 1.0 : 2.0);
-                t_complex&   F   = complexGrid_[idx];
-                const double F2  = static_cast<double>(F.re) * F.re + static_cast<double>(F.im) * F.im;
-                const double ek  = 0.5 * w * g * F2;
-                energy += ek;
-                if (strain && g != 0)
+                for (int i2 = 0; i2 < cNData_[c2]; i2++)
                 {
-                    const int mm[DIM] = { k[XX] <= K1 / 2 ? k[XX] : k[XX] - K1,
-                                          k[YY] <= K2 / 2 ? k[YY] : k[YY] - K2,
-                                          k[ZZ] };
-                    DVec      ms;
-                    for (int dd = 0; dd < DIM; dd++)
+                    const size_t idx = (static_cast<size_t>(i0) * cSize_[c1] + i1) * cSize_[c2] + i2;
+                    k[c0]            = i0;
+                    k[c1]            = i1;
+                    k[c2]            = i2;
+                    const double g   = influence_[idx];
+                    const double w   = (k[ZZ] == 0 || (K3 % 2 == 0 && k[ZZ] == K3 / 2) ? 1.0 : 2.0);
+                    t_complex&   F   = complexGrid_[idx];
+                    const double F2  = static_cast<double>(F.re) * F.re + static_cast<double>(F.im) * F.im;
+                    const double ek  = 0.5 * w * g * F2;
+                    energy += ek;
+                    if (strain && g != 0)
                     {
-                        ms[dd] = mm[XX] * recip_[dd][XX] + mm[YY] * recip_[dd][YY] + mm[ZZ] * recip_[dd][ZZ];
-                    }
-                    const double m2 = dot3(ms, ms);
-                    const double c2 = 2.0 * (M_PI * M_PI / (beta_ * beta_) + 1.0 / m2);
-                    for (int a = 0; a < DIM; a++)
-                    {
-                        for (int b = 0; b < DIM; b++)
+                        const int mm[DIM] = { k[XX] <= K1 / 2 ? k[XX] : k[XX] - K1,
+                                              k[YY] <= K2 / 2 ? k[YY] : k[YY] - K2,
+                                              k[ZZ] };
+                        DVec      ms;
+                        for (int dd = 0; dd < DIM; dd++)
                         {
-                            strain[3 * a + b] += ek * ((a == b ? -1.0 : 0.0) + c2 * ms[a] * ms[b]);
+                            ms[dd] = mm[XX] * recip_[dd][XX] + mm[YY] * recip_[dd][YY] + mm[ZZ] * recip_[dd][ZZ];
+                        }
+                        const double m2 = dot3(ms, ms);
+                        const double cm = 2.0 * (M_PI * M_PI / (beta_ * beta_) + 1.0 / m2);
+                        for (int a = 0; a < DIM; a++)
+                        {
+                            for (int b = 0; b < DIM; b++)
+                            {
+                                strainLocal[3 * a + b] += ek * ((a == b ? -1.0 : 0.0) + cm * ms[a] * ms[b]);
+                            }
                         }
                     }
+                    F.re *= g;
+                    F.im *= g;
                 }
-                F.re *= g;
-                F.im *= g;
+            }
+        }
+        if (strain)
+        {
+            for (int a = 0; a < 9; a++)
+            {
+#pragma omp atomic
+                strain[a] += strainLocal[a];
             }
         }
     }
-    gmx_parallel_3dfft_execute(fft_, GMX_FFT_COMPLEX_TO_REAL, 0, nullptr);
+    fftExecute(GMX_FFT_COMPLEX_TO_REAL);
 #pragma omp parallel for num_threads(nt_) schedule(static)
     for (int g1 = 0; g1 < K1; g1++)
     {
@@ -787,6 +887,7 @@ void PgmElectrostatics::Impl::pmeField(std::vector<DVec>& E) const
 
 std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, const std::vector<DVec>& d)
 {
+    const double      t0 = now();
     std::vector<DVec> E(n_, DVec{ 0, 0, 0 });
     const int         numLists = pairs_.size();
     for (auto& v : threadVec_)
@@ -815,8 +916,11 @@ std::vector<DVec> PgmElectrostatics::Impl::field(const std::vector<double>* q, c
         }
     }
     reduceThreadVec(E);
+    double t1 = now();
+    tFieldPairs_ += t1 - t0;
     pmePotential(q, d, nullptr);
     pmeField(E);
+    tPme_ += now() - t1;
     const double cs = 4.0 * beta_ * beta_ * beta_ / (3.0 * c_sqrtPi);
     for (int i = 0; i < n_; i++)
     {
@@ -997,6 +1101,10 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
     threadVec_.resize(nt_);
     threadGrid_.resize(nt_);
+    if (fftThreads_ != nt_)
+    {
+        initFft(nt_);
+    }
     setTopology(numHomeAtoms, charges, idef);
     globalIndex_.assign(globalIndex.begin(), globalIndex.begin() + (globalIndex.empty() ? 0 : n_));
     pos_.resize(n_);
@@ -1006,9 +1114,26 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     setBox(box);
     permanentDipoles();
+    double t0 = now();
     buildPairs(xIn, nbv, shiftVectors);
+    const double tPairs1 = now();
+    tPairs_ += tPairs1 - t0;
+    for (const auto& v : pairs_)
+    {
+        numPairs_ += v.size();
+    }
+    if (numCalls_ == 0 && std::getenv("GMX_PGM_TIMING"))
+    {
+        fprintf(stderr, "pGM pairs per thread:");
+        for (const auto& v : pairs_)
+        {
+            fprintf(stderr, " %zu", v.size());
+        }
+        fprintf(stderr, " (%d i-cluster items)\n", static_cast<int>(ciItems_.size()));
+    }
     splines();
     computeInfluence();
+    tSplines_ += now() - tPairs1;
 
     if (polarizable_)
     {
@@ -1021,6 +1146,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     numCalls_++;
     sumIterations_ += lastIterations_;
+    const double tFinal0 = now();
 
     std::vector<DVec> d(n_);
     for (int i = 0; i < n_; i++)
@@ -1045,7 +1171,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
         const int          t   = gmx_omp_get_thread_num();
         std::vector<DVec>& Ft  = threadVec_[t];
         std::vector<DVec>& Et  = threadE[t];
-        auto&              sum = threadSum[t]; // S (9), direct energy
+        std::array<double, 10> sum{}; // S (9), direct energy: local, stored at the end
 #pragma omp for schedule(static)
         for (int l = 0; l < numLists; l++)
         {
@@ -1075,6 +1201,11 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
                 }
             }
         }
+        for (int k = 0; k < 10; k++)
+        {
+#pragma omp atomic
+            threadSum[0][k] += sum[k];
+        }
     }
     reduceThreadVec(F);
 #pragma omp parallel for num_threads(nt_) schedule(static)
@@ -1085,18 +1216,17 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             E[i] += threadE[t][i];
         }
     }
-    for (int t = 0; t < nt_; t++)
+    for (int k = 0; k < 9; k++)
     {
-        for (int k = 0; k < 9; k++)
-        {
-            S[k] += threadSum[t][k];
-        }
-        direct += threadSum[t][9];
+        S[k] += threadSum[0][k];
     }
+    direct += threadSum[0][9];
 
-    reciprocal = pmePotential(&q, d, S);
+    const double tPme0 = now();
+    reciprocal         = pmePotential(&q, d, S);
     std::vector<DVec> Erec(n_, DVec{ 0, 0, 0 });
     pmeField(Erec);
+    const double tPme1 = now();
     for (int i = 0; i < n_; i++)
     {
         for (int a = 0; a < DIM; a++)
@@ -1203,6 +1333,9 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             }
         }
     }
+
+    tFinal_ += (now() - tFinal0) - (tPme1 - tPme0);
+    tPme_ += tPme1 - tPme0;
 
     // outputs
     ArrayRef<RVec> f = forceWithVirial->force_;

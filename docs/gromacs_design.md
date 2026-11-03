@@ -108,8 +108,9 @@ rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
 * outputs: forces into `ForceWithVirial` with the analytical virial Xi = S^T/2 (pairs, covalent chain
   rule, reciprocal including the dipole term, background); energies: Coulomb (SR) = direct, Coul. recip.
   = reciprocal + self + background, "pGM Polariz." = sum |mu|^2/(2 alpha);
-* OpenMP over the pair lists (per-thread field/force buffers), atoms (splines, gather) and per-thread
-  spread grids; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
+* OpenMP: the i-cluster entries of all lists dealt out dynamically into per-thread pair vectors, per-thread
+  field/force buffers, atoms (splines, gather), per-thread spread grids, the threaded `gmx_parallel_3dfft`,
+  convolution; `-nb cpu`, one rank, no MTS (fatal errors otherwise).
 * `GMX_PGM_DUMP=file`: the first force call's settings, terms, virial, per-atom positions, parameters,
   forces, dipoles and the covalent list, in the global order; `core/tests/run_dump` recomputes it with
   pgm_core, `tests/compare_gmx.py` compares it with a pGM-JAX reference.
@@ -132,5 +133,7 @@ Dynamics (mixed precision, 8 OpenMP threads, `tests/gmx/nve_w512.sh`, `npt_w512.
 * NVE, 1 fs, 4 ps, rigid water (SETTLE), plain LJ cut-off, Verlet buffer tolerance 1e-4, dipole tol
   1e-5, mu4 predictor, peek 0.65: total energy fluctuation 0.36 kJ/mol, drift -0.07 kJ/mol over 4 ps;
   4.0 CG iterations per step.
-* Speed of this reference: 1.8 ns/day (47 ms/step) for water512 on 8 cores; the pair setup (two erf
-  kernels per pair per step) and the scalar loops dominate, which is G2's job.
+* Speed of this reference (water512, 36^3 grid, 8 OpenMP threads, double build): 4.4 ns/day (19 ms per
+  step at ~4 CG iterations: pair setup 4.7 ms, 6 field pair passes 2.2 ms, 7 PME solves 9.6 ms, final
+  forces 1.4 ms; `GMX_PGM_TIMING=1` prints this breakdown).  The pair setup evaluates two erf kernels
+  per pair in double; the PME is a plain per-thread-grid spread / FFT / gather.  Speed is G2's job.
