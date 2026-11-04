@@ -295,9 +295,14 @@ it).  GVDW overrides and the dispersion tail, LJ, bonded terms and everything el
   per atom the full list of the atoms within rl = max(rc, rvdw) + skin (0.15 nm, less in small boxes;
   minimum image), built with one block per cell and neighbour slab (the neighbour atoms read once per
   cell through shared memory; deterministic order), rebuilt when an atom has moved by more than skin/2
-  or the box changed (`GMX_PGM_GPU_SKIN`); GROMACS's reordering at every pair search also rebuilds it.
-  Each step one pass compacts the pairs within the radius (warp ballot) with their kernels G1, G2;
-  the final pass computes all four itself.  One warp per atom over its full list: no atomics.
+  or the box changed (`GMX_PGM_GPU_SKIN`).  GROMACS's reordering at its pair search only renames the
+  list (rows moved, partners renamed on the GPU).  The displacement check is the first kernel of the
+  step's graph: the host predicts from the last step (its displacement + twice its largest move) whether
+  to rebuild before the step, and rebuilds and repeats the evaluation should the check fail after all
+  (the history has a fifth slot, so a repeat reads what the first run read; 0 repeats in the benchmark).
+  Each step one pass compacts the pairs within the radius (warp ballot) with their kernels G1, G2,
+  together with the first field pass; the final pass computes all four itself.  One warp per atom over
+  its full list: no atomics.
 * **GVDW** (`Engine::setGvdw`): per-atom sqrt A, sqrt C6, b, the excluded and the overridden pairs as
   per-atom skip lists, marked once per list build in the partner index; the pair (core/gvdw_kernel.h in
   float) in the final pass.
@@ -318,7 +323,8 @@ it).  GVDW overrides and the dispersion tail, LJ, bonded terms and everything el
 * **Overlap**: `PgmElectrostatics::launch` (a second hook in `do_force`, before the CPU nonbonded
   kernels) starts the evaluation on a worker thread; `calculate` at the usual hook waits for it and adds
   forces, virial and energies.  Both hand-overs spin before they block (a sleeping thread's wake-up
-  cost up to 0.1 ms).
+  cost up to 0.1 ms).  The positions go from GROMACS's float array (registered with CUDA once) straight
+  into the graph (`Engine::computeF`), the forces are read from the engine's pinned buffer.
 
 Validation (`tests/gmx/gpu_check.sh`, GPU against the CPU path of the same mixed build; relative
 differences, float output):
@@ -333,9 +339,9 @@ differences, float output):
 `core/cuda/tests/test_cuda` checks the engine against pgm_core in double on a dump (total energy 7e-8
 relative, dipoles 3e-6 relative, strain 8e-7), its own list against given candidates and after
 displacements that rebuild it, GVDW against a double brute-force sum (1.5e-6), and the mu4 predictor
-over moved steps (1.3e-7 against pgm_core at every step).  NVE, 10 ps, 1 fs: 4096 waters total-energy
-fluctuation 2.6 kJ/mol and drift -8.9 kJ/mol on the GPU, 1.6 and -5.8 kJ/mol on the CPU path; with GVDW
-0.2 and +0.02 kJ/mol.  NPT water512 (C-rescale, 150 ps, the same seed): density 1020.6 +- 2.1
+over moved steps (1.3e-7 against pgm_core at every step), the list after a reordering and the float
+positions (identical results).  NVE, 10 ps, 1 fs: 4096 waters total-energy fluctuation 2.4 kJ/mol and
+drift -8.1 kJ/mol on the GPU, 1.4 and -5.0 kJ/mol on the CPU path; with GVDW 0.6 and +0.3 kJ/mol.  NPT water512 (C-rescale, 150 ps, the same seed): density 1020.6 +- 2.1
 kg/m^3 and potential -2.11509e6 kJ/mol on the GPU, 1022.9 +- 1.9 and -2.11509e6 on the CPU path (three
 GPU runs of the code's stages: 1017-1021).
 
@@ -344,16 +350,17 @@ Speed, 4096 waters (12288 atoms), pmemd's benchmark settings (rc 0.9 nm, beta 4/
 
 | | ns/day |
 |---|---|
-| GROMACS, pGM on the GPU, LJ, nstlist 10 | 113 |
-| the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 137 |
-| GROMACS, pGM + GVDW on the GPU, nstlist 10 | 107 |
+| GROMACS, pGM on the GPU, LJ, nstlist 10 | 124 |
+| the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 155 |
+| GROMACS, pGM + GVDW on the GPU, nstlist 10 | 117 |
 | pmemd.pgm.cuda (SPFP) | 91.7 |
 | OpenMM plugin, CUDA mixed | 77.2 |
 | GROMACS, CPU path (8 threads), LJ | 4.3 |
 
-Per step at nstlist 40 (0.59 ms): the GPU part 0.43 ms of kernels (2 CG iterations) plus 0.07 ms of
-host work (inputs, the list check, outputs), launch 0.05 ms, the CPU's own nonbonded work (0.26 ms)
-hidden behind the GPU, GROMACS's update and search the rest.  Tried and kept off: the kernels computed
+Per step at nstlist 40 (0.52 ms): the GPU part 0.43 ms of kernels (2 CG iterations; per step the
+first pair pass with the pair setup 64 us, the other field passes 22 us each, the final pass 44 us, FFTs
+52 us, spreads 56 us, gathers 35 us) plus 0.02 ms of host work, launch 0.03 ms, the CPU's own nonbonded
+work (0.26 ms) hidden behind the GPU, GROMACS's update and search the rest.  Tried and kept off: the kernels computed
 in every pass instead of stored (`PGM_CUDA_KERNELS_ON_THE_FLY`, slower), G0/G3 stored too
 (`PGM_CUDA_STORE_G03`, the same speed).
 
@@ -364,9 +371,8 @@ in every pass instead of stored (`PGM_CUDA_KERNELS_ON_THE_FLY`, slower), G0/G3 s
    the potential to the ranks whose atoms need it; instead of the whole-grid sum + redundant FFT.
 2. **GPU with DD**: one engine per rank on its home + halo atoms (the module's halo communication), or
    one GPU engine for the whole system on the main rank.
-   One rank, smaller steps: the list kept across GROMACS's reordering (a permutation instead of a
-   rebuild), the displacement check inside the graph (one synchronisation less), LJ on the GPU too
-   (`-nb gpu` with the electrostatics off in nbnxm, or in the engine's final pass).
+   One rank: the kernels are now the step (FFT, spread and pair passes about equal); LJ on the GPU would
+   only help when the CPU's share stops being hidden (fewer CPU cores).
 3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
    (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
 

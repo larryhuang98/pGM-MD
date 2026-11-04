@@ -76,6 +76,10 @@ public:
      * newStep: this evaluation starts a new MD step (its solution enters the predictor history).
      */
     Terms compute(const double* pos, const double box[3][3], bool newStep, double* f, double* strain);
+    /** compute() with float positions (3n), the forces left in forces() (3n, kJ/mol/nm, valid until the
+     * next call): no copies for callers in single precision. */
+    Terms computeF(const float* pos, const double box[3][3], bool newStep, double* strain);
+    const double* forces() const;
 
     int iterations() const;
     double residual() const;

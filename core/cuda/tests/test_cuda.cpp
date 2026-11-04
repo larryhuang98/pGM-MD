@@ -190,6 +190,55 @@ int main(int argc, char** argv) {
         printf("  moved %d: list builds %ld, total rel. diff to core %.3e\n", rep+1, own.listBuilds(), rel);
         ownOk = ownOk && fabs(rel) < 1e-6;
     }
+    // float positions from registered host memory (computeF): the same as from doubles
+    {
+        vector<float> pf(pm.begin(), pm.end());
+        const pgmcuda::Terms Td = own.compute(pm.data(), B, true, nullptr, nullptr);
+        const pgmcuda::Terms Tf = own.computeF(pf.data(), B, true, nullptr);
+        const pgmcuda::Terms Tf2 = own.computeF(pf.data(), B, true, nullptr);
+        printf("computeF: total %.10f vs %.10f from doubles (rel %.2e), again %.2e\n", Tf.total(), Td.total(),
+               (Tf.total()-Td.total())/fabs(Td.total()), (Tf2.total()-Td.total())/fabs(Td.total()));
+        ownOk = ownOk && fabs(Tf.total()-Td.total()) < 1e-9*fabs(Td.total());
+    }
+
+    // the same atoms in another order (as after a GROMACS pair search): the list is renamed, not rebuilt
+    {
+        vector<int> perm(n), gidx(n);   // new local k holds old atom perm[k]
+        for (int k = 0; k < n; k++)
+            perm[k] = (k*7919+13)%n;
+        vector<int> used(n, 0);
+        bool bij = true;
+        for (int k = 0; k < n; k++)
+            bij = bij && !used[perm[k]]++;
+        if (!bij)
+            for (int k = 0; k < n; k++)
+                perm[k] = n-1-k;
+        vector<int> newOf(n);
+        vector<double> q2(n), r2v(n), a2(n), p2(3*n);
+        for (int k = 0; k < n; k++) {
+            newOf[perm[k]] = k;
+            q2[k] = top.q[perm[k]];
+            r2v[k] = top.radius[perm[k]];
+            a2[k] = top.alpha[perm[k]];
+            gidx[k] = perm[k];
+            for (int c = 0; c < 3; c++)
+                p2[3*k+c] = pm[3*perm[k]+c];
+        }
+        vector<int> ca(ncov), cp(ncov);
+        for (int m = 0; m < ncov; m++) {
+            ca[m] = newOf[top.covAtom[m]];
+            cp[m] = newOf[top.covPartner[m]];
+        }
+        const pgmcuda::Terms Ta = own.compute(pm.data(), B, true, F2v.data(), nullptr);
+        const long builds0 = own.listBuilds();
+        own.setAtoms(n, q2.data(), r2v.data(), a2.data(), gidx.data(), n);
+        own.setCovalent(ncov, ca.data(), cp.data(), top.covStrength.data());
+        vector<double> Fp(3*n, 0.0);
+        const pgmcuda::Terms Tb = own.compute(p2.data(), B, true, Fp.data(), nullptr);
+        printf("reordered: total %.10f vs %.10f (rel %.2e), list builds %ld -> %ld\n", Tb.total(), Ta.total(),
+               (Tb.total()-Ta.total())/fabs(Ta.total()), builds0, own.listBuilds());
+        ownOk = ownOk && fabs(Tb.total()-Ta.total()) < 1e-7*fabs(Ta.total()) && own.listBuilds() == builds0;
+    }
     own.setAtoms(n, top.q.data(), top.radius.data(), top.alpha.data(), nullptr, n);
     own.setCovalent(ncov, top.covAtom.data(), top.covPartner.data(), top.covStrength.data());
 

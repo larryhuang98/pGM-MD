@@ -24,6 +24,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -432,11 +433,13 @@ public:
 #if GMX_GPU_CUDA
     std::unique_ptr<pgmcuda::Engine> gpu_;
     std::vector<int>                 gpuAtoms_; // the global indices the engine has
-    std::vector<double>              gpuF_, gpuS_;
+    std::vector<double>              gpuS_;
     pgmcuda::Terms                   gpuTerms_;
 #endif
     PgmWorker gpuWorker_;
     bool      gpuPending_ = false, launched_ = false, lastTopologyChanged_ = false, wantVirial_ = true;
+    ArrayRef<const RVec> xIn_; // this step's positions (valid during the force call)
+    void                 copyPositions(); // xIn_ to pos_ (double)
     double    tWait_ = 0, tPrep_ = 0, tFinish_ = 0, tLaunchEnd_ = 0, tBetween_ = 0;
     double    tSubmit_ = 0, tJobEnd_ = 0, tWakeWorker_ = 0, tWakeMain_ = 0; // worker hand-over latencies
     void      prepare(ArrayRef<const RVec>          xIn,
@@ -1445,15 +1448,17 @@ void PgmElectrostatics::Impl::startGpu(bool topologyChanged)
         }
     }
     tCand_ += now() - tc0;
-    gpuF_.assign(3 * n_, 0.0);
     gpuS_.assign(9, 0.0);
-    static_assert(sizeof(DVec) == 3 * sizeof(double), "pos_ is passed as 3n doubles");
+    static_assert(std::is_same_v<real, float> && sizeof(RVec) == 3 * sizeof(float),
+                  "the GPU engine takes the positions as 3n floats");
     tSubmit_ = now();
     auto job = [this]()
     {
         const double tg0 = now();
         tWakeWorker_ += tg0 - tSubmit_;
-        gpuTerms_ = gpu_->compute(reinterpret_cast<const double*>(pos_.data()), box_, true, gpuF_.data(), wantVirial_ ? gpuS_.data() : nullptr);
+        // the positions straight from GROMACS (float), the forces stay in the engine (forces())
+        gpuTerms_ = gpu_->computeF(reinterpret_cast<const float*>(xIn_.data()), box_, true,
+                                   wantVirial_ ? gpuS_.data() : nullptr);
         tJobEnd_ = now();
         tPme_ += tJobEnd_ - tg0; // the whole GPU part (GMX_PGM_TIMING: "PME")
     };
@@ -1493,7 +1498,7 @@ void PgmElectrostatics::Impl::finishGpu(ForceWithVirial* forceWithVirial, gmx_en
     }
     gpuPending_                  = false;
     const pgmcuda::Terms&     t  = gpuTerms_;
-    const std::vector<double>& F = gpuF_;
+    const double*              F = gpu_->forces();
     const std::vector<double>& S = gpuS_;
     lastIterations_ = gpu_->iterations();
     lastResidual_   = gpu_->residual();
@@ -2219,21 +2224,33 @@ void PgmElectrostatics::Impl::prepare(ArrayRef<const RVec>          xIn,
     // the global order
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
     threadVec_.resize(nt_);
-    if (fftThreads_ != nt_)
+    if (fftThreads_ != nt_ && !useGpu_)
     {
         initFft(nt_);
     }
-    globalIndex_.assign(globalIndex.begin(), globalIndex.begin() + (globalIndex.empty() ? 0 : n_));
+    if (topologyChanged || !useGpu_)
+    {
+        globalIndex_.assign(globalIndex.begin(), globalIndex.begin() + (globalIndex.empty() ? 0 : n_));
+    }
     if (topologyChanged || static_cast<int>(q_.size()) != n_)
     {
         setTopology(charges, idef, topologyChanged);
     }
+    xIn_ = xIn;
+    if (!useGpu_)
+    {
+        copyPositions();
+    }
+    setBox(box);
+}
+
+void PgmElectrostatics::Impl::copyPositions()
+{
     pos_.resize(n_);
     for (int i = 0; i < n_; i++)
     {
-        pos_[i] = DVec(xIn[i][XX], xIn[i][YY], xIn[i][ZZ]);
+        pos_[i] = DVec(xIn_[i][XX], xIn_[i][YY], xIn_[i][ZZ]);
     }
-    setBox(box);
 }
 
 void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
@@ -2279,6 +2296,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     else if (gvdw_) // the rule part comes from the GPU (finishGpu), the overrides and the tail from here
     {
+        copyPositions();
         gvdwForce_.resize(1);
         gvdwForce_[0].assign(n_, DVec{ 0, 0, 0 });
         gvdwEnergy_ = 0;

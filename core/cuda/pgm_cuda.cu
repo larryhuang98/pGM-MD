@@ -577,25 +577,66 @@ __global__ void sumSlabs(int n, int slabs, const int* slabCount, int* count) {
     }
 }
 
+// ------------------------------------------------------------------ the list across a reordering
+// newOf[i]: the new local index of old atom i (the same atoms in another order, as after GROMACS's pair
+// search): the rows move, the partners are renamed; positions of the build and of the last step move too.
+
+__global__ void remapCounts(int n, const int* newOf, const int* atomStart, int* count) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i <= n; i += gridDim.x*blockDim.x)
+        count[i < n ? newOf[i] : n] = (i < n ? atomStart[i+1]-atomStart[i] : 0);
+}
+
+__global__ void remapRows(int n, const int* newOf, const int* atomStart, const int* candJ, const int* newStart,
+                          int* newCand) {
+    const int i = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
+    if (i >= n)
+        return;
+    const int o = newStart[newOf[i]]-atomStart[i];
+    for (int k = atomStart[i]+lane; k < atomStart[i+1]; k += 32)
+        newCand[k+o] = newOf[candJ[k]&INDEX_MASK];
+}
+
+__global__ void remapAtoms(int n, const int* newOf, const float4* a, const float4* b, float4* a2, float4* b2,
+                           int* order) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        a2[newOf[i]] = a[i];
+        b2[newOf[i]] = b[i];
+        order[i] = newOf[order[i]];
+    }
+}
+
+__global__ void packPositions(int n, const float* x, const float* q, float4* posq) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x)
+        posq[i] = make_float4(x[3*i], x[3*i+1], x[3*i+2], q[i]);
+}
+
 __global__ void gatherPositions(int n, const int* order, const float4* posq, float4* out) {
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < n; k += gridDim.x*blockDim.x)
         out[k] = posq[order[k]];
 }
 
-/** max |r_i - r_i(build)|^2 (minimum image) as float bits. */
-__global__ void maxDisplacement(int n, const float4* posq, const float4* ref, unsigned* out) {
+/** out[0] = max |r_i - r_i(list build)|^2, out[1] = max |r_i - r_i(last evaluation)|^2 (minimum image,
+ * float bits); then prev = r. */
+__global__ void displacements(int n, const float4* posq, const float4* ref, float4* prev, unsigned* out) {
     const Box bx = c_box;
-    float m = 0;
+    float m = 0, ms = 0;
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
-        const float4 a = posq[i], b = ref[i];
-        float3 d = make_float3(a.x-b.x, a.y-b.y, a.z-b.z);
+        const float4 a = posq[i], b = ref[i], c = prev[i];
+        float3 d = make_float3(a.x-b.x, a.y-b.y, a.z-b.z), e = make_float3(a.x-c.x, a.y-c.y, a.z-c.z);
         minImage(d, bx);
+        minImage(e, bx);
         m = fmaxf(m, d.x*d.x+d.y*d.y+d.z*d.z);
+        ms = fmaxf(ms, e.x*e.x+e.y*e.y+e.z*e.z);
+        prev[i] = a;
     }
-    for (int o = 16; o > 0; o >>= 1)
+    for (int o = 16; o > 0; o >>= 1) {
         m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
-    if (threadIdx.x%32 == 0)
+        ms = fmaxf(ms, __shfl_down_sync(0xffffffff, ms, o));
+    }
+    if (threadIdx.x%32 == 0) {
         atomicMax(out, __float_as_uint(m));
+        atomicMax(out+1, __float_as_uint(ms));
+    }
 }
 
 // ------------------------------------------------------------------ covalent dipoles
@@ -975,6 +1016,72 @@ __global__ void gatherT(int n, int, const float4* posq, const float4* dip, int K
     }
 }
 
+/** pairSetup<false> and fieldPassDual in one pass over the candidates: the first pair pass of a step
+ * (the field of the charges and permanent dipoles dip1 and of the guess dip2) while the pairs are found. */
+__global__ void pairSetupDual(int n, const int* order, const int* atomStart, const int* candJ, const float4* posq,
+                              const float* rg, float rc2, float rp2, float beta, const float4* dip1,
+                              const float4* dip2, int* PJ, float2* G12, float2* G03, int* pairEnd, double* fld1,
+                              double* fld2) {
+    const Box bx = c_box;
+    const int w = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
+    if (w >= n)
+        return;
+    const int i = order ? order[w] : w;
+    const float4 pi = posq[i];
+    const float rgi = rg[i];
+    const unsigned below = (1u<<lane)-1;
+    const int end = atomStart[i+1];
+    int out = atomStart[i];
+    float e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0};
+    for (int k0 = atomStart[i]; k0 < end; k0 += 32) {
+        const int k = k0+lane;
+        bool inside = false;
+        int jraw = 0, j = 0;
+        float4 pj = make_float4(0, 0, 0, 0);
+        float3 d = make_float3(0, 0, 0);
+        if (k < end) {
+            jraw = candJ[k];
+            j = jraw&INDEX_MASK;
+            pj = posq[j];
+            d = make_float3(pi.x-pj.x, pi.y-pj.y, pi.z-pj.z);
+            minImage(d, bx);
+            inside = d.x*d.x+d.y*d.y+d.z*d.z < rp2;
+        }
+        const unsigned mask = __ballot_sync(0xffffffff, inside);
+        if (inside) {
+            const float r2 = d.x*d.x+d.y*d.y+d.z*d.z, r = sqrtf(r2);
+            float g[4] = {0, 0, 0, 0};
+            if (r2 < rc2)
+                pairKernels(rgi+rg[j], r, r > 0 ? 1/r : 0.0f, beta, g);
+            const int q = out+__popc(mask&below);
+            PJ[q] = jraw;
+            G12[q] = make_float2(g[1], g[2]);
+            if (G03)
+                G03[q] = make_float2(g[0], g[3]);
+            const float x[3] = {d.x, d.y, d.z};
+            const float4 a = dip1[j], b = dip2[j];
+            const float ax = a.x*x[0]+a.y*x[1]+a.z*x[2], bxd = b.x*x[0]+b.y*x[1]+b.z*x[2];
+            const float da[3] = {a.x, a.y, a.z}, db[3] = {b.x, b.y, b.z};
+            for (int c = 0; c < 3; c++) {
+                e1[c] += pj.w*x[c]*g[1]-da[c]*g[1]+ax*x[c]*g[2];
+                e2[c] += -db[c]*g[1]+bxd*x[c]*g[2];
+            }
+        }
+        out += __popc(mask);
+    }
+    for (int c = 0; c < 3; c++) {
+        e1[c] = warpSum(e1[c]);
+        e2[c] = warpSum(e2[c]);
+    }
+    if (lane == 0) {
+        pairEnd[i] = out;
+        for (int c = 0; c < 3; c++) {
+            fld1[3*i+c] = e1[c];
+            fld2[3*i+c] = e2[c];
+        }
+    }
+}
+
 // ------------------------------------------------------------------ two fields in one pass
 // The field of the charges and permanent dipoles (set 1) and of the initial guess (set 2), needed together
 // at the start of every step: one pair pass, one spread into two grids, one batched FFT pair, one gather.
@@ -1092,8 +1199,10 @@ struct Control {
     int pushSlot;   // the slot the solution goes into (-1: none)
 };
 
-struct HistPtrs {   // the four history slots (3 nGlobal, the global order)
-    double* h[4];
+constexpr int NHIST = 5;   // history slots: 4 for the predictor, the fifth for this step's solution (so an
+                           // evaluation can be repeated: it never writes what its guess reads)
+struct HistPtrs {          // (3 nGlobal each, the global order)
+    double* h[NHIST];
 };
 
 /** x = sum_h c_h hist_(head+h) (through gidx) or alpha b; polarizable atoms only. */
@@ -1110,7 +1219,7 @@ __global__ void initialGuess(int n, const Control* ctl, const int* gidx, HistPtr
         double v = 0;
         for (int h = 0; h < 4; h++)
             if (c.c[h] != 0)
-                v += c.c[h]*hp.h[(c.head+h)%4][g];
+                v += c.c[h]*hp.h[(c.head+h)%NHIST][g];
         x[k] = (a > 0 ? v : 0.0);
     }
 }
@@ -1408,8 +1517,8 @@ struct Engine::Impl {
     DevArray<int> cellKey, cellKeySorted, cellAtom, cellAtomSorted, cellStart, cellEnd, count, slabCount;
     DevArray<unsigned char> cubTemp;
     DevArray<unsigned> maxDisp;
-    // predictor history (device, global order): slot (head + h) % 4 is h steps back
-    DevArray<double> hist[4];
+    // predictor history (device, global order): slot (head + h) % NHIST is h steps back
+    DevArray<double> hist[NHIST];
     int head = 0, numHist = 0;
     // host staging (pinned)
     HostArray<float4> posqH;
@@ -1421,9 +1530,9 @@ struct Engine::Impl {
     bool useGraphs = false;
     cudaGraphExec_t exec[4] = {nullptr, nullptr, nullptr, nullptr};
     long execAllocations[4] = {-1, -1, -1, -1};
-    std::array<long long, 6> execKey[4];
-    std::array<long long, 6> graphKey() const {   // the host values the graph's kernels take as parameters
-        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0, gvdwOn ? 1 : 0};
+    std::array<long long, 7> execKey[4];
+    std::array<long long, 7> graphKey() const {   // the host values the graph's kernels take as parameters
+        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0, gvdwOn ? 1 : 0, usePosF ? 1 : 0};
     }
     double pairRadius() const { return gvdwOn ? std::max(s.cutoff, rvdw) : s.cutoff; }
     void markSkipList();
@@ -1439,10 +1548,21 @@ struct Engine::Impl {
     long numCalls = 0;
 
     void field(bool withQ, const double* dvec, double* out);   // out == nullptr: leave fld + erec
-    void fieldDual();   // b = field(q, perm), T = field(x), together
+    void fieldDual(bool pairsDone);   // b = field(q, perm), T = field(x), together
     bool dualOrder() const { return s.order == 4 || s.order == 5 || s.order == 6 || s.order == 8; }
     void pme(bool withQ, bool final, int energyMode, double* acc10);
-    bool needList();
+    double boxChange() const;
+    bool listStaleBefore() const;
+    bool listStaleAfter() const;
+    double lastD2 = 0, lastS2 = 0;   // the last step's displacements (squared): since the build, the step
+    bool prevValid = false;          // posPrev holds the last evaluation's positions in this order
+    long numRepeats = 0, numRemaps = 0;
+    std::vector<int> giHost;   // the global indices of the local atoms (setAtoms)
+    double builtRadius = 0;    // the pair radius the list was built for
+    void remapList(const std::vector<int>& newOf);
+    DevArray<int> rmNewOf, rmStart, rmCand;
+    DevArray<float4> rmA, rmB;
+    DevArray<float4> posPrev;
     void buildList();
     const int* order() const { return externalList ? nullptr : cellAtomSorted.ptr; }   // of the pair kernels
     // the kernels stored by pairSetup (default) or computed in every pass (PGM_CUDA_KERNELS_ON_THE_FLY: slower
@@ -1455,21 +1575,26 @@ struct Engine::Impl {
         return KernelSource{storeKernels ? G12.ptr : nullptr, storeKernels && storeG03 ? G03.ptr : nullptr, rg.ptr,
                             (float) (s.cutoff*s.cutoff), (float) s.beta};
     }
-    HistPtrs histPtrs() { return HistPtrs{{hist[0].ptr, hist[1].ptr, hist[2].ptr, hist[3].ptr}}; }
+    HistPtrs histPtrs() { return HistPtrs{{hist[0].ptr, hist[1].ptr, hist[2].ptr, hist[3].ptr, hist[4].ptr}}; }
     void enqueuePre(bool dual);
     void enqueueCgInit(CondHandle h, bool useHandle, bool dual);
     void enqueueCgIteration(CondHandle h, bool useHandle);
     void enqueuePost(bool strain);
     void captureGraph(bool strain, bool dual);
+    Terms evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
+                   double* strain);
+    // positions straight from the caller's (registered) float array
+    const float* regPtr = nullptr;
+    size_t regBytes = 0;
+    bool usePosF = false;
+    DevArray<float> pos3, qF;
+    bool registerPositions(const float* p);
+    void uploadPositions();
     void releaseGraphs();
 };
 
-/** The list is stale when 2 max displacement + the box change exceeds the skin. */
-bool Engine::Impl::needList() {
-    if (externalList)
-        return false;
-    if (!haveList)
-        return true;
+/** The box change since the list build (sum of the row changes) [nm]. */
+double Engine::Impl::boxChange() const {
     double dH = 0;
     for (int a = 0; a < 3; a++) {
         double r2 = 0;
@@ -1477,13 +1602,27 @@ bool Engine::Impl::needList() {
             r2 += (boxD[a][c]-buildBox[a][c])*(boxD[a][c]-buildBox[a][c]);
         dH += std::sqrt(r2);
     }
-    CU(cudaMemsetAsync(maxDisp.ptr, 0, sizeof(unsigned), st));
-    maxDisplacement<<<std::min(blocksFor(n, 256), 1024), 256, 0, st>>>(n, posq.ptr, posBuild.ptr, maxDisp.ptr);
-    CU(cudaMemcpyAsync(dispH.ptr, maxDisp.ptr, sizeof(unsigned), cudaMemcpyDeviceToHost, st));
-    CU(cudaStreamSynchronize(st));
+    return dH;
+}
+
+/* The list check runs inside the evaluation (displacements, the first kernel): before a step the host
+ * predicts from the last step's displacement plus twice the last step's largest move whether the list will
+ * still be good, and rebuilds if not; after the step it checks the actual displacement and, should it be
+ * beyond the skin after all, rebuilds and repeats the evaluation (which the history layout allows). */
+bool Engine::Impl::listStaleBefore() const {
+    if (externalList)
+        return false;
+    if (!haveList)
+        return true;
+    return 2*(std::sqrt(lastD2)+2*std::sqrt(lastS2))+boxChange() > skinNow;
+}
+
+bool Engine::Impl::listStaleAfter() const {
+    if (externalList)
+        return false;
     float d2;
     std::memcpy(&d2, dispH.ptr, sizeof(float));
-    return 2*std::sqrt((double) d2)+dH > skinNow;
+    return 2*std::sqrt((double) d2)+boxChange() > skinNow;
 }
 
 void Engine::Impl::buildList() {
@@ -1554,6 +1693,8 @@ void Engine::Impl::buildList() {
     CU(cudaMemcpyAsync(posBuild.ptr, posq.ptr, n*sizeof(float4), cudaMemcpyDeviceToDevice, st));
     std::memcpy(buildBox, boxD, sizeof(buildBox));
     haveList = true;
+    builtRadius = pairRadius();
+    lastD2 = 0;
     skipsMarked = false;
     numBuilds++;
 }
@@ -1635,14 +1776,16 @@ void Engine::Impl::field(bool withQ, const double* dvec, double* out) {
         combineField<<<blocksFor(m, 256), 256, 0, st>>>(m, fld.ptr, erec.ptr, dvec, cs, out);
 }
 
-void Engine::Impl::fieldDual() {
+void Engine::Impl::fieldDual(bool pairsDone) {
     const int m = 3*n, K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], P = s.order;
     const size_t gsize = (size_t) K1*K2*K3, csize = (size_t) K1*K2*(K3/2+1);
-    toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
-    toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
-    const int warpsPerBlock = 4, threads = 32*warpsPerBlock, blocks = (n+warpsPerBlock-1)/warpsPerBlock;
-    fieldPassDual<<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr, dipF.ptr,
-                                              dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
+    if (!pairsDone) {   // (else pairSetupDual did the pair part)
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
+        const int warpsPerBlock = 4, threads = 32*warpsPerBlock, blocks = (n+warpsPerBlock-1)/warpsPerBlock;
+        fieldPassDual<<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
+                                                  dipF.ptr, dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
+    }
     CU(cudaMemsetAsync(gridFix.ptr, 0, 2*gsize*sizeof(ull), st));
 #define PGM_DUAL(PC)                                                                                           \
     spreadDual<PC><<<(n+3)/4, 128, 0, st>>>(n, posq.ptr, dipF.ptr, dipF2.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
@@ -1671,20 +1814,68 @@ void Engine::Impl::fieldDual() {
 
 /** Pairs, covalent dipoles, splines; polarizable: b = the field of the charges and permanent dipoles, the
  * initial guess x and T x (dual: the guess from the history, both fields together). */
+void Engine::Impl::uploadPositions() {
+    CU(cudaMemcpyAsync(pos3.ptr, regPtr, 3*(size_t) n*sizeof(float), cudaMemcpyHostToDevice, st));
+    packPositions<<<blocksFor(n, 256), 256, 0, st>>>(n, pos3.ptr, qF.ptr, posq.ptr);
+}
+
+/** Registers the caller's position array (once per address and size); false if CUDA refuses. */
+bool Engine::Impl::registerPositions(const float* p) {
+    const size_t bytes = 3*(size_t) n*sizeof(float);
+    if (p == regPtr && bytes == regBytes)
+        return true;
+    if (regPtr) {
+        cudaHostUnregister(const_cast<float*>(regPtr));
+        regPtr = nullptr;
+        regBytes = 0;
+    }
+    if (std::getenv("PGM_CUDA_NO_REGISTER")
+        || cudaHostRegister(const_cast<float*>(p), bytes, cudaHostRegisterDefault) != cudaSuccess) {
+        cudaGetLastError();   // (clear it)
+        return false;
+    }
+    regPtr = p;
+    regBytes = bytes;
+    pos3.resize(3*(size_t) n);
+    g_allocations++;   // the graph's copy reads from this address
+    return true;
+}
+
 void Engine::Impl::enqueuePre(bool dual) {
     const int m = 3*n;
+    if (usePosF)
+        uploadPositions();
+    if (!externalList) {
+        CU(cudaMemsetAsync(maxDisp.ptr, 0, 2*sizeof(unsigned), st));
+        displacements<<<std::min(blocksFor(n, 256), 1024), 256, 0, st>>>(n, posq.ptr, posBuild.ptr, posPrev.ptr,
+                                                                          maxDisp.ptr);
+        CU(cudaMemcpyAsync(dispH.ptr, maxDisp.ptr, 2*sizeof(unsigned), cudaMemcpyDeviceToHost, st));
+    }
     const int warpsPerBlock = 4, threads = 32*warpsPerBlock;
     const int pblocks = (n+warpsPerBlock-1)/warpsPerBlock;
     const float rc2 = (float) (s.cutoff*s.cutoff), rp2 = (float) (pairRadius()*pairRadius()), beta = (float) s.beta;
-    if (externalList)
-        pairSetup<true><<<pblocks, threads, 0, st>>>(n, nullptr, atomStart.ptr, candJ.ptr, candT.ptr, posq.ptr,
-                                                     rg.ptr, rc2, rp2, beta, PJ.ptr, storeKernels ? G12.ptr : nullptr, storeG03 ? G03.ptr : nullptr, pairEnd.ptr);
-    else
-        pairSetup<false><<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, nullptr,
-                                                      posq.ptr, rg.ptr, rc2, rp2, beta, PJ.ptr, storeKernels ? G12.ptr : nullptr, storeG03 ? G03.ptr : nullptr,
-                                                      pairEnd.ptr);
+    // the pairs together with the first field pass (dual, own list, stored kernels), or on their own
+    const bool fused = dual && polarizable && !externalList && storeKernels;
     permDipolesKernel<<<blocksFor(n, 128), 128, 0, st>>>(n, posq.ptr, covStart.ptr, covPartnerSorted.ptr,
                                                          covStrengthSorted.ptr, perm.ptr);
+    if (fused) {
+        initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr, b.ptr,
+                                                        x.ptr);   // the predictor: b not needed
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
+        pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
+                                                   rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
+                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr);
+    }
+    else if (externalList)
+        pairSetup<true><<<pblocks, threads, 0, st>>>(n, nullptr, atomStart.ptr, candJ.ptr, candT.ptr, posq.ptr,
+                                                     rg.ptr, rc2, rp2, beta, PJ.ptr, storeKernels ? G12.ptr : nullptr,
+                                                     storeG03 ? G03.ptr : nullptr, pairEnd.ptr);
+    else
+        pairSetup<false><<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, nullptr,
+                                                      posq.ptr, rg.ptr, rc2, rp2, beta, PJ.ptr,
+                                                      storeKernels ? G12.ptr : nullptr, storeG03 ? G03.ptr : nullptr,
+                                                      pairEnd.ptr);
 #define PGM_SPLINES(PC)                                                                                     \
     splines<PC><<<blocksFor(3*n, 128), 128, 0, st>>>(n, s.order, posq.ptr, s.grid[0], s.grid[1], s.grid[2],    \
                                                      theta.ptr, dtheta.ptr, d2theta.ptr, gidx.ptr)
@@ -1701,9 +1892,10 @@ void Engine::Impl::enqueuePre(bool dual) {
         return;
     }
     if (dual) {
-        initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr, b.ptr,
-                                                        x.ptr);   // the predictor: b not needed
-        fieldDual();
+        if (!fused)
+            initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr,
+                                                            b.ptr, x.ptr);   // the predictor: b not needed
+        fieldDual(fused);
         return;
     }
     field(true, perm.ptr, b.ptr);
@@ -1864,11 +2056,11 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     impl->mod3.upload(mf[2].data(), K3);
     impl->scal.resize(16);
     impl->acc.resize(NACC);
-    impl->maxDisp.resize(1);
+    impl->maxDisp.resize(2);
     impl->ctl.resize(1);
     impl->accH.resize(NACC);
     impl->scalH.resize(16);
-    impl->dispH.resize(1);
+    impl->dispH.resize(2);
     impl->boxH.resize(1);
     impl->ctlH.resize(1);
     impl->useGraphs = PGM_CUDA_GRAPHS && std::getenv("PGM_CUDA_NO_GRAPH") == nullptr;
@@ -1876,6 +2068,8 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
 
 Engine::~Engine() {
     impl->releaseGraphs();
+    if (impl->regPtr)
+        cudaHostUnregister(const_cast<float*>(impl->regPtr));
     if (impl->planF)
         cufftDestroy(impl->planF);
     if (impl->planB)
@@ -1897,6 +2091,22 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
     const bool resized = (n != I.n || numGlobal != I.nGlobal);
     if (resized)
         I.numHist = 0;
+    // the same atoms in another order: keep the list (renamed) instead of building it again
+    std::vector<int> newOf;
+    if (!resized && I.haveList && !I.externalList && globalIndex && (int) I.giHost.size() == n) {
+        std::vector<int> localOf(numGlobal, -1);
+        for (int i = 0; i < n; i++)
+            if (globalIndex[i] >= 0 && globalIndex[i] < numGlobal)
+                localOf[globalIndex[i]] = i;
+        newOf.resize(n);
+        for (int i = 0; i < n && !newOf.empty(); i++) {
+            const int g = I.giHost[i];
+            if (g < 0 || g >= numGlobal || localOf[g] < 0)
+                newOf.clear();
+            else
+                newOf[i] = localOf[g];
+        }
+    }
     I.n = n;
     I.nGlobal = numGlobal;
     I.alpha.resize(n);
@@ -1914,9 +2124,15 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
     I.rg.upload(rgH.data(), n);
     I.alphaD.upload(I.alpha.data(), n);
     I.globalIdx.upload(gi.data(), n);
+    I.giHost = gi;
+    {
+        std::vector<float> qh(q, q+n);
+        I.qF.upload(qh.data(), n);
+    }
     const int m = 3*n;
     I.posq.resize(n);
     I.posBuild.resize(n);
+    I.posPrev.resize(n);
     I.posqH.resize(n);
     I.fH.resize(m);
     for (int i = 0; i < n; i++)
@@ -1928,6 +2144,7 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
         I.dipF2.zero(n);
         for (auto& h : I.hist)
             h.zero(3*(size_t) numGlobal);
+        I.lastS2 = 0;
         I.dipF.zero(n);
         I.atomStart.zero(n+1);
         I.pairEnd.zero(n);
@@ -1940,10 +2157,48 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
     I.gidx.resize((size_t) 3*n);
     I.mu.assign(m, 0.0);
     I.permH.assign(m, 0.0);
-    I.haveList = false;
+    const bool keep = !newOf.empty();
+    if (keep) {
+        I.remapList(newOf);
+        I.numRemaps++;
+    }
+    else {
+        I.haveList = false;
+        I.prevValid = false;
+    }
     I.externalList = false;
     I.gvdwOn = false;   // setGvdw again for the new order
+    I.skipsMarked = false;
     I.cellAtomSorted.resize(n);
+}
+
+void Engine::Impl::remapList(const std::vector<int>& newOf) {
+    // (persistent scratch: a reallocation would mean capturing the graph again)
+    DevArray<int>& newOfD = rmNewOf;
+    DevArray<int>& start2 = rmStart;
+    DevArray<int>& cand2 = rmCand;
+    newOfD.upload(newOf.data(), n);
+    count.resize(n+1);
+    remapCounts<<<blocksFor(n+1, 256), 256, 0, st>>>(n, newOfD.ptr, atomStart.ptr, count.ptr);
+    start2.resize(n+1);
+    size_t bytes = 0;
+    CU(cub::DeviceScan::ExclusiveSum(nullptr, bytes, count.ptr, start2.ptr, n+1, st));
+    cubTemp.resize(bytes);
+    CU(cub::DeviceScan::ExclusiveSum(cubTemp.ptr, bytes, count.ptr, start2.ptr, n+1, st));
+    cand2.resize(std::max(candJ.size, (size_t) 1));
+    remapRows<<<(n+3)/4, 128, 0, st>>>(n, newOfD.ptr, atomStart.ptr, candJ.ptr, start2.ptr, cand2.ptr);
+    // back into the same buffers (the graph keeps its pointers)
+    CU(cudaMemcpyAsync(atomStart.ptr, start2.ptr, (n+1)*sizeof(int), cudaMemcpyDeviceToDevice, st));
+    CU(cudaMemcpyAsync(candJ.ptr, cand2.ptr, ncand*sizeof(int), cudaMemcpyDeviceToDevice, st));
+    DevArray<float4>& a2 = rmA;
+    DevArray<float4>& b2 = rmB;
+    a2.resize(n);
+    b2.resize(n);
+    remapAtoms<<<blocksFor(n, 256), 256, 0, st>>>(n, newOfD.ptr, posBuild.ptr, posPrev.ptr, a2.ptr, b2.ptr,
+                                                  cellAtomSorted.ptr);
+    CU(cudaMemcpyAsync(posBuild.ptr, a2.ptr, n*sizeof(float4), cudaMemcpyDeviceToDevice, st));
+    CU(cudaMemcpyAsync(posPrev.ptr, b2.ptr, n*sizeof(float4), cudaMemcpyDeviceToDevice, st));
+    CU(cudaStreamSynchronize(st));
 }
 
 void Engine::setGvdw(int repulsion, double rvdw, const double* sqrtA, const double* sqrtC6, const double* b,
@@ -1972,12 +2227,11 @@ void Engine::setGvdw(int repulsion, double rvdw, const double* sqrtA, const doub
         std::sort(part.begin()+start[i], part.begin()+start[i+1]);
     I.skipStart.upload(start.data(), n+1);
     I.skipJ.upload(part.data(), part.size());
-    const bool radiusChanged = !I.gvdwOn || I.rvdw != rvdw;
     I.gvdwOn = true;
     I.gvdwSlater = (repulsion == 1);
     I.rvdw = rvdw;
-    if (radiusChanged)
-        I.haveList = false;   // the list radius may change
+    if (I.pairRadius() > I.builtRadius)
+        I.haveList = false;   // the list is for a smaller radius
     I.skipsMarked = false;
 }
 
@@ -2050,7 +2304,18 @@ void Engine::setCandidates(int nseg, const int* segI, const int* segShift, const
 }
 
 Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, double* f, double* strain) {
-    Impl& I = *impl;
+    return impl->evaluate(pos, nullptr, box, newStep, f, strain);
+}
+
+Terms Engine::computeF(const float* pos, const double box[3][3], bool newStep, double* strain) {
+    return impl->evaluate(nullptr, pos, box, newStep, nullptr, strain);
+}
+
+const double* Engine::forces() const { return impl->fH.ptr; }
+
+Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
+                             double* strain) {
+    Impl& I = *this;
     const int n = I.n, m = 3*n;
     const Settings& s = I.s;
     CU(cudaSetDevice(s.device));   // the calling thread may be another than the constructor's
@@ -2080,19 +2345,30 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
         }
     bx.vol = (float) I.volume;
     float4* pq = I.posqH.ptr;
-    for (int i = 0; i < n; i++) {
-        pq[i].x = (float) pos[3*i];
-        pq[i].y = (float) pos[3*i+1];
-        pq[i].z = (float) pos[3*i+2];
-    }
+    // float positions in host memory registered with CUDA: the upload and the packing with the charges
+    // are part of the evaluation (graph); else packed here into pinned memory
+    I.usePosF = posF && I.registerPositions(posF);
+    if (posF && !I.usePosF)
+        for (int i = 0; i < n; i++) {
+            pq[i].x = posF[3*i];
+            pq[i].y = posF[3*i+1];
+            pq[i].z = posF[3*i+2];
+        }
+    else if (!posF)
+        for (int i = 0; i < n; i++) {
+            pq[i].x = (float) pos[3*i];
+            pq[i].y = (float) pos[3*i+1];
+            pq[i].z = (float) pos[3*i+2];
+        }
     CU(cudaMemcpyToSymbolAsync(c_box, I.boxH.ptr, sizeof(Box), 0, cudaMemcpyHostToDevice, I.st));
-    CU(cudaMemcpyAsync(I.posq.ptr, pq, n*sizeof(float4), cudaMemcpyHostToDevice, I.st));
+    if (!I.usePosF)
+        CU(cudaMemcpyAsync(I.posq.ptr, pq, n*sizeof(float4), cudaMemcpyHostToDevice, I.st));
+    else if (I.listStaleBefore())
+        I.uploadPositions();   // the list build needs them before the evaluation
     I.muValid = I.permValid = false;
     const double tB = I.timing ? wallSeconds() : 0;
-    if (I.needList())
+    if (I.listStaleBefore())
         I.buildList();
-    if (I.gvdwOn && !I.skipsMarked)
-        I.markSkipList();
 
     // the initial guess and the history slots
     Control& c = *I.ctlH.ptr;
@@ -2109,7 +2385,7 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
         c.c[0] = 1;
     c.head = I.head;
     const bool push = I.polarizable && (newStep || h == 0);
-    c.pushSlot = push ? (I.head+3)%4 : -1;   // the oldest slot becomes the newest
+    c.pushSlot = push ? (I.head+NHIST-1)%NHIST : -1;   // a slot the guess does not read becomes the newest
     CU(cudaMemcpyAsync(I.ctl.ptr, I.ctlH.ptr, sizeof(Control), cudaMemcpyHostToDevice, I.st));
 
     const bool wantStrain = (strain != nullptr);
@@ -2119,32 +2395,53 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
     const double tC = I.timing ? wallSeconds() : 0;
     int it = 0;
     double err = 0;
-    if (I.useGraphs) {
-        const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
-        if (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey())
-            I.captureGraph(wantStrain, dual);
-        CU(cudaGraphLaunch(I.exec[v], I.st));
-        CU(cudaStreamSynchronize(I.st));
-        it = (int) I.scalH.ptr[9];
-        err = I.scalH.ptr[2];
-    }
-    else {
-        I.enqueuePre(dual);
-        if (I.polarizable) {
-            I.enqueueCgInit(0, false, dual);
-            CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (I.gvdwOn && !I.skipsMarked)
+            I.markSkipList();
+        if (I.useGraphs) {
+            const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
+            if (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey())
+                I.captureGraph(wantStrain, dual);
+            CU(cudaGraphLaunch(I.exec[v], I.st));
             CU(cudaStreamSynchronize(I.st));
+            it = (int) I.scalH.ptr[9];
             err = I.scalH.ptr[2];
-            while (err > s.tol && it < s.maxIter) {
-                I.enqueueCgIteration(0, false);
+        }
+        else {
+            it = 0;
+            I.enqueuePre(dual);
+            if (I.polarizable) {
+                I.enqueueCgInit(0, false, dual);
                 CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
                 CU(cudaStreamSynchronize(I.st));
                 err = I.scalH.ptr[2];
-                it++;
+                while (err > s.tol && it < s.maxIter) {
+                    I.enqueueCgIteration(0, false);
+                    CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
+                    CU(cudaStreamSynchronize(I.st));
+                    err = I.scalH.ptr[2];
+                    it++;
+                }
             }
+            I.enqueuePost(wantStrain);
+            CU(cudaStreamSynchronize(I.st));
         }
-        I.enqueuePost(wantStrain);
-        CU(cudaStreamSynchronize(I.st));
+        if (attempt == 0 && !I.externalList) {   // this step's largest move (not over a reordering)
+            float s2;
+            std::memcpy(&s2, I.dispH.ptr+1, sizeof(float));
+            if (I.prevValid)
+                I.lastS2 = s2;
+            I.prevValid = true;
+        }
+        if (!I.listStaleAfter())
+            break;
+        I.buildList();   // the prediction failed: rebuild and repeat
+        I.numRepeats++;
+    }
+    if (!I.externalList) {
+        float d2;
+        std::memcpy(&d2, I.dispH.ptr, sizeof(float));
+        I.lastD2 = d2;
     }
     const double tD = I.timing ? wallSeconds() : 0;
     if (!I.polarizable)
@@ -2186,9 +2483,11 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
         I.tPhase[2] += tD-tC;
         I.tPhase[3] += tE-tD;
         if (++I.numCalls%1000 == 0)
-            fprintf(stderr, "pgm_cuda ms per call (%ld): inputs %.3f, list check/build %.3f, GPU %.3f, outputs %.3f\n",
+            fprintf(stderr,
+                    "pgm_cuda ms per call (%ld): inputs %.3f, list builds %.3f, GPU %.3f, outputs %.3f; %ld builds, "
+                    "%ld repeated evaluations\n",
                     I.numCalls, 1e3*I.tPhase[0]/I.numCalls, 1e3*I.tPhase[1]/I.numCalls, 1e3*I.tPhase[2]/I.numCalls,
-                    1e3*I.tPhase[3]/I.numCalls);
+                    1e3*I.tPhase[3]/I.numCalls, I.numBuilds, I.numRepeats);
     }
     return t;
 }
