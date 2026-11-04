@@ -262,6 +262,34 @@ int main(int argc, char** argv) {
         ownOk = ownOk && fabs(relE) < 1e-5 && dFg < 1e-4*Fgmax && dSg < 1e-4*Sgmax;
     }
 
+    // with the mu4 predictor over a few moved steps (the dual first field pass; PGM_CUDA_NO_DUAL=1 for the
+    // separate passes: the same numbers to rounding) against pgm_core at each step
+    {
+        pgmcuda::Settings ps = cs;
+        ps.predictor = 2;
+        pgmcuda::Engine pe(ps);
+        pe.setAtoms(n, top.q.data(), top.radius.data(), top.alpha.data(), nullptr, n);
+        pe.setCovalent(ncov, top.covAtom.data(), top.covPartner.data(), top.covStrength.data());
+        srand(11);
+        vector<double> pm2 = pd;
+        double worst = 0;
+        for (int step = 0; step < 6; step++) {
+            for (auto& v : pm2)
+                v += 0.002*(2.0*rand()/RAND_MAX-1.0);
+            vector<pgmcore::V3> pv(n);
+            for (int i = 0; i < n; i++)
+                pv[i] = pgmcore::V3{pm2[3*i], pm2[3*i+1], pm2[3*i+2]};
+            vector<pgmcore::V3> Fc(n, pgmcore::V3{0, 0, 0});
+            ref.compute(pv, box, &Fc);
+            const pgmcuda::Terms Tp = pe.compute(pm2.data(), B, true, nullptr, nullptr);
+            const double rel = (Tp.total()-ref.terms().total())/fabs(ref.terms().total());
+            worst = max(worst, fabs(rel));
+            printf("  predictor step %d: total %.10f, %d iterations, rel. diff to core %.3e\n", step, Tp.total(),
+                   pe.iterations(), rel);
+        }
+        ownOk = ownOk && worst < 1e-6;
+    }
+
     // timing: repeated evaluations at tolerance 1e-5 with the predictor (same positions: iterations ~0)
     const int reps = 50;
     auto t0 = chrono::steady_clock::now();

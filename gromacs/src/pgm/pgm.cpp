@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -74,7 +75,9 @@ namespace
 
 /*! \brief One worker thread that runs one job at a time (the GPU part of a step while the calling
  * thread does the CPU short-range work).  Not pinned: the mdrun threads are, and the worker mostly
- * waits on the GPU. */
+ * waits on the GPU.  Both hand-overs spin for a while before they block (a futex wake-up of a thread
+ * that went to sleep costs up to 0.1 ms, a tenth of a step): the worker waits for the next job, the
+ * caller for the result. */
 class PgmWorker
 {
 public:
@@ -99,16 +102,18 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             job_   = std::move(job);
-            busy_  = true;
             error_ = nullptr;
+            busy_.store(true, std::memory_order_release);
+            pending_.store(true, std::memory_order_release);
         }
         wake_.notify_all();
     }
     //! wait for the job; rethrows its exception
     void wait()
     {
+        spinWhile([this] { return busy_.load(std::memory_order_acquire); });
         std::unique_lock<std::mutex> lock(mutex_);
-        done_.wait(lock, [this] { return !busy_; });
+        done_.wait(lock, [this] { return !busy_.load(std::memory_order_acquire); });
         if (error_)
         {
             std::rethrow_exception(error_);
@@ -116,7 +121,23 @@ public:
     }
 
 private:
-    void loop()
+    //! spin while cond() holds, at most c_spinSeconds
+    template<class Cond>
+    static void spinWhile(Cond cond)
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        int        k  = 0;
+        while (cond())
+        {
+            if (++k % 1024 == 0
+                && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > c_spinSeconds)
+            {
+                return;
+            }
+        }
+    }
+    static constexpr double c_spinSeconds = 0.005;
+    void                    loop()
     {
 #ifdef __linux__
         cpu_set_t set;
@@ -128,16 +149,18 @@ private:
         }
         pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 #endif
-        std::unique_lock<std::mutex> lock(mutex_);
         while (true)
         {
-            wake_.wait(lock, [this] { return quit_ || static_cast<bool>(job_); });
-            if (quit_)
+            spinWhile([this] { return !pending_.load(std::memory_order_acquire) && !quit_.load(); });
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait(lock, [this] { return quit_.load() || pending_.load(std::memory_order_acquire); });
+            if (quit_.load())
             {
                 return;
             }
             std::function<void()> job = std::move(job_);
             job_                      = nullptr;
+            pending_.store(false, std::memory_order_release);
             lock.unlock();
             std::exception_ptr error;
             try
@@ -150,7 +173,8 @@ private:
             }
             lock.lock();
             error_ = error;
-            busy_  = false;
+            busy_.store(false, std::memory_order_release);
+            lock.unlock();
             done_.notify_all();
         }
     }
@@ -158,7 +182,7 @@ private:
     std::mutex              mutex_;
     std::condition_variable wake_, done_;
     std::function<void()>   job_;
-    bool                    busy_ = false, quit_ = false;
+    std::atomic<bool>       busy_{ false }, pending_{ false }, quit_{ false };
     std::exception_ptr      error_;
 };
 
@@ -408,12 +432,13 @@ public:
 #if GMX_GPU_CUDA
     std::unique_ptr<pgmcuda::Engine> gpu_;
     std::vector<int>                 gpuAtoms_; // the global indices the engine has
-    std::vector<double>              gpuPos_, gpuF_, gpuS_;
+    std::vector<double>              gpuF_, gpuS_;
     pgmcuda::Terms                   gpuTerms_;
 #endif
     PgmWorker gpuWorker_;
     bool      gpuPending_ = false, launched_ = false, lastTopologyChanged_ = false, wantVirial_ = true;
     double    tWait_ = 0, tPrep_ = 0, tFinish_ = 0, tLaunchEnd_ = 0, tBetween_ = 0;
+    double    tSubmit_ = 0, tJobEnd_ = 0, tWakeWorker_ = 0, tWakeMain_ = 0; // worker hand-over latencies
     void      prepare(ArrayRef<const RVec>          xIn,
                       const matrix                  box,
                       int                           numHomeAtoms,
@@ -1420,21 +1445,17 @@ void PgmElectrostatics::Impl::startGpu(bool topologyChanged)
         }
     }
     tCand_ += now() - tc0;
-    gpuPos_.resize(3 * n_);
     gpuF_.assign(3 * n_, 0.0);
     gpuS_.assign(9, 0.0);
-    for (int i = 0; i < n_; i++)
-    {
-        for (int k = 0; k < DIM; k++)
-        {
-            gpuPos_[3 * i + k] = pos_[i][k];
-        }
-    }
+    static_assert(sizeof(DVec) == 3 * sizeof(double), "pos_ is passed as 3n doubles");
+    tSubmit_ = now();
     auto job = [this]()
     {
         const double tg0 = now();
-        gpuTerms_ = gpu_->compute(gpuPos_.data(), box_, true, gpuF_.data(), wantVirial_ ? gpuS_.data() : nullptr);
-        tPme_ += now() - tg0; // the whole GPU part (GMX_PGM_TIMING: "PME")
+        tWakeWorker_ += tg0 - tSubmit_;
+        gpuTerms_ = gpu_->compute(reinterpret_cast<const double*>(pos_.data()), box_, true, gpuF_.data(), wantVirial_ ? gpuS_.data() : nullptr);
+        tJobEnd_ = now();
+        tPme_ += tJobEnd_ - tg0; // the whole GPU part (GMX_PGM_TIMING: "PME")
     };
     if (std::getenv("GMX_PGM_GPU_SYNC"))
     {
@@ -1465,6 +1486,7 @@ void PgmElectrostatics::Impl::finishGpu(ForceWithVirial* forceWithVirial, gmx_en
         gmx_fatal(FARGS, "pGM on the GPU: %s", e.what());
     }
     tWait_ += now() - tw0;
+    tWakeMain_ += std::max(0.0, now() - std::max(tJobEnd_, tw0));
     if (tLaunchEnd_ > 0)
     {
         tBetween_ += tw0 - tLaunchEnd_; // CPU work between the launch and here
@@ -1507,9 +1529,10 @@ void PgmElectrostatics::Impl::finishGpu(ForceWithVirial* forceWithVirial, gmx_en
         const double c = 1e3 / (numCalls_ + 1);
         fprintf(stderr,
                 "pGM GPU ms per call (%ld calls): launch (setup + atoms) %.3f, CPU work meanwhile %.3f, "
-                "GPU engine %.3f, waiting + outputs %.3f (waiting %.3f), step %.3f; %ld list builds, %d "
-                "candidates\n",
-                numCalls_ + 1, c * tPrep_, c * tBetween_, c * tPme_, c * tFinish_, c * tWait_,
+                "GPU engine %.3f, waiting + outputs %.3f (waiting %.3f; hand-over to the worker %.3f, back "
+                "%.3f), step %.3f; %ld list builds, %d candidates\n",
+                numCalls_ + 1, c * tPrep_, c * tBetween_, c * tPme_, c * tFinish_, c * tWait_, c * tWakeWorker_,
+                c * tWakeMain_,
                 c * (now() - tStart_), gpu_->listBuilds(), gpu_->numCandidates());
     }
 #else

@@ -44,10 +44,10 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
   q = 0 atoms with a dipole or polarizability (or `includeAllPairs`), so their clusters stay in the list.
 * **Domain decomposition** (later): halo exchange of the search direction / dipoles and reduction of the
   fields per CG iteration with `dd_move_x` / `dd_move_f`-style calls on rvec arrays.
-* **GPU** (G3, done): the whole pGM electrostatics in a separate engine, `core/cuda/pgm_cuda` (own pair
-  list, PME of charges and dipoles with cuFFT, CG on the device, one CUDA graph per step), started by
-  `do_force` before the CPU short-range kernels on a worker thread and collected at the pGM hook; LJ and
-  GVDW stay on the CPU (`-nb cpu`).  See G3 below.
+* **GPU** (G3, done): the whole pGM electrostatics and the combination-rule GVDW in a separate engine,
+  `core/cuda/pgm_cuda` (own pair list, PME of charges and dipoles with cuFFT, CG on the device, one CUDA
+  graph per step), started by `do_force` before the CPU short-range kernels on a worker thread and
+  collected at the pGM hook; LJ stays on the CPU (`-nb cpu`).  See G3 below.
 
 ## Input
 
@@ -285,62 +285,77 @@ global coordinates (O(N^2), for testing) and lists missing ones on one rank.
 
 ### G3 (done): the GPU
 
-`GMX_PGM_GPU=1` with a CUDA build, one rank, `-nb cpu`: the pGM electrostatics run in
-`core/cuda/pgm_cuda.{h,cu}` (`pgmcuda::Engine`, also usable outside GROMACS), compiled as a static
-library next to the module (libgromacs's CUDA flags forbid double precision; `g3_gpu.py` links it).
-GVDW, LJ, bonded terms and everything else stay on the CPU path.
+`GMX_PGM_GPU=1` with a CUDA build, one rank, `-nb cpu`: the pGM electrostatics and the combination-rule
+GVDW run in `core/cuda/pgm_cuda.{h,cu}` (`pgmcuda::Engine`, also usable outside GROMACS), compiled as a
+static library next to the module (libgromacs's CUDA flags forbid double precision; `g3_gpu.py` links
+it).  GVDW overrides and the dispersion tail, LJ, bonded terms and everything else stay on the CPU path.
 
 * **Pairs**: the engine's own list instead of the nbnxm lists (whose transfer cost more than the whole
-  GPU step): a cell list on the GPU (cells rl/2 wide, atoms sorted by cell with a stable radix sort, so
-  the list is deterministic), per atom the full list of the atoms within rl = rc + skin (0.15 nm, less in
-  small boxes; minimum image), rebuilt when an atom has moved by more than skin/2 or the box changed
-  (`GMX_PGM_GPU_SKIN`); GROMACS's reordering at every pair search also rebuilds it.  Each step one pass
-  compacts the pairs within rc (warp ballot, candidate order) with their kernels G1, G2 (field passes) and
-  G0, G3 (final pass); one warp per atom over its full list, so no atomics in the pair passes.
+  GPU step): a cell list on the GPU (cells rl/2 wide, atoms sorted by cell with a stable radix sort),
+  per atom the full list of the atoms within rl = max(rc, rvdw) + skin (0.15 nm, less in small boxes;
+  minimum image), built with one block per cell and neighbour slab (the neighbour atoms read once per
+  cell through shared memory; deterministic order), rebuilt when an atom has moved by more than skin/2
+  or the box changed (`GMX_PGM_GPU_SKIN`); GROMACS's reordering at every pair search also rebuilds it.
+  Each step one pass compacts the pairs within the radius (warp ballot) with their kernels G1, G2;
+  the final pass computes all four itself.  One warp per atom over its full list: no atomics.
+* **GVDW** (`Engine::setGvdw`): per-atom sqrt A, sqrt C6, b, the excluded and the overridden pairs as
+  per-atom skip lists, marked once per list build in the partner index; the pair (core/gvdw_kernel.h in
+  float) in the final pass.
 * **Precision** as OpenMM's mixed mode: pair kernels, splines and grids in float, PME grid and covalent
   forces in 64-bit fixed point (2^32), the CG vectors, dipoles, energies and the strain in double.
-* **PME**: splines once per step; spread one warp per atom over the p^3 points with the spline values in
-  lanes (shuffles); cuFFT R2C/C2R; gather one thread per atom with the splines in registers (the
-  instantiation with the second derivatives is the faster one on sm_120, so every gather uses it).
-* **CG**: Jacobi PCG over many blocks with atomic reductions, the mu3/mu4 predictor history on the device
-  in the global order, peek.  The whole evaluation (pairs, the permanent field, the guess, the CG loop
-  as a conditional while node, peek, history, final pass, reductions, copies to pinned host memory) is
-  one CUDA graph (CUDA >= 12.4; `PGM_CUDA_NO_GRAPH=1` runs the same kernels with a host-side loop); the
-  box is in constant memory, so the graph is only captured again when buffers grow.  The strain
-  derivative only on virial steps.
+* **PME**: splines once per step (one thread per atom and dimension, the order a template parameter);
+  spread one warp per atom over the p^3 points with the spline values in lanes (shuffles); cuFFT R2C/C2R;
+  gather one thread per atom with the splines in registers (the instantiation with the second
+  derivatives is the faster one on sm_120, so every gather uses it).
+* **CG**: Jacobi PCG over many blocks with atomic reductions, the scalars and the loop condition in the
+  last block of a reduction kernel; the mu3/mu4 predictor history on the device in the global order;
+  peek.  When the guess comes from the history, the permanent field and the guess's field are one pair
+  pass, one spread into two grids and one batched FFT pair.
+* **One CUDA graph per step** (CUDA >= 12.4; `PGM_CUDA_NO_GRAPH=1` runs the same kernels with a host
+  loop): pairs, the first fields, the CG loop as a conditional while node, peek, history, final pass,
+  reductions, copies to pinned host memory; the box in constant memory, so the graph is captured again
+  only when buffers grow.  The strain derivative only on virial steps.
 * **Overlap**: `PgmElectrostatics::launch` (a second hook in `do_force`, before the CPU nonbonded
   kernels) starts the evaluation on a worker thread; `calculate` at the usual hook waits for it and adds
-  forces, virial and energies.
+  forces, virial and energies.  Both hand-overs spin before they block (a sleeping thread's wake-up
+  cost up to 0.1 ms).
 
-Validation (`tests/gmx/gpu_check.sh`, GPU against the CPU path of the same mixed build):
+Validation (`tests/gmx/gpu_check.sh`, GPU against the CPU path of the same mixed build; relative
+differences, float output):
 
-| single point | Coulomb (SR) | Coul. recip. | pGM Polariz. | potential | pressure | max force diff (max \|F\|) |
-|---|---|---|---|---|---|---|
-| water512 | -2.9e-7 | -7e-8 | 1.3e-6 | -1.2e-7 | 0.06 bar | 7.8e-3 (3488) |
-| 4096 waters (benchmark settings) | -6.3e-7 | 0 | 9e-7 | -1.1e-7 | 0.04 bar | 1.5e-2 (1106) |
-| GVDW, overrides + tail | -1.9e-7 | 0 | 1.2e-6 | 0 | 0.03 bar | 9.4e-3 (3637) |
+| single point | LJ (SR) / GVDW | Coulomb (SR) | Coul. recip. | pGM Polariz. | potential | pressure | max force diff (max \|F\|) |
+|---|---|---|---|---|---|---|---|
+| water512 | 0 | -2.9e-7 | -7e-8 | 1.3e-6 | -1.2e-7 | 0.03 bar | 7.8e-3 (3488) |
+| 4096 waters (benchmark settings) | 0 | -6.3e-7 | 0 | 9e-7 | -1.1e-7 | 0.06 bar | 1.5e-2 (1106) |
+| GVDW, overrides + tail | 1.5e-6 | -1.9e-7 | 0 | 1.3e-6 | 0 | 0.002 bar | 1.1e-2 (3637) |
+| GVDW, 4096 waters | 1.2e-6 | -2.2e-7 | 0 | 1.4e-6 | -1.2e-7 | 0.009 bar | 2.4e-2 (3637) |
 
-(relative differences, float output).  `core/cuda/tests/test_cuda` checks the engine against pgm_core in
-double on a dump (total energy 7e-8 relative, dipoles 3e-6 relative, strain 8e-7) and its own list
-against given candidates and after displacements that rebuild it.  NVE, 4096 waters, 10 ps, 1 fs: total
-energy fluctuation 2.5 kJ/mol, drift -8.7 kJ/mol on the GPU, 2.0 and -7.3 kJ/mol on the CPU path.
-NPT water512 (C-rescale, 150 ps, GPU): density 1017.2 +- 1.8 kg/m^3, potential -2.11503e6 kJ/mol (CPU
-path: 1016.0 +- 4.2, -2.11497e6).
+`core/cuda/tests/test_cuda` checks the engine against pgm_core in double on a dump (total energy 7e-8
+relative, dipoles 3e-6 relative, strain 8e-7), its own list against given candidates and after
+displacements that rebuild it, GVDW against a double brute-force sum (1.5e-6), and the mu4 predictor
+over moved steps (1.3e-7 against pgm_core at every step).  NVE, 10 ps, 1 fs: 4096 waters total-energy
+fluctuation 2.6 kJ/mol and drift -8.9 kJ/mol on the GPU, 1.6 and -5.8 kJ/mol on the CPU path; with GVDW
+0.2 and +0.02 kJ/mol.  NPT water512 (C-rescale, 150 ps, the same seed): density 1020.6 +- 2.1
+kg/m^3 and potential -2.11509e6 kJ/mol on the GPU, 1022.9 +- 1.9 and -2.11509e6 on the CPU path (three
+GPU runs of the code's stages: 1017-1021).
 
 Speed, 4096 waters (12288 atoms), pmemd's benchmark settings (rc 0.9 nm, beta 4/nm, 56^3, order 6, tol
 1e-4, mu4, peek 0.65, 1 fs, NVE), RTX PRO 6000 Blackwell, 8 CPU threads, ns/day:
 
 | | ns/day |
 |---|---|
-| GROMACS, pGM on the GPU (G3) | 94.6 |
+| GROMACS, pGM on the GPU, LJ, nstlist 10 | 113 |
+| the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 137 |
+| GROMACS, pGM + GVDW on the GPU, nstlist 10 | 107 |
 | pmemd.pgm.cuda (SPFP) | 91.7 |
 | OpenMM plugin, CUDA mixed | 77.2 |
-| GROMACS, CPU path (8 threads) | 4.3 |
+| GROMACS, CPU path (8 threads), LJ | 4.3 |
 
-Per step (0.88 ms): launch 0.07 ms, GPU evaluation 0.55 ms (2 CG iterations; field pass 20 us, PME
-~60 us per field), of which the CPU's own nonbonded and other work hides 0.27 ms.  Ideas for more: one
-PME and one pair pass for the permanent field and the guess's field together (two grids in one complex
-FFT), the pair list kept across GROMACS's reordering, the GPU path with DD.
+Per step at nstlist 40 (0.59 ms): the GPU part 0.43 ms of kernels (2 CG iterations) plus 0.07 ms of
+host work (inputs, the list check, outputs), launch 0.05 ms, the CPU's own nonbonded work (0.26 ms)
+hidden behind the GPU, GROMACS's update and search the rest.  Tried and kept off: the kernels computed
+in every pass instead of stored (`PGM_CUDA_KERNELS_ON_THE_FLY`, slower), G0/G3 stored too
+(`PGM_CUDA_STORE_G03`, the same speed).
 
 ### Next
 
@@ -349,6 +364,9 @@ FFT), the pair list kept across GROMACS's reordering, the GPU path with DD.
    the potential to the ranks whose atoms need it; instead of the whole-grid sum + redundant FFT.
 2. **GPU with DD**: one engine per rank on its home + halo atoms (the module's halo communication), or
    one GPU engine for the whole system on the main rank.
+   One rank, smaller steps: the list kept across GROMACS's reordering (a permutation instead of a
+   rebuild), the displacement check inside the graph (one synchronisation less), LJ on the GPU too
+   (`-nb gpu` with the electrostatics off in nbnxm, or in the engine's final pass).
 3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
    (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
 
