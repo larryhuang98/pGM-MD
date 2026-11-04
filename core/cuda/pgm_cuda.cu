@@ -154,10 +154,17 @@ __device__ inline float3 unpackShift(int code, const Box& bx) {
 /** The pairs of atom i within the cut-off, compacted (in candidate order) to [atomStart[i], pairEnd[i]):
  * the partner j and the kernels G_1, G_2 (G12, the field passes) and G_0, G_3 (G03), x = r_i - r_j the
  * minimum image (SHIFTS: x = r_i + t.box - r_j as given, the same for pairs within the cut-off). */
+constexpr int SKIP_BIT = 1<<30;     // in a partner index: no combination-rule GVDW for this pair
+constexpr int INDEX_MASK = SKIP_BIT-1;
+
+/** The pairs of atom i within rp = max(rc, rvdw), compacted (in candidate order) to [atomStart[i],
+ * pairEnd[i]): the partner j (with SKIP_BIT) and the kernels G_1, G_2 (G12, the field passes) and G_0, G_3
+ * (G03; zero beyond rc), x = r_i - r_j the minimum image (SHIFTS: x = r_i + t.box - r_j as given, the same
+ * for pairs within the cut-off). */
 template<bool SHIFTS>
-__global__ void pairSetup(int n, const int* order, const int* atomStart, const int* candJ, const int* candT, const float4* posq,
-                          const float* rg, float rc2, float beta, int* PJ, float2* G12, float2* G03,
-                          int* pairEnd) {
+__global__ void pairSetup(int n, const int* order, const int* atomStart, const int* candJ, const int* candT,
+                          const float4* posq, const float* rg, float rc2, float rp2, float beta, int* PJ,
+                          float2* G12, float2* G03, int* pairEnd) {
     const Box bx = c_box;
     const int w = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
     if (w >= n)
@@ -171,10 +178,11 @@ __global__ void pairSetup(int n, const int* order, const int* atomStart, const i
     for (int k0 = atomStart[i]; k0 < end; k0 += 32) {
         const int k = k0+lane;
         bool inside = false;
-        int j = 0;
+        int jraw = 0, j = 0;
         float3 d = make_float3(0, 0, 0);
         if (k < end) {
-            j = candJ[k];
+            jraw = candJ[k];
+            j = jraw&INDEX_MASK;
             const float4 pj = posq[j];
             if (SHIFTS) {
                 const float3 sv = unpackShift(candT[k], bx);
@@ -184,15 +192,16 @@ __global__ void pairSetup(int n, const int* order, const int* atomStart, const i
                 d = make_float3(pi.x-pj.x, pi.y-pj.y, pi.z-pj.z);
                 minImage(d, bx);
             }
-            inside = d.x*d.x+d.y*d.y+d.z*d.z < rc2;
+            inside = d.x*d.x+d.y*d.y+d.z*d.z < rp2;
         }
         const unsigned mask = __ballot_sync(0xffffffff, inside);
         if (inside) {
-            const float r = sqrtf(d.x*d.x+d.y*d.y+d.z*d.z);
-            float g[4];
-            pairKernels(rgi+rg[j], r, r > 0 ? 1/r : 0.0f, beta, g);
+            const float r2 = d.x*d.x+d.y*d.y+d.z*d.z, r = sqrtf(r2);
+            float g[4] = {0, 0, 0, 0};
+            if (r2 < rc2)
+                pairKernels(rgi+rg[j], r, r > 0 ? 1/r : 0.0f, beta, g);
             const int q = out+__popc(mask&below);
-            PJ[q] = j;
+            PJ[q] = jraw;
             G12[q] = make_float2(g[1], g[2]);
             G03[q] = make_float2(g[0], g[3]);
         }
@@ -200,6 +209,72 @@ __global__ void pairSetup(int n, const int* order, const int* atomStart, const i
     }
     if (lane == 0)
         pairEnd[i] = out;
+}
+
+/** Sets SKIP_BIT on the candidates (i, j) of the skip lists (exclusions, overridden pairs). */
+__global__ void markSkips(int n, const int* atomStart, int* candJ, const int* skipStart, const int* skipJ) {
+    const int i = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
+    if (i >= n || skipStart[i] == skipStart[i+1])
+        return;
+    for (int k = atomStart[i]+lane; k < atomStart[i+1]; k += 32) {
+        const int j = candJ[k]&INDEX_MASK;
+        bool skip = false;
+        for (int e = skipStart[i]; e < skipStart[i+1]; e++)
+            skip |= (skipJ[e] == j);
+        candJ[k] = j|(skip ? SKIP_BIT : 0);
+    }
+}
+
+// ------------------------------------------------------------------ GVDW (core/gvdw_kernel.h in float)
+
+/** G(y) = F(y)/y^6 and H(y) = G'(y)/y (pgmcore::gvdwG). */
+__device__ inline void gvdwGF(float y, float& G, float& H) {
+    const float C0 = 0.28294212f;   // 8/(9 pi)
+    if (y < 0.6f) {
+        const float c[15] = {1.0f, -2.0f, 58.0f/25, -188.0f/105, 2222.0f/2205, -1532.0f/3465, 64244.0f/405405,
+                             -162056.0f/3378375, 1587734.0f/126351225, -211108.0f/72747675,
+                             11902564.0f/19860115275.0f, -611992.0f/5465775315.0f,
+                             755028172.0f/39529267903125.0f, -213335384.0f/71152682225625.0f,
+                             15291334888.0f/35078272337233125.0f};
+        const float y2 = y*y;
+        float g = 0, h = 0;
+        for (int k = 14; k >= 0; k--)
+            g = g*y2+c[k];
+        for (int k = 14; k >= 1; k--)
+            h = h*y2+2.0f*k*c[k];
+        G = C0*g;
+        H = C0*h;
+        return;
+    }
+    const float isp = 0.56418958f;   // 1/sqrt(pi)
+    const float y2 = y*y, e = expf(-y2);
+    const float A = erff(y)-2.0f*isp*y*(1.0f+2.0f*y2/3.0f)*e;
+    const float g = (4.0f/3.0f)*isp*y2*y*e;
+    const float F = A*A+0.5f*g*g;
+    const float Ap = (8.0f/3.0f)*isp*y2*y2*e;
+    const float gp = 4.0f*isp*y2*(1.0f-2.0f*y2/3.0f)*e;
+    const float Fp = 2.0f*A*Ap+g*gp;
+    const float y6 = y2*y2*y2;
+    G = F/y6;
+    H = (Fp/y6-6.0f*F/(y6*y))/y;
+}
+
+/** The pair energy; dEdR = -(1/r) dU/dr (force on i = dEdR x) (pgmcore::gvdwPair). */
+__device__ inline float gvdwPairF(float r, float bij, float A, float C6, float B, bool slater, float& dEdR) {
+    const float y = bij*r, b2 = bij*bij, b6 = b2*b2*b2;
+    float erep, drep;
+    if (!slater) {
+        erep = A*expf(-B*y*y);
+        drep = -2.0f*B*b2*erep;
+    }
+    else {
+        erep = A*expf(-B*y);
+        drep = (r > 0 ? -B*bij*erep/r : 0.0f);
+    }
+    float G, H;
+    gvdwGF(y, G, H);
+    dEdR = -(drep-C6*b6*b2*H);
+    return erep-C6*b6*G;
 }
 
 __device__ inline float warpSum(float v) {
@@ -226,7 +301,7 @@ __global__ void fieldPass(int n, const int* order, const int* atomStart, const i
     const float4 pi = posq[i];
     float ex = 0, ey = 0, ez = 0;
     for (int k = atomStart[i]+lane; k < pairEnd[i]; k += 32) {
-        const int j = PJ[k];
+        const int jraw = PJ[k], j = jraw&INDEX_MASK;
         const float2 gg = G12[k];
         const float4 pj = posq[j];
         float3 v = make_float3(pi.x-pj.x, pi.y-pj.y, pi.z-pj.z);
@@ -248,10 +323,11 @@ __global__ void fieldPass(int n, const int* order, const int* atomStart, const i
 
 /** Energy, forces, field and (STRAIN) strain of charges and dipoles d; acc[0] energy, acc[1..9] S (both
  * halves). */
-template<bool STRAIN>
-__global__ void finalPass(int n, const int* order, const int* atomStart, const int* pairEnd, const int* PJ, const float4* posq,
-                          const float4* dip, const float2* G12, const float2* G03, double* fld, double* fpair,
-                          double* acc) {
+template<bool STRAIN, bool GVDW>
+__global__ void finalPass(int n, const int* order, const int* atomStart, const int* pairEnd, const int* PJ,
+                          const float4* posq, const float4* dip, const float2* G12, const float2* G03,
+                          const float* rg, const float4* gv, bool slater, float rvdw2, float invKe, double* fld,
+                          double* fpair, double* acc) {
     const Box bx = c_box;
     const int w = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
     if (w >= n)
@@ -261,9 +337,15 @@ __global__ void finalPass(int n, const int* order, const int* atomStart, const i
     const float qi = pi.w;
     const float4 di4 = dip[i];
     const float di[3] = {di4.x, di4.y, di4.z};
-    float Ei[3] = {0, 0, 0}, Fi[3] = {0, 0, 0}, S[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, en = 0;
+    float Ei[3] = {0, 0, 0}, Fi[3] = {0, 0, 0}, S[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, en = 0, eg = 0;
+    float4 gvi = make_float4(0, 0, 0, 0);
+    float rgi = 0;
+    if (GVDW) {
+        gvi = gv[i];
+        rgi = rg[i];
+    }
     for (int k = atomStart[i]+lane; k < pairEnd[i]; k += 32) {
-        const int j = PJ[k];
+        const int jraw = PJ[k], j = jraw&INDEX_MASK;
         const float2 g12 = G12[k], g03 = G03[k];
         const float4 g = make_float4(g03.x, g12.x, g12.y, g03.y);
         const float4 pj = posq[j];
@@ -284,6 +366,23 @@ __global__ void finalPass(int n, const int* order, const int* atomStart, const i
             Fi[c] -= dedx;
             Ei[c] += qj*x[c]*g.y-dj[c]*g.y+djx*x[c]*g.z;
         }
+        // the combination-rule GVDW (forces and strain in units of ke, as the electrostatics)
+        if (GVDW && !(jraw&SKIP_BIT)) {
+            const float r2 = x[0]*x[0]+x[1]*x[1]+x[2]*x[2];
+            const float4 gvj = gv[j];
+            if (r2 < rvdw2 && (gvi.x*gvj.x != 0 || gvi.y*gvj.y != 0)) {
+                float dEdR;
+                eg += gvdwPairF(sqrtf(r2), rsqrtf(rgi+rg[j]), gvi.x*gvj.x, gvi.y*gvj.y, 0.5f*(gvi.z+gvj.z), slater,
+                                dEdR);
+                const float f = dEdR*invKe;
+                for (int c = 0; c < 3; c++) {
+                    Fi[c] += f*x[c];
+                    if (STRAIN)
+                        for (int b = 0; b < 3; b++)
+                            S[3*c+b] -= f*x[c]*x[b];
+                }
+            }
+        }
     }
     for (int c = 0; c < 3; c++) {
         Ei[c] = warpSum(Ei[c]);
@@ -301,6 +400,11 @@ __global__ void finalPass(int n, const int* order, const int* atomStart, const i
         }
         for (int c = 0; c < ns; c++)
             atomicAdd(acc+c, sum[c]);
+    }
+    if (GVDW) {
+        const double sg = warpSumD(0.5*(double) eg);
+        if (lane == 0)
+            atomicAdd(acc+40, sg);
     }
 }
 
@@ -1054,7 +1158,7 @@ int blocksFor(size_t work, int threads) {
 }
 
 constexpr int NACC = 48;   // acc: [0] pair energy, [1..9] pair S, [10] k-space energy, [11..19] k-space S,
-                           // [20..28] covalent S, [29] |d|^2, [30] polarization, [31..39] E_rec d
+                           // [20..28] covalent S, [29] |d|^2, [30] polarization, [31..39] E_rec d, [40] GVDW
 
 } // namespace
 
@@ -1082,6 +1186,11 @@ struct Engine::Impl {
     DevArray<ull> frc, gridFix;
     DevArray<cufftComplex> cgrid;
     DevArray<Control> ctl;
+    // GVDW (combination rule): per atom (sqrt A, sqrt C6, b, 0); the skipped partners per atom (CSR)
+    bool gvdwOn = false, gvdwSlater = true, skipsMarked = false;
+    double rvdw = 0;
+    DevArray<float4> gvP;
+    DevArray<int> skipStart, skipJ;
     cufftHandle planF = 0, planB = 0;
     // own pair list
     bool externalList = false, haveList = false;
@@ -1103,10 +1212,12 @@ struct Engine::Impl {
     bool useGraphs = false;
     cudaGraphExec_t exec[2] = {nullptr, nullptr};
     long execAllocations[2] = {-1, -1};
-    std::array<long long, 5> execKey[2];
-    std::array<long long, 5> graphKey() const {   // the host values the graph's kernels take as parameters
-        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0};
+    std::array<long long, 6> execKey[2];
+    std::array<long long, 6> graphKey() const {   // the host values the graph's kernels take as parameters
+        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0, gvdwOn ? 1 : 0};
     }
+    double pairRadius() const { return gvdwOn ? std::max(s.cutoff, rvdw) : s.cutoff; }
+    void markSkipList();
     // results
     mutable std::vector<double> mu, permH;
     mutable bool muValid = false, permValid = false;
@@ -1158,10 +1269,10 @@ void Engine::Impl::buildList() {
         w[a] = 1.0/std::sqrt(recipD[0][a]*recipD[0][a]+recipD[1][a]*recipD[1][a]+recipD[2][a]*recipD[2][a]);
         wmin = std::min(wmin, w[a]);
     }
-    skinNow = std::min(s.skin, 0.5*wmin*(1-1e-6)-s.cutoff);
+    skinNow = std::min(s.skin, 0.5*wmin*(1-1e-6)-pairRadius());
     if (skinNow < 0.01)
         throw std::runtime_error("pgm_cuda: the cut-off (+ 0.01 nm) beyond half the box (minimum image)");
-    const double rl = s.cutoff+skinNow;
+    const double rl = pairRadius()+skinNow;
     const int R = 2;   // cells rl / 2 wide: (5/6)^3 = 0.58 of the volume searched with cells rl wide
     int nc[3];
     for (int a = 0; a < 3; a++)
@@ -1210,7 +1321,14 @@ void Engine::Impl::buildList() {
     CU(cudaMemcpyAsync(posBuild.ptr, posq.ptr, n*sizeof(float4), cudaMemcpyDeviceToDevice, st));
     std::memcpy(buildBox, boxD, sizeof(buildBox));
     haveList = true;
+    skipsMarked = false;
     numBuilds++;
+}
+
+void Engine::Impl::markSkipList() {
+    if (gvdwOn && skipStart.ptr)
+        markSkips<<<(n+3)/4, 128, 0, st>>>(n, atomStart.ptr, candJ.ptr, skipStart.ptr, skipJ.ptr);
+    skipsMarked = true;
 }
 
 void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
@@ -1289,13 +1407,13 @@ void Engine::Impl::enqueuePre() {
     const int m = 3*n;
     const int warpsPerBlock = 4, threads = 32*warpsPerBlock;
     const int pblocks = (n+warpsPerBlock-1)/warpsPerBlock;
-    const float rc2 = (float) (s.cutoff*s.cutoff), beta = (float) s.beta;
+    const float rc2 = (float) (s.cutoff*s.cutoff), rp2 = (float) (pairRadius()*pairRadius()), beta = (float) s.beta;
     if (externalList)
         pairSetup<true><<<pblocks, threads, 0, st>>>(n, nullptr, atomStart.ptr, candJ.ptr, candT.ptr, posq.ptr,
-                                                     rg.ptr, rc2, beta, PJ.ptr, G12.ptr, G03.ptr, pairEnd.ptr);
+                                                     rg.ptr, rc2, rp2, beta, PJ.ptr, G12.ptr, G03.ptr, pairEnd.ptr);
     else
         pairSetup<false><<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, nullptr,
-                                                      posq.ptr, rg.ptr, rc2, beta, PJ.ptr, G12.ptr, G03.ptr,
+                                                      posq.ptr, rg.ptr, rc2, rp2, beta, PJ.ptr, G12.ptr, G03.ptr,
                                                       pairEnd.ptr);
     permDipolesKernel<<<blocksFor(n, 128), 128, 0, st>>>(n, posq.ptr, covStart.ptr, covPartnerSorted.ptr,
                                                          covStrengthSorted.ptr, perm.ptr);
@@ -1342,12 +1460,20 @@ void Engine::Impl::enqueuePost(bool strain) {
     toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, dTot.ptr, nullptr, dipF.ptr);
     CU(cudaMemsetAsync(frc.ptr, 0, m*sizeof(ull), st));
     CU(cudaMemsetAsync(acc.ptr, 0, NACC*sizeof(double), st));
-    if (strain)
-        finalPass<true><<<pblocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
-                                                     dipF.ptr, G12.ptr, G03.ptr, fld.ptr, fpair.ptr, acc.ptr);
+    const float rvdw2 = (float) (rvdw*rvdw), invKe = (float) (1.0/s.ke);
+#define PGM_FINAL(STRAIN, GV)                                                                                    \
+    finalPass<STRAIN, GV><<<pblocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,  \
+                                                       dipF.ptr, G12.ptr, G03.ptr, rg.ptr, gvP.ptr, gvdwSlater,  \
+                                                       rvdw2, invKe, fld.ptr, fpair.ptr, acc.ptr)
+    if (strain && gvdwOn)
+        PGM_FINAL(true, true);
+    else if (strain)
+        PGM_FINAL(true, false);
+    else if (gvdwOn)
+        PGM_FINAL(false, true);
     else
-        finalPass<false><<<pblocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
-                                                      dipF.ptr, G12.ptr, G03.ptr, fld.ptr, fpair.ptr, acc.ptr);
+        PGM_FINAL(false, false);
+#undef PGM_FINAL
     pme(true, true, strain ? 2 : 1, acc.ptr+10);
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     combineField<<<blocksFor(m, 256), 256, 0, st>>>(m, fld.ptr, erec.ptr, dTot.ptr, cs, Etot.ptr);
@@ -1522,7 +1648,43 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
     I.permH.assign(m, 0.0);
     I.haveList = false;
     I.externalList = false;
+    I.gvdwOn = false;   // setGvdw again for the new order
     I.cellAtomSorted.resize(n);
+}
+
+void Engine::setGvdw(int repulsion, double rvdw, const double* sqrtA, const double* sqrtC6, const double* b,
+                     int nskip, const int* skipI, const int* skipJ) {
+    Impl& I = *impl;
+    CU(cudaStreamSynchronize(I.st));
+    const int n = I.n;
+    std::vector<float4> gvH(n);
+    for (int i = 0; i < n; i++)
+        gvH[i] = make_float4((float) sqrtA[i], (float) sqrtC6[i], (float) b[i], 0.0f);
+    I.gvP.upload(gvH.data(), n);
+    // both directions, sorted per atom
+    std::vector<int> start(n+1, 0);
+    for (int k = 0; k < nskip; k++) {
+        start[skipI[k]+1]++;
+        start[skipJ[k]+1]++;
+    }
+    for (int i = 0; i < n; i++)
+        start[i+1] += start[i];
+    std::vector<int> fill(start.begin(), start.end()-1), part(std::max(start[n], 1));
+    for (int k = 0; k < nskip; k++) {
+        part[fill[skipI[k]]++] = skipJ[k];
+        part[fill[skipJ[k]]++] = skipI[k];
+    }
+    for (int i = 0; i < n; i++)
+        std::sort(part.begin()+start[i], part.begin()+start[i+1]);
+    I.skipStart.upload(start.data(), n+1);
+    I.skipJ.upload(part.data(), part.size());
+    const bool radiusChanged = !I.gvdwOn || I.rvdw != rvdw;
+    I.gvdwOn = true;
+    I.gvdwSlater = (repulsion == 1);
+    I.rvdw = rvdw;
+    if (radiusChanged)
+        I.haveList = false;   // the list radius may change
+    I.skipsMarked = false;
 }
 
 void Engine::setCovalent(int ncov, const int* atom, const int* partner, const double* strength) {
@@ -1583,6 +1745,7 @@ void Engine::setCandidates(int nseg, const int* segI, const int* segShift, const
     }
     I.atomStart.upload(count.data(), n+1);
     I.candJ.upload(jj.data(), I.ncand);
+    I.skipsMarked = false;
     I.candT.upload(tt.data(), I.ncand);
     I.PJ.resize(I.ncand);
     I.G12.resize(I.ncand);
@@ -1630,6 +1793,8 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
     I.muValid = I.permValid = false;
     if (I.needList())
         I.buildList();
+    if (I.gvdwOn && !I.skipsMarked)
+        I.markSkipList();
 
     // the initial guess and the history slots
     Control& c = *I.ctlH.ptr;
@@ -1697,6 +1862,7 @@ Terms Engine::compute(const double* pos, const double box[3][3], bool newStep, d
     const double background = -pgmcore::PI*I.Qtot*I.Qtot/(2.0*I.volume*s.beta*s.beta);
     t.background = s.ke*background;
     t.polarization = s.ke*accH[30];
+    t.gvdw = I.gvdwOn ? accH[40] : 0.0;
     if (f)
         for (int k = 0; k < m; k++)
             f[k] += I.fH.ptr[k];

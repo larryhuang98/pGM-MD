@@ -21,10 +21,24 @@ EDITS = [
      "                        mdatoms->homenr,\n"
      "                        mdatoms->chargeA,\n"
      "                        top->idef,\n"
+     "                        top->excls,\n"
      "                        haveDDAtomOrdering(*cr) ? ArrayRef<const int>(cr->dd->globalAtomIndices)\n"
      "                                                : ArrayRef<const int>(),\n"
      "                        simulationWork.havePpDomainDecomposition ? cr->dd : nullptr,\n"
      "                        stepWork);\n"
      "    }\n\n"
      "    const bool useOrEmulateGpuNb = simulationWork.useGpuNonbonded || fr->nbv->emulateGpu();\n"),
+    # trees patched before the launch call took the exclusions (GVDW on the GPU)
+    ("src/gromacs/mdlib/sim_util.cpp",
+     "                        top->idef,\n"
+     "                        haveDDAtomOrdering(*cr) ? ArrayRef<const int>(cr->dd->globalAtomIndices)\n"
+     "                                                : ArrayRef<const int>(),\n"
+     "                        simulationWork.havePpDomainDecomposition ? cr->dd : nullptr,\n"
+     "                        stepWork);\n",
+     "                        top->idef,\n"
+     "                        top->excls,\n"
+     "                        haveDDAtomOrdering(*cr) ? ArrayRef<const int>(cr->dd->globalAtomIndices)\n"
+     "                                                : ArrayRef<const int>(),\n"
+     "                        simulationWork.havePpDomainDecomposition ? cr->dd : nullptr,\n"
+     "                        stepWork);\n"),
 ]

@@ -39,7 +39,8 @@ struct Settings {
 
 struct Terms {
     double direct = 0, reciprocal = 0, self = 0, background = 0, polarization = 0;
-    double total() const { return direct + reciprocal + self + background + polarization; }
+    double gvdw = 0;   // the combination-rule GVDW (setGvdw)
+    double total() const { return direct + reciprocal + self + background + polarization + gvdw; }
 };
 
 class Engine {
@@ -52,6 +53,15 @@ public:
     /** The atoms in the caller's (local) order; globalIndex[i] (nullptr: i) keys the predictor history. */
     void setAtoms(int n, const double* q, const double* radius, const double* alpha, const int* globalIndex,
                   int numGlobal);
+    /**
+     * GVDW (core/gvdw_kernel.h) by the combination rule for all pairs within rvdw except the skipped ones
+     * (exclusions, pairs with their own parameters: those and the dispersion tail are the caller's):
+     * per atom sqrt(A), sqrt(C6), b (local order; zeros: none), repulsion 0 Gaussian, 1 Slater; skip pairs
+     * (skipI[k], skipJ[k]) once each, local indices.  Its energy is Terms::gvdw, its forces and strain are
+     * added to those of compute().  After every setAtoms.
+     */
+    void setGvdw(int repulsion, double rvdw, const double* sqrtA, const double* sqrtC6, const double* b, int nskip,
+                 const int* skipI, const int* skipJ);
     /** Covalent dipoles: p_atom += strength unit(r_partner - r_atom), local indices. */
     void setCovalent(int ncov, const int* atom, const int* partner, const double* strength);
     /**

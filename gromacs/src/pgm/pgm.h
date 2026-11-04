@@ -86,6 +86,7 @@ public:
                 int                           numHomeAtoms,
                 ArrayRef<const real>          charges,
                 const InteractionDefinitions& idef,
+                const ListOfLists<int>&       exclusions,
                 ArrayRef<const int>           globalIndex,
                 const gmx_domdec_t*           dd,
                 const StepWorkload&           stepWork);

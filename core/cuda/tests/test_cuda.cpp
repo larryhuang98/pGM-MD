@@ -4,6 +4,7 @@
 //   nvcc -O3 -std=c++17 -arch=sm_120 -I../.. ../pgm_cuda.cu ../../pgm_core.cpp test_cuda.cpp -lcufft -o test_cuda
 //   ./test_cuda DUMP [tol=1e-10] [skin=0.1]          (PGM_CUDA_NO_GRAPH=1: without the CUDA graph)
 #include "../pgm_cuda.h"
+#include "gvdw_kernel.h"
 #include "pgm_core.h"
 
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -190,6 +192,75 @@ int main(int argc, char** argv) {
     }
     own.setAtoms(n, top.q.data(), top.radius.data(), top.alpha.data(), nullptr, n);
     own.setCovalent(ncov, top.covAtom.data(), top.covPartner.data(), top.covStrength.data());
+
+    // GVDW (Slater), water-like parameters (negative charges: O, else H), the covalent pairs skipped:
+    // the engine with GVDW minus without against a double brute-force sum
+    {
+        vector<double> ga(n), gc(n), gb(n);
+        for (int i = 0; i < n; i++) {
+            const bool O = top.q[i] < 0;
+            ga[i] = O ? 605.06 : 20.0;
+            gc[i] = O ? 0.0499 : 0.005;
+            gb[i] = O ? 4.52 : 4.0;
+        }
+        set<pair<int, int>> skip;
+        for (int m = 0; m < ncov; m++)
+            skip.insert({min(top.covAtom[m], top.covPartner[m]), max(top.covAtom[m], top.covPartner[m])});
+        vector<int> si, sj;
+        for (auto& pr : skip) {
+            si.push_back(pr.first);
+            sj.push_back(pr.second);
+        }
+        const double rv = s.cutoff;
+        double Eref = 0, Sref[9] = {0};
+        vector<double> Fref(3*n, 0.0);
+        for (int i = 0; i < n; i++)
+            for (int j = i+1; j < n; j++) {
+                if (skip.count({i, j}))
+                    continue;
+                double d[3] = {pos[i][0]-pos[j][0], pos[i][1]-pos[j][1], pos[i][2]-pos[j][2]};
+                for (int c = 2; c >= 0; c--) {
+                    const double k = round(d[c]/box[c][c]);
+                    for (int e = 0; e < 3; e++)
+                        d[e] -= k*box[c][e];
+                }
+                const double r = sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+                if (r >= rv)
+                    continue;
+                const double bij = 1.0/sqrt(2.0*(top.radius[i]*top.radius[i]+top.radius[j]*top.radius[j]));
+                double dEdR;
+                Eref += pgmcore::gvdwPair(r, bij, ga[i]*ga[j], gc[i]*gc[j], 0.5*(gb[i]+gb[j]), pgmcore::GVDWSlater, dEdR);
+                for (int a = 0; a < 3; a++) {
+                    Fref[3*i+a] += dEdR*d[a];
+                    Fref[3*j+a] -= dEdR*d[a];
+                    for (int b = 0; b < 3; b++)
+                        Sref[3*a+b] -= dEdR*d[a]*d[b];
+                }
+            }
+        pgmcuda::Engine gv(cs);
+        gv.setAtoms(n, top.q.data(), top.radius.data(), top.alpha.data(), nullptr, n);
+        gv.setCovalent(ncov, top.covAtom.data(), top.covPartner.data(), top.covStrength.data());
+        vector<double> F0(3*n, 0.0), S0(9, 0.0), F1(3*n, 0.0), S1(9, 0.0);
+        const pgmcuda::Terms T0 = gv.compute(pd.data(), B, true, F0.data(), S0.data());
+        gv.setAtoms(n, top.q.data(), top.radius.data(), top.alpha.data(), nullptr, n);
+        gv.setCovalent(ncov, top.covAtom.data(), top.covPartner.data(), top.covStrength.data());
+        gv.setGvdw(1, rv, ga.data(), gc.data(), gb.data(), (int) si.size(), si.data(), sj.data());
+        const pgmcuda::Terms T1 = gv.compute(pd.data(), B, true, F1.data(), S1.data());
+        double dFg = 0, Fgmax = 0, dSg = 0, Sgmax = 0;
+        for (int k = 0; k < 3*n; k++) {
+            dFg = max(dFg, fabs(F1[k]-F0[k]-Fref[k]));
+            Fgmax = max(Fgmax, fabs(Fref[k]));
+        }
+        for (int c = 0; c < 9; c++) {
+            dSg = max(dSg, fabs(S1[c]-S0[c]-Sref[c]));
+            Sgmax = max(Sgmax, fabs(Sref[c]));
+        }
+        const double relE = (T1.gvdw-Eref)/fabs(Eref);
+        printf("GVDW: gpu %.8f ref %.8f rel %.3e (electrostatics change %.3e); forces max|diff| %.3e (max %.3e); "
+               "strain max|diff| %.3e (max %.3e)\n", T1.gvdw, Eref, relE, (T1.total()-T1.gvdw)-T0.total(), dFg,
+               Fgmax, dSg, Sgmax);
+        ownOk = ownOk && fabs(relE) < 1e-5 && dFg < 1e-4*Fgmax && dSg < 1e-4*Sgmax;
+    }
 
     // timing: repeated evaluations at tolerance 1e-5 with the predictor (same positions: iterations ~0)
     const int reps = 50;

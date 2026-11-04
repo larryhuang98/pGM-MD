@@ -402,8 +402,8 @@ public:
     //! sum the per-thread vectors 0..nt_-1 into out
     void reduceThreadVec(std::vector<DVec>& out);
 
-    // GPU (G3): GMX_PGM_GPU=1 in a CUDA build, one rank: the pGM electrostatics on the GPU (pgm_cuda,
-    // with its own pair list); GVDW stays here
+    // GPU (G3): GMX_PGM_GPU=1 in a CUDA build, one rank: the pGM electrostatics and the combination-rule
+    // GVDW on the GPU (pgm_cuda, with its own pair list); GVDW overrides and the tail stay here
     bool useGpu_ = (std::getenv("GMX_PGM_GPU") != nullptr);
 #if GMX_GPU_CUDA
     std::unique_ptr<pgmcuda::Engine> gpu_;
@@ -1392,6 +1392,30 @@ void PgmElectrostatics::Impl::startGpu(bool topologyChanged)
         {
             gpu_->setAtoms(n_, q_.data(), radius_.data(), alpha_.data(), gi.data(), nGlobal_);
             gpu_->setCovalent(covAtom_.size(), covAtom_.data(), covPartner_.data(), covStrength_.data());
+            if (gvdw_)
+            {
+                // the combination rule on the GPU, without the excluded and the overridden pairs (those
+                // and the tail stay here, gvdwOverridesAndTail)
+                std::vector<int> si, sj;
+                for (int i = 0; i < n_; i++)
+                {
+                    for (const int e : (*excls_)[i])
+                    {
+                        if (e > i)
+                        {
+                            si.push_back(i);
+                            sj.push_back(e);
+                        }
+                    }
+                }
+                for (const GvdwPair& p : gvdwPairs_)
+                {
+                    si.push_back(p.i);
+                    sj.push_back(p.j);
+                }
+                gpu_->setGvdw(gvdwRep_ == pgmcore::GVDWSlater ? 1 : 0, rvdw_, gvdwA_.data(), gvdwC_.data(),
+                              gvdwB_.data(), si.size(), si.data(), sj.data());
+            }
             gpuAtoms_ = gi;
         }
     }
@@ -1475,6 +1499,7 @@ void PgmElectrostatics::Impl::finishGpu(ForceWithVirial* forceWithVirial, gmx_en
     enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::CoulombSR][0] += t.direct;
     enerd->term[InteractionFunction::CoulombReciprocalSpace] += t.reciprocal + t.self + t.background;
     enerd->term[InteractionFunction::PgmAtom] += t.polarization;
+    gvdwEnergy_ = t.gvdw; // its forces and virial are in F and S
     addGvdwOutputs(f, forceWithVirial, enerd);
     tFinish_ += now() - tw0;
     if (std::getenv("GMX_PGM_TIMING") && (numCalls_ + 1) % 500 == 0)
@@ -2219,15 +2244,22 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     }
     double t0 = now();
     // the nbnxm candidates: for the CPU kernels, GVDW and the pair check (the GPU engine has its own list)
-    const bool needCandidates = !useGpu_ || gvdw_ || checkPairs_;
+    const bool needCandidates = !useGpu_ || checkPairs_;
     if (needCandidates && (topologyChanged || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_))
     {
         searchCandidates(nbv);
     }
     GMX_UNUSED_VALUE(shiftVectors);
-    if (!useGpu_ || gvdw_)
+    if (!useGpu_)
     {
         buildPairs();
+    }
+    else if (gvdw_) // the rule part comes from the GPU (finishGpu), the overrides and the tail from here
+    {
+        gvdwForce_.resize(1);
+        gvdwForce_[0].assign(n_, DVec{ 0, 0, 0 });
+        gvdwEnergy_ = 0;
+        std::fill(std::begin(gvdwS_), std::end(gvdwS_), 0.0);
     }
     if (checkPairs_ && !useGpu_)
     {
@@ -2645,6 +2677,7 @@ void PgmElectrostatics::launch(ArrayRef<const RVec>          x,
                                int                           numHomeAtoms,
                                ArrayRef<const real>          charges,
                                const InteractionDefinitions& idef,
+                               const ListOfLists<int>&       exclusions,
                                ArrayRef<const int>           globalIndex,
                                const gmx_domdec_t*           dd,
                                const StepWorkload&           stepWork)
@@ -2655,6 +2688,7 @@ void PgmElectrostatics::launch(ArrayRef<const RVec>          x,
     }
     const double t0     = Impl::now();
     impl_->wantVirial_ = stepWork.computeVirial; // the GPU strain derivative only when needed
+    impl_->excls_      = &exclusions;
     impl_->prepare(x, box, numHomeAtoms, charges, idef, globalIndex, dd, stepWork.doNeighborSearch);
     impl_->startGpu(impl_->lastTopologyChanged_);
     impl_->launched_ = true;
