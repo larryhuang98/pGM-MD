@@ -17,7 +17,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -49,11 +54,115 @@
 #include "gromacs/utility/alignedallocator.h"
 #include "gromacs/utility/listoflists.h"
 
+#ifdef __linux__
+#    include <pthread.h>
+#    include <sched.h>
+#    include <unistd.h>
+#endif
+
 #include "gvdw_kernel.h" // pgm-native core/, copied next to this file: the GVDW pair
 #include "pgm_math.h"    // and the shared numerics (erf kernels, B-spline moduli, minimum image)
+#if GMX_GPU_CUDA
+#    include "pgm_cuda.h" // pgm-native core/cuda: the pGM engine on the GPU (GMX_PGM_GPU=1)
+#endif
 
 namespace gmx
 {
+
+namespace
+{
+
+/*! \brief One worker thread that runs one job at a time (the GPU part of a step while the calling
+ * thread does the CPU short-range work).  Not pinned: the mdrun threads are, and the worker mostly
+ * waits on the GPU. */
+class PgmWorker
+{
+public:
+    ~PgmWorker()
+    {
+        if (thread_.joinable())
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                quit_ = true;
+            }
+            wake_.notify_all();
+            thread_.join();
+        }
+    }
+    void run(std::function<void()> job)
+    {
+        if (!thread_.joinable())
+        {
+            thread_ = std::thread([this] { loop(); });
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_   = std::move(job);
+            busy_  = true;
+            error_ = nullptr;
+        }
+        wake_.notify_all();
+    }
+    //! wait for the job; rethrows its exception
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [this] { return !busy_; });
+        if (error_)
+        {
+            std::rethrow_exception(error_);
+        }
+    }
+
+private:
+    void loop()
+    {
+#ifdef __linux__
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        const long numCpus = sysconf(_SC_NPROCESSORS_CONF);
+        for (long c = 0; c < numCpus && c < CPU_SETSIZE; c++)
+        {
+            CPU_SET(c, &set);
+        }
+        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#endif
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true)
+        {
+            wake_.wait(lock, [this] { return quit_ || static_cast<bool>(job_); });
+            if (quit_)
+            {
+                return;
+            }
+            std::function<void()> job = std::move(job_);
+            job_                      = nullptr;
+            lock.unlock();
+            std::exception_ptr error;
+            try
+            {
+                job();
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+            lock.lock();
+            error_ = error;
+            busy_  = false;
+            done_.notify_all();
+        }
+    }
+    std::thread             thread_;
+    std::mutex              mutex_;
+    std::condition_variable wake_, done_;
+    std::function<void()>   job_;
+    bool                    busy_ = false, quit_ = false;
+    std::exception_ptr      error_;
+};
+
+} // namespace
 
 namespace
 {
@@ -293,6 +402,47 @@ public:
     //! sum the per-thread vectors 0..nt_-1 into out
     void reduceThreadVec(std::vector<DVec>& out);
 
+    // GPU (G3): GMX_PGM_GPU=1 in a CUDA build, one rank: the pGM electrostatics on the GPU (pgm_cuda,
+    // with its own pair list); GVDW stays here
+    bool useGpu_ = (std::getenv("GMX_PGM_GPU") != nullptr);
+#if GMX_GPU_CUDA
+    std::unique_ptr<pgmcuda::Engine> gpu_;
+    std::vector<int>                 gpuAtoms_; // the global indices the engine has
+    std::vector<double>              gpuPos_, gpuF_, gpuS_;
+    pgmcuda::Terms                   gpuTerms_;
+#endif
+    PgmWorker gpuWorker_;
+    bool      gpuPending_ = false, launched_ = false, lastTopologyChanged_ = false, wantVirial_ = true;
+    double    tWait_ = 0, tPrep_ = 0, tFinish_ = 0, tLaunchEnd_ = 0, tBetween_ = 0;
+    void      prepare(ArrayRef<const RVec>          xIn,
+                      const matrix                  box,
+                      int                           numHomeAtoms,
+                      ArrayRef<const real>          charges,
+                      const InteractionDefinitions& idef,
+                      ArrayRef<const int>           globalIndex,
+                      const gmx_domdec_t*           dd,
+                      bool                          doPairSearch);
+    void      startGpu(bool topologyChanged);
+    void      finishGpu(ForceWithVirial* forceWithVirial, gmx_enerdata_t* enerd);
+    bool                             gpuMuStale_ = false;
+    void                             fetchGpuDipoles()
+    {
+#if GMX_GPU_CUDA
+        if (gpuMuStale_ && gpu_)
+        {
+            std::vector<double> mu(3 * n_);
+            gpu_->inducedDipoles(mu.data());
+            mu_.resize(n_);
+            for (int i = 0; i < n_; i++)
+            {
+                mu_[i] = DVec(mu[3 * i], mu[3 * i + 1], mu[3 * i + 2]);
+            }
+        }
+#endif
+        gpuMuStale_ = false;
+    }
+    void addGvdwOutputs(ArrayRef<RVec> f, ForceWithVirial* forceWithVirial, gmx_enerdata_t* enerd);
+
     // dipoles and predictor history
     std::vector<DVec>              perm_, mu_;
     std::deque<std::vector<DVec>>  history_;
@@ -305,10 +455,11 @@ public:
 
     // wall-clock seconds per phase (GMX_PGM_TIMING): pair setup, splines + influence, pair passes of the
     // field, PME, final forces
-    double tPairs_ = 0, tSplines_ = 0, tFieldPairs_ = 0, tPme_ = 0, tFinal_ = 0;
+    double tPairs_ = 0, tSplines_ = 0, tFieldPairs_ = 0, tPme_ = 0, tFinal_ = 0, tCand_ = 0;
     // within PME: spreading (with the grid reduction), the two FFTs, the convolution, the gathers
     double tSpread_ = 0, tFft_ = 0, tConv_ = 0, tGather_ = 0;
     double numCandidates_ = 0, numPairs_ = 0, numSearches_ = 0;
+    double tStart_ = -1; // the first call (GPU timing)
     static double now()
     {
         return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1036,7 +1187,7 @@ void PgmElectrostatics::Impl::buildPairs()
                     {
                         gvdwPairInLoop(ai, aj, dx, r2, Fg, sum);
                     }
-                    if (r2 < rc2)
+                    if (r2 < rc2 && !useGpu_) // on the GPU the pGM pairs are done there
                     {
                         T.j.push_back(aj);
                         for (int d = 0; d < DIM; d++)
@@ -1160,6 +1311,187 @@ void PgmElectrostatics::Impl::gvdwOverridesAndTail()
             }
         }
     }
+}
+
+void PgmElectrostatics::Impl::addGvdwOutputs(ArrayRef<RVec> f, ForceWithVirial* forceWithVirial, gmx_enerdata_t* enerd)
+{
+    if (!gvdw_)
+    {
+        return;
+    }
+    const std::vector<DVec>& Fg = gvdwForce_[0];
+    for (int i = 0; i < nHome_; i++)
+    {
+        for (int k = 0; k < DIM; k++)
+        {
+            f[i][k] += Fg[i][k];
+        }
+    }
+    matrix virG;
+    for (int a = 0; a < DIM; a++)
+    {
+        for (int b = 0; b < DIM; b++)
+        {
+            virG[a][b] = 0.5 * gvdwS_[3 * b + a];
+        }
+    }
+    forceWithVirial->addVirialContribution(virG);
+    enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::LJSR][0] += gvdwEnergy_;
+    enerd->term[InteractionFunction::PgmGvdwPair] += gvdwPairEnergy_;
+    if (dispCorr_ != DispersionCorrectionType::No)
+    {
+        enerd->term[InteractionFunction::DispersionCorrection] += gvdwTail_;
+        if (dispCorr_ == DispersionCorrectionType::EnerPres || dispCorr_ == DispersionCorrectionType::AllEnerPres)
+        {
+            enerd->term[InteractionFunction::PressureDispersionCorrection] += c_presfac * gvdwTail_ / volume_;
+        }
+    }
+}
+
+void PgmElectrostatics::Impl::startGpu(bool topologyChanged)
+{
+#if GMX_GPU_CUDA
+    if (dd_)
+    {
+        gmx_fatal(FARGS, "pGM on the GPU (GMX_PGM_GPU) needs a single rank");
+    }
+    if (!gpu_)
+    {
+        pgmcuda::Settings gs;
+        gs.cutoff    = rc_;
+        gs.beta      = beta_;
+        for (int d = 0; d < DIM; d++)
+        {
+            gs.grid[d] = grid_[d];
+        }
+        gs.order     = order_;
+        gs.tol       = tol_;
+        gs.maxIter   = maxIter_;
+        gs.peek      = peek_;
+        gs.predictor = predictor_;
+        gs.ke        = ke_;
+        gs.device    = 0;
+        if (const char* sk = std::getenv("GMX_PGM_GPU_SKIN"))
+        {
+            gs.skin = std::atof(sk);
+        }
+        gpu_            = std::make_unique<pgmcuda::Engine>(gs);
+        topologyChanged = true;
+        gpuAtoms_.clear();
+    }
+    const double tc0 = now();
+    // the engine keeps its own pair list (GPU cell list, rebuilt by displacement): only the atoms
+    if (topologyChanged)
+    {
+        std::vector<int> gi(n_);
+        for (int i = 0; i < n_; i++)
+        {
+            gi[i] = globalOf(i);
+        }
+        if (gi != gpuAtoms_)
+        {
+            gpu_->setAtoms(n_, q_.data(), radius_.data(), alpha_.data(), gi.data(), nGlobal_);
+            gpu_->setCovalent(covAtom_.size(), covAtom_.data(), covPartner_.data(), covStrength_.data());
+            gpuAtoms_ = gi;
+        }
+    }
+    tCand_ += now() - tc0;
+    gpuPos_.resize(3 * n_);
+    gpuF_.assign(3 * n_, 0.0);
+    gpuS_.assign(9, 0.0);
+    for (int i = 0; i < n_; i++)
+    {
+        for (int k = 0; k < DIM; k++)
+        {
+            gpuPos_[3 * i + k] = pos_[i][k];
+        }
+    }
+    auto job = [this]()
+    {
+        const double tg0 = now();
+        gpuTerms_ = gpu_->compute(gpuPos_.data(), box_, true, gpuF_.data(), wantVirial_ ? gpuS_.data() : nullptr);
+        tPme_ += now() - tg0; // the whole GPU part (GMX_PGM_TIMING: "PME")
+    };
+    if (std::getenv("GMX_PGM_GPU_SYNC"))
+    {
+        job();
+    }
+    else
+    {
+        gpuWorker_.run(job);
+    }
+    gpuPending_ = true;
+#else
+    GMX_UNUSED_VALUE(topologyChanged);
+    gmx_fatal(FARGS, "GMX_PGM_GPU: this GROMACS build has no CUDA");
+#endif
+}
+
+void PgmElectrostatics::Impl::finishGpu(ForceWithVirial* forceWithVirial, gmx_enerdata_t* enerd)
+{
+#if GMX_GPU_CUDA
+    GMX_RELEASE_ASSERT(gpuPending_, "finishGpu without startGpu");
+    const double tw0 = now();
+    try
+    {
+        gpuWorker_.wait();
+    }
+    catch (const std::exception& e)
+    {
+        gmx_fatal(FARGS, "pGM on the GPU: %s", e.what());
+    }
+    tWait_ += now() - tw0;
+    if (tLaunchEnd_ > 0)
+    {
+        tBetween_ += tw0 - tLaunchEnd_; // CPU work between the launch and here
+    }
+    gpuPending_                  = false;
+    const pgmcuda::Terms&     t  = gpuTerms_;
+    const std::vector<double>& F = gpuF_;
+    const std::vector<double>& S = gpuS_;
+    lastIterations_ = gpu_->iterations();
+    lastResidual_   = gpu_->residual();
+    gpuMuStale_ = true; // fetched by inducedDipoles() when asked for
+    ArrayRef<RVec> f = forceWithVirial->force_;
+    for (int i = 0; i < n_; i++)
+    {
+        for (int k = 0; k < DIM; k++)
+        {
+            f[i][k] += F[3 * i + k];
+        }
+    }
+    matrix vir;
+    for (int a = 0; a < DIM; a++)
+    {
+        for (int b = 0; b < DIM; b++)
+        {
+            vir[a][b] = 0.5 * S[3 * b + a]; // Xi = S^T / 2
+        }
+    }
+    if (wantVirial_)
+    {
+        forceWithVirial->addVirialContribution(vir);
+    }
+    enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::CoulombSR][0] += t.direct;
+    enerd->term[InteractionFunction::CoulombReciprocalSpace] += t.reciprocal + t.self + t.background;
+    enerd->term[InteractionFunction::PgmAtom] += t.polarization;
+    addGvdwOutputs(f, forceWithVirial, enerd);
+    tFinish_ += now() - tw0;
+    if (std::getenv("GMX_PGM_TIMING") && (numCalls_ + 1) % 500 == 0)
+    {
+        const double c = 1e3 / (numCalls_ + 1);
+        fprintf(stderr,
+                "pGM GPU ms per call (%ld calls): launch (setup + atoms) %.3f, CPU work meanwhile %.3f, "
+                "GPU engine %.3f, waiting + outputs %.3f (waiting %.3f), step %.3f; %ld list builds, %d "
+                "candidates\n",
+                numCalls_ + 1, c * tPrep_, c * tBetween_, c * tPme_, c * tFinish_, c * tWait_,
+                c * (now() - tStart_), gpu_->listBuilds(), gpu_->numCandidates());
+    }
+#else
+    GMX_UNUSED_VALUE(forceWithVirial);
+    GMX_UNUSED_VALUE(enerd);
+    gmx_fatal(FARGS, "GMX_PGM_GPU: this GROMACS build has no CUDA");
+#endif
 }
 
 void PgmElectrostatics::Impl::reduceThreadVec(std::vector<DVec>& out)
@@ -1805,21 +2137,15 @@ void PgmElectrostatics::Impl::solve()
     havePos_ = true;
 }
 
-void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
-                                        const matrix                  box,
-                                        int                           numHomeAtoms,
-                                        ArrayRef<const real>          charges,
-                                        const nonbonded_verlet_t&     nbv,
-                                        const InteractionDefinitions& idef,
-                                        const ListOfLists<int>&       exclusions,
-                                        ArrayRef<const RVec>          shiftVectors,
-                                        ArrayRef<const int>           globalIndex,
-                                        const gmx_domdec_t*           dd,
-                                        ForceWithVirial*              forceWithVirial,
-                                        gmx_enerdata_t*               enerd,
-                                        bool                          doPairSearch)
+void PgmElectrostatics::Impl::prepare(ArrayRef<const RVec>          xIn,
+                                      const matrix                  box,
+                                      int                           numHomeAtoms,
+                                      ArrayRef<const real>          charges,
+                                      const InteractionDefinitions& idef,
+                                      ArrayRef<const int>           globalIndex,
+                                      const gmx_domdec_t*           dd,
+                                      bool                          doPairSearch)
 {
-    excls_ = &exclusions;
     dd_    = dd;
     if (dd_ && dd_->unitCellInfo.haveScrewPBC)
     {
@@ -1839,8 +2165,10 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
         nGlobal_ = static_cast<int>(ng);
     }
     const bool topologyChanged = doPairSearch || numCalls_ == 0;
-    // the local atom order changes at repartitioning (also on a single rank): parameters are read
-    // from the local topology at every call, the predictor history is kept in the global order
+    lastTopologyChanged_       = topologyChanged;
+    // the local atom order changes at repartitioning (also on a single rank), only at pair-search
+    // steps: the parameters are read from the local topology then, the predictor history is kept in
+    // the global order
     nt_ = std::max(1, gmx_omp_nthreads_get(ModuleMultiThread::Default));
     threadVec_.resize(nt_);
     if (fftThreads_ != nt_)
@@ -1848,22 +2176,60 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
         initFft(nt_);
     }
     globalIndex_.assign(globalIndex.begin(), globalIndex.begin() + (globalIndex.empty() ? 0 : n_));
-    setTopology(charges, idef, topologyChanged);
+    if (topologyChanged || static_cast<int>(q_.size()) != n_)
+    {
+        setTopology(charges, idef, topologyChanged);
+    }
     pos_.resize(n_);
     for (int i = 0; i < n_; i++)
     {
         pos_[i] = DVec(xIn[i][XX], xIn[i][YY], xIn[i][ZZ]);
     }
     setBox(box);
-    permanentDipoles();
+}
+
+void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
+                                        const matrix                  box,
+                                        int                           numHomeAtoms,
+                                        ArrayRef<const real>          charges,
+                                        const nonbonded_verlet_t&     nbv,
+                                        const InteractionDefinitions& idef,
+                                        const ListOfLists<int>&       exclusions,
+                                        ArrayRef<const RVec>          shiftVectors,
+                                        ArrayRef<const int>           globalIndex,
+                                        const gmx_domdec_t*           dd,
+                                        ForceWithVirial*              forceWithVirial,
+                                        gmx_enerdata_t*               enerd,
+                                        bool                          doPairSearch)
+{
+    excls_ = &exclusions;
+    if (!launched_)
+    {
+        prepare(xIn, box, numHomeAtoms, charges, idef, globalIndex, dd, doPairSearch);
+        if (useGpu_)
+        {
+            startGpu(lastTopologyChanged_);
+        }
+    }
+    launched_                  = false;
+    const bool topologyChanged = lastTopologyChanged_;
+    if (!useGpu_)
+    {
+        permanentDipoles();
+    }
     double t0 = now();
-    if (topologyChanged || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_)
+    // the nbnxm candidates: for the CPU kernels, GVDW and the pair check (the GPU engine has its own list)
+    const bool needCandidates = !useGpu_ || gvdw_ || checkPairs_;
+    if (needCandidates && (topologyChanged || !haveCandidates_ || static_cast<int>(tp_.size()) != nt_))
     {
         searchCandidates(nbv);
     }
     GMX_UNUSED_VALUE(shiftVectors);
-    buildPairs();
-    if (checkPairs_)
+    if (!useGpu_ || gvdw_)
+    {
+        buildPairs();
+    }
+    if (checkPairs_ && !useGpu_)
     {
         checkPairCount();
     }
@@ -1886,6 +2252,17 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
             fprintf(stderr, " %zu", T.numPairs());
         }
         fprintf(stderr, " (%d i-cluster items)\n", static_cast<int>(ciItems_.size()));
+    }
+    if (useGpu_)
+    {
+        if (tStart_ < 0)
+        {
+            tStart_ = t0;
+        }
+        finishGpu(forceWithVirial, enerd);
+        numCalls_++;
+        sumIterations_ += lastIterations_;
+        return;
     }
     splines();
     computeInfluence();
@@ -2158,36 +2535,7 @@ void PgmElectrostatics::Impl::calculate(ArrayRef<const RVec>          xIn,
     enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::CoulombSR][0] += ke_ * direct;
     enerd->term[InteractionFunction::CoulombReciprocalSpace] += ke_ * (reciprocal + self + background);
     enerd->term[InteractionFunction::PgmAtom] += ke_ * polarization;
-    if (gvdw_)
-    {
-        const std::vector<DVec>& Fg = gvdwForce_[0];
-        for (int i = 0; i < nHome_; i++)
-        {
-            for (int k = 0; k < DIM; k++)
-            {
-                f[i][k] += Fg[i][k];
-            }
-        }
-        matrix virG;
-        for (int a = 0; a < DIM; a++)
-        {
-            for (int b = 0; b < DIM; b++)
-            {
-                virG[a][b] = 0.5 * gvdwS_[3 * b + a];
-            }
-        }
-        forceWithVirial->addVirialContribution(virG);
-        enerd->grpp.energyGroupPairTerms[NonBondedEnergyTerms::LJSR][0] += gvdwEnergy_;
-        enerd->term[InteractionFunction::PgmGvdwPair] += gvdwPairEnergy_;
-        if (dispCorr_ != DispersionCorrectionType::No)
-        {
-            enerd->term[InteractionFunction::DispersionCorrection] += gvdwTail_;
-            if (dispCorr_ == DispersionCorrectionType::EnerPres || dispCorr_ == DispersionCorrectionType::AllEnerPres)
-            {
-                enerd->term[InteractionFunction::PressureDispersionCorrection] += c_presfac * gvdwTail_ / volume_;
-            }
-        }
-    }
+    addGvdwOutputs(f, forceWithVirial, enerd);
 
     static const char* dump = std::getenv("GMX_PGM_DUMP");
     if (dump && numCalls_ == 1 && dd_)
@@ -2284,12 +2632,39 @@ void PgmElectrostatics::calculate(ArrayRef<const RVec>          x,
                                   gmx_enerdata_t*               enerd,
                                   const StepWorkload&           stepWork)
 {
+    if (!impl_->launched_)
+    {
+        impl_->wantVirial_ = stepWork.computeVirial;
+    }
     impl_->calculate(x, box, numHomeAtoms, charges, nbv, idef, exclusions, shiftVectors, globalIndex, dd,
                      forceWithVirial, enerd, stepWork.doNeighborSearch);
 }
 
+void PgmElectrostatics::launch(ArrayRef<const RVec>          x,
+                               const matrix                  box,
+                               int                           numHomeAtoms,
+                               ArrayRef<const real>          charges,
+                               const InteractionDefinitions& idef,
+                               ArrayRef<const int>           globalIndex,
+                               const gmx_domdec_t*           dd,
+                               const StepWorkload&           stepWork)
+{
+    if (!impl_->useGpu_)
+    {
+        return;
+    }
+    const double t0     = Impl::now();
+    impl_->wantVirial_ = stepWork.computeVirial; // the GPU strain derivative only when needed
+    impl_->prepare(x, box, numHomeAtoms, charges, idef, globalIndex, dd, stepWork.doNeighborSearch);
+    impl_->startGpu(impl_->lastTopologyChanged_);
+    impl_->launched_ = true;
+    impl_->tLaunchEnd_ = Impl::now();
+    impl_->tPrep_ += impl_->tLaunchEnd_ - t0;
+}
+
 ArrayRef<const DVec> PgmElectrostatics::inducedDipoles() const
 {
+    impl_->fetchGpuDipoles();
     return impl_->mu_;
 }
 

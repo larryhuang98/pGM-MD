@@ -7,3 +7,4 @@ build_omm_login.out
 core/tests/run_dump
 core/tests/test_gvdw
 core/tests/test_core
+core/cuda/tests/test_cuda

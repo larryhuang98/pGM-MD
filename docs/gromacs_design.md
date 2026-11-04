@@ -44,9 +44,10 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
   q = 0 atoms with a dipole or polarizability (or `includeAllPairs`), so their clusters stay in the list.
 * **Domain decomposition** (later): halo exchange of the search direction / dipoles and reduction of the
   fields per CG iteration with `dd_move_x` / `dd_move_f`-style calls on rvec arrays.
-* **GPU** (later): pGM kernels on the GPU pairlist after `k_calc_nb` in the same stream (the GPU FEP kernel
-  `gpu_launch_free_energy_kernel` is the model), per-atom pGM buffers in `NBAtomDataGpu`, GPU PME with
-  dipoles, CG vectors on the device.
+* **GPU** (G3, done): the whole pGM electrostatics in a separate engine, `core/cuda/pgm_cuda` (own pair
+  list, PME of charges and dipoles with cuFFT, CG on the device, one CUDA graph per step), started by
+  `do_force` before the CPU short-range kernels on a worker thread and collected at the pGM hook; LJ and
+  GVDW stay on the CPU (`-nb cpu`).  See G3 below.
 
 ## Input
 
@@ -75,7 +76,7 @@ The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `co
 | G0 | directives, interaction functions, tpr, mdp options, `coulombtype = pGM` accepted by grompp; LJ-only nbnxm kernels without FMM | grompp + gmx dump; LJ energy of water512 = pGM-JAX's vdW |
 | G1 | mdrun CPU reference: pGM electrostatics over the nbnxm lists (scalar kernel), GROMACS PME extended to dipoles, CG, forces, energies, virial; single rank, OpenMP | water512 energies/forces/dipoles = OpenMM Reference / pGM-JAX; NVE drift; NPT density with C-rescale |
 | G2 | SIMD (4xM) pGM kernels, threaded PME paths | same numbers, speed |
-| G3 | CUDA: pGM pair kernels on the GPU list, GPU PME with dipoles, device CG | same numbers, speed vs pmemd.pgm.cuda |
+| G3 | CUDA: the pGM electrostatics on the GPU (own pair list, PME with dipoles, device CG), overlapped with the CPU short-range work | same numbers, speed vs pmemd.pgm.cuda |
 | G4 | domain decomposition, separate PME ranks | multi-rank = single-rank |
 
 ## Status
@@ -87,7 +88,8 @@ python3 gromacs/patches/apply.py gromacs/patches/g0a_interactions.py $SRC   # to
 python3 gromacs/patches/apply.py gromacs/patches/g0b_coulombtype.py $SRC    # coulombtype = pGM, mdp options
 bash    gromacs/patches/g0b_elecnone.sh $SRC                                # LJ-only nbnxm kernels always
 bash    gromacs/patches/g1_install.sh $SRC                                  # src/gromacs/pgm + hooks (g1_hooks.py,
-                                                                            # g1b_checks.py, g2_gvdw.py, g4_dd.py)
+                                                                            # g1b_checks.py, g2_gvdw.py, g4_dd.py,
+                                                                            # g3_gpu.py; core/cuda in CUDA builds)
 ```
 
 All stages are idempotent string replacements that fail loudly if upstream code moved.  Builds on
@@ -281,13 +283,72 @@ step) and does the whole FFT with its few threads.  A decomposed PME (below) is 
 `GMX_PGM_CHECK_PAIRS=1` counts, every step, the pairs within rc on all ranks against all pairs of the
 global coordinates (O(N^2), for testing) and lists missing ones on one rank.
 
+### G3 (done): the GPU
+
+`GMX_PGM_GPU=1` with a CUDA build, one rank, `-nb cpu`: the pGM electrostatics run in
+`core/cuda/pgm_cuda.{h,cu}` (`pgmcuda::Engine`, also usable outside GROMACS), compiled as a static
+library next to the module (libgromacs's CUDA flags forbid double precision; `g3_gpu.py` links it).
+GVDW, LJ, bonded terms and everything else stay on the CPU path.
+
+* **Pairs**: the engine's own list instead of the nbnxm lists (whose transfer cost more than the whole
+  GPU step): a cell list on the GPU (cells rl/2 wide, atoms sorted by cell with a stable radix sort, so
+  the list is deterministic), per atom the full list of the atoms within rl = rc + skin (0.15 nm, less in
+  small boxes; minimum image), rebuilt when an atom has moved by more than skin/2 or the box changed
+  (`GMX_PGM_GPU_SKIN`); GROMACS's reordering at every pair search also rebuilds it.  Each step one pass
+  compacts the pairs within rc (warp ballot, candidate order) with their kernels G1, G2 (field passes) and
+  G0, G3 (final pass); one warp per atom over its full list, so no atomics in the pair passes.
+* **Precision** as OpenMM's mixed mode: pair kernels, splines and grids in float, PME grid and covalent
+  forces in 64-bit fixed point (2^32), the CG vectors, dipoles, energies and the strain in double.
+* **PME**: splines once per step; spread one warp per atom over the p^3 points with the spline values in
+  lanes (shuffles); cuFFT R2C/C2R; gather one thread per atom with the splines in registers (the
+  instantiation with the second derivatives is the faster one on sm_120, so every gather uses it).
+* **CG**: Jacobi PCG over many blocks with atomic reductions, the mu3/mu4 predictor history on the device
+  in the global order, peek.  The whole evaluation (pairs, the permanent field, the guess, the CG loop
+  as a conditional while node, peek, history, final pass, reductions, copies to pinned host memory) is
+  one CUDA graph (CUDA >= 12.4; `PGM_CUDA_NO_GRAPH=1` runs the same kernels with a host-side loop); the
+  box is in constant memory, so the graph is only captured again when buffers grow.  The strain
+  derivative only on virial steps.
+* **Overlap**: `PgmElectrostatics::launch` (a second hook in `do_force`, before the CPU nonbonded
+  kernels) starts the evaluation on a worker thread; `calculate` at the usual hook waits for it and adds
+  forces, virial and energies.
+
+Validation (`tests/gmx/gpu_check.sh`, GPU against the CPU path of the same mixed build):
+
+| single point | Coulomb (SR) | Coul. recip. | pGM Polariz. | potential | pressure | max force diff (max \|F\|) |
+|---|---|---|---|---|---|---|
+| water512 | -2.9e-7 | -7e-8 | 1.3e-6 | -1.2e-7 | 0.06 bar | 7.8e-3 (3488) |
+| 4096 waters (benchmark settings) | -6.3e-7 | 0 | 9e-7 | -1.1e-7 | 0.04 bar | 1.5e-2 (1106) |
+| GVDW, overrides + tail | -1.9e-7 | 0 | 1.2e-6 | 0 | 0.03 bar | 9.4e-3 (3637) |
+
+(relative differences, float output).  `core/cuda/tests/test_cuda` checks the engine against pgm_core in
+double on a dump (total energy 7e-8 relative, dipoles 3e-6 relative, strain 8e-7) and its own list
+against given candidates and after displacements that rebuild it.  NVE, 4096 waters, 10 ps, 1 fs: total
+energy fluctuation 2.5 kJ/mol, drift -8.7 kJ/mol on the GPU, 2.0 and -7.3 kJ/mol on the CPU path.
+NPT water512 (C-rescale, 150 ps, GPU): density 1017.2 +- 1.8 kg/m^3, potential -2.11503e6 kJ/mol (CPU
+path: 1016.0 +- 4.2, -2.11497e6).
+
+Speed, 4096 waters (12288 atoms), pmemd's benchmark settings (rc 0.9 nm, beta 4/nm, 56^3, order 6, tol
+1e-4, mu4, peek 0.65, 1 fs, NVE), RTX PRO 6000 Blackwell, 8 CPU threads, ns/day:
+
+| | ns/day |
+|---|---|
+| GROMACS, pGM on the GPU (G3) | 94.6 |
+| pmemd.pgm.cuda (SPFP) | 91.7 |
+| OpenMM plugin, CUDA mixed | 77.2 |
+| GROMACS, CPU path (8 threads) | 4.3 |
+
+Per step (0.88 ms): launch 0.07 ms, GPU evaluation 0.55 ms (2 CG iterations; field pass 20 us, PME
+~60 us per field), of which the CPU's own nonbonded and other work hides 0.27 ms.  Ideas for more: one
+PME and one pair pass for the permanent field and the guess's field together (two grids in one complex
+FFT), the pair list kept across GROMACS's reordering, the GPU path with DD.
+
 ### Next
 
-1. **G3 (GPU)**: the pair passes and the PME on the GPU (the nbnxm GPU lists; the CG in one kernel
-   sequence as in the OpenMM plugin), the GPU PME grids.
-2. **Decomposed PME for DD**: spread into the local grid region only, send the parts to the owners of
+1. **Decomposed PME for DD**: spread into the local grid region only, send the parts to the owners of
    FFT slabs (`gmx_parallel_3dfft` with the PP communicator), distributed FFT and convolution, return
    the potential to the ranks whose atoms need it; instead of the whole-grid sum + redundant FFT.
+2. **GPU with DD**: one engine per rank on its home + halo atoms (the module's halo communication), or
+   one GPU engine for the whole system on the main rank.
 3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
    (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
 

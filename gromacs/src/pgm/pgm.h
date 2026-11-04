@@ -79,6 +79,17 @@ public:
                    gmx_enerdata_t*           enerd,
                    const StepWorkload&       stepWork);
 
+    /*! \brief Start the GPU part of calculate() (GMX_PGM_GPU) on a worker thread, with the arguments
+     * calculate() will get; calculate() then waits for it.  Without the GPU: nothing. */
+    void launch(ArrayRef<const RVec>          x,
+                const matrix                  box,
+                int                           numHomeAtoms,
+                ArrayRef<const real>          charges,
+                const InteractionDefinitions& idef,
+                ArrayRef<const int>           globalIndex,
+                const gmx_domdec_t*           dd,
+                const StepWorkload&           stepWork);
+
     //! The induced dipoles [e nm] of the last calculation (local atom order)
     ArrayRef<const DVec> inducedDipoles() const;
     //! The permanent (covalent) dipoles [e nm] of the last calculation
