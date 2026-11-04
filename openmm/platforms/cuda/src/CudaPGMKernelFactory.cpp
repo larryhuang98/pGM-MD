@@ -1,5 +1,6 @@
 #include "CommonGVDWKernels.h"
 #include "CommonPGMKernels.h"
+#include "CudaPGMKernels.h"
 #include "openmm/cuda/CudaContext.h"
 #include "openmm/cuda/CudaPlatform.h"
 #include "openmm/KernelFactory.h"
@@ -17,7 +18,7 @@ public:
     KernelImpl* createKernelImpl(std::string name, const Platform& platform, ContextImpl& context) const {
         CudaContext& cu = *static_cast<CudaPlatform::PlatformData*>(context.getPlatformData())->contexts[0];
         if (name == CalcPGMForceKernel::Name())
-            return new CommonCalcPGMForceKernel(name, platform, cu, context.getSystem());
+            return new CudaCalcPGMForceKernel(name, platform, cu, context.getSystem());
         if (name == CalcGVDWForceKernel::Name())
             return new CommonCalcGVDWForceKernel(name, platform, cu, context.getSystem());
         throw OpenMMException((std::string("Tried to create kernel with illegal kernel name '")+name+"'").c_str());

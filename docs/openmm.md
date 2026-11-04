@@ -9,7 +9,8 @@ stays in OpenMM's NonbondedForce (with the topology's exclusions).
 | Platform | Implementation |
 |---|---|
 | Reference, CPU | `core/pgm_core.cpp` (double precision, O(N^2) pair search: for tests and small systems) |
-| CUDA, OpenCL | Common kernels `openmm/platforms/common/src/kernels/pgm*.cc` (tile pair kernels on OpenMM's neighbour list, PME of charges + dipoles, CG solver on the device) |
+| CUDA, mixed precision, PME | `core/cuda/pgm_cuda.cu` (the engine of the GROMACS module, `docs/gromacs_design.md` G3) on OpenMM's device data: `CudaPGMKernels.cpp` |
+| CUDA (other precisions, no cutoff), OpenCL | Common kernels `openmm/platforms/common/src/kernels/pgm*.cc` (tile pair kernels on OpenMM's neighbour list, PME of charges + dipoles, CG solver on the device); `PGM_OPENMM_COMMON=1` uses them for CUDA mixed too |
 | GVDW, Reference / CPU | `ReferenceGVDWKernels.cpp`: double precision, all pairs of the atoms that carry GVDW, `core/gvdw_kernel.h` |
 | XML serialization | `serialization/`: proxies for both forces (`XmlSerializer`, System files), registered when the library loads |
 | GVDW, CUDA / OpenCL | `kernels/gvdwPair.cc` (the pair, shared), `gvdwNonbonded.cc` (combination-rule pairs in OpenMM's nonbonded tile kernel, exception pairs excluded), `gvdwExceptions.cc` (exceptions with parameters, BondedUtilities); dispersion correction on the host |
@@ -144,6 +145,20 @@ CUDA mixed: 141 ns/day, fluctuation 0.5 kJ/mol.  Speed against pmemd-pgm on the 
 (4096 waters, 12288 atoms, cut 0.9 nm, beta 4/nm, 56^3, order 6, tol 1e-4, 1 fs, NVE, 2000 steps):
 pmemd.pgm.cuda_SPFP 91.7 ns/day, this plugin (CUDA mixed, `md_nve.py`, with energy reports) 77.2 ns/day,
 2 CG iterations per step; total energies agree (-9.2612e6 kJ/mol).
+
+CUDA mixed precision with PME now runs the pgm_cuda engine (own GPU pair list with skin and predictive
+rebuilds, fused pair setup and first field pass, the whole step as one CUDA graph with the CG in a
+conditional while node; `docs/gromacs_design.md`, G3).  It reads OpenMM's `posq` on the device, adds its
+forces to OpenMM's fixed-point force buffer (2^32) and follows OpenMM's atom reordering (parameters and
+covalent dipoles permuted by `getAtomIndex`, the predictor history kept in the original order).
+`runs/gpu_tests.sh` with it: all API tests passed; mixed vs CPU energies 1e-7 relative, forces max 0.14
+kJ/mol/nm (rms 1500), induced dipoles 1e-6 (as the Common kernels in single precision).
+Speed (the benchmark above, 10000 steps, energy every 1000): 107-115 ns/day over 7 runs (Common kernels
+80.8, pmemd.pgm.cuda 91.7, GROMACS G3 124); NVE drift 0.10-0.18 kJ/mol/ps, fluctuation 0.5-0.6 kJ/mol.
+NVE water512: 213 ns/day (Common 141).  The engine stream is non-blocking (a capture on a blocking stream
+is invalidated when another thread uses the legacy stream: this ended some runs with
+`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`); a failed capture is ended and retried once, then the engine
+runs without graphs.
 
 The conda environment's NVRTC 13.4 emits PTX the 13.3 driver rejects (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
 for OpenMM's own kernels too): `LD_PRELOAD` an NVRTC 13.0 (`~/project/ext/nvrtc13.0`, conda-forge

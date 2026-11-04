@@ -32,7 +32,8 @@ struct Settings {
     double peek = 0.65;
     int predictor = 2;       // 0 none, 1 mu3, 2 mu4 (history in the global order)
     double ke = 138.935458;  // Coulomb constant [kJ mol^-1 nm e^-2]
-    int device = 0;
+    int device = 0;          // < 0: the CUDA context current on the calling thread (e.g. OpenMM's), never
+                             // switched
     double skin = 0.15;      // own pair list: radius cutoff + skin (less in small boxes), rebuilt when atoms
                              // moved > skin / 2 [nm]
 };
@@ -80,6 +81,14 @@ public:
      * next call): no copies for callers in single precision. */
     Terms computeF(const float* pos, const double box[3][3], bool newStep, double* strain);
     const double* forces() const;
+    /**
+     * compute() on device data of a caller on the same GPU context (OpenMM): positions xyz from the
+     * device array posq4 (float4, w ignored, local order), forces added atomically to the device fixed-point
+     * buffer forceFixed (x of atom i at i, y at i + stride, z at i + 2 stride, scale fixedScale); stream:
+     * the caller's stream (cudaStream_t), whose work so far comes first.  Returns after the evaluation.
+     */
+    Terms computeDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed, int stride,
+                        double fixedScale, void* stream);
 
     int iterations() const;
     double residual() const;

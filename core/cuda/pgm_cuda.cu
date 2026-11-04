@@ -605,6 +605,21 @@ __global__ void remapAtoms(int n, const int* newOf, const float4* a, const float
     }
 }
 
+__global__ void packPositions4(int n, const float4* x, const float* q, float4* posq) {
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        const float4 a = x[i];
+        posq[i] = make_float4(a.x, a.y, a.z, q[i]);
+    }
+}
+
+/** forceFixed += f (3n, interleaved) in the caller's layout. */
+__global__ void addForcesFixed(int n, const double* f, long long* out, int stride, double scale) {
+    for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < 3*n; k += gridDim.x*blockDim.x) {
+        const int i = k/3, c = k%3;
+        atomicAdd((ull*) (out+i+(size_t) c*stride), (ull) (long long) llrint(f[k]*scale));
+    }
+}
+
 __global__ void packPositions(int n, const float* x, const float* q, float4* posq) {
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x)
         posq[i] = make_float4(x[3*i], x[3*i+1], x[3*i+2], q[i]);
@@ -1431,8 +1446,10 @@ struct DevArray {
     }
     void upload(const T* h, size_t n) {   // synchronous
         resize(n);
-        if (n)
+        if (n) {
             CU(cudaMemcpy(ptr, h, n*sizeof(T), cudaMemcpyHostToDevice));
+            CU(cudaStreamSynchronize(0));   // (pageable: the DMA may still run) before the engine stream reads it
+        }
     }
     void download(T* h, size_t n) const {   // synchronous
         if (n)
@@ -1530,9 +1547,10 @@ struct Engine::Impl {
     bool useGraphs = false;
     cudaGraphExec_t exec[4] = {nullptr, nullptr, nullptr, nullptr};
     long execAllocations[4] = {-1, -1, -1, -1};
-    std::array<long long, 7> execKey[4];
-    std::array<long long, 7> graphKey() const {   // the host values the graph's kernels take as parameters
-        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0, gvdwOn ? 1 : 0, usePosF ? 1 : 0};
+    std::array<long long, 10> execKey[4];
+    std::array<long long, 10> graphKey() const {   // the host values the graph's kernels take as parameters
+        return {n, ncov, nGlobal, polarizable ? 1 : 0, externalList ? 1 : 0, gvdwOn ? 1 : 0, usePosF ? 1 : 0,
+                (long long) devPos, (long long) devForce, devStride};
     }
     double pairRadius() const { return gvdwOn ? std::max(s.cutoff, rvdw) : s.cutoff; }
     void markSkipList();
@@ -1581,6 +1599,7 @@ struct Engine::Impl {
     void enqueueCgIteration(CondHandle h, bool useHandle);
     void enqueuePost(bool strain);
     void captureGraph(bool strain, bool dual);
+    bool tryCapture(bool strain, bool dual);
     Terms evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
                    double* strain);
     // positions straight from the caller's (registered) float array
@@ -1590,6 +1609,12 @@ struct Engine::Impl {
     DevArray<float> pos3, qF;
     bool registerPositions(const float* p);
     void uploadPositions();
+    // device input / output (computeDevice)
+    const float4* devPos = nullptr;
+    long long* devForce = nullptr;
+    int devStride = 0;
+    double devScale = 0;
+    cudaEvent_t devEvent = nullptr;
     void releaseGraphs();
 };
 
@@ -1815,6 +1840,10 @@ void Engine::Impl::fieldDual(bool pairsDone) {
 /** Pairs, covalent dipoles, splines; polarizable: b = the field of the charges and permanent dipoles, the
  * initial guess x and T x (dual: the guess from the history, both fields together). */
 void Engine::Impl::uploadPositions() {
+    if (devPos) {
+        packPositions4<<<blocksFor(n, 256), 256, 0, st>>>(n, devPos, qF.ptr, posq.ptr);
+        return;
+    }
     CU(cudaMemcpyAsync(pos3.ptr, regPtr, 3*(size_t) n*sizeof(float), cudaMemcpyHostToDevice, st));
     packPositions<<<blocksFor(n, 256), 256, 0, st>>>(n, pos3.ptr, qF.ptr, posq.ptr);
 }
@@ -1843,7 +1872,7 @@ bool Engine::Impl::registerPositions(const float* p) {
 
 void Engine::Impl::enqueuePre(bool dual) {
     const int m = 3*n;
-    if (usePosF)
+    if (usePosF || devPos)
         uploadPositions();
     if (!externalList) {
         CU(cudaMemsetAsync(maxDisp.ptr, 0, 2*sizeof(unsigned), st));
@@ -1965,7 +1994,10 @@ void Engine::Impl::enqueuePost(bool strain) {
     else
         finalReduce<false><<<rblocks, 256, 0, st>>>(n, s.ke, frc.ptr, fpair.ptr, frec.ptr, erec.ptr, dTot.ptr, x.ptr,
                                                     alphaD.ptr, fOut.ptr, acc.ptr);
-    CU(cudaMemcpyAsync(fH.ptr, fOut.ptr, m*sizeof(double), cudaMemcpyDeviceToHost, st));
+    if (devForce)
+        addForcesFixed<<<blocksFor(m, 256), 256, 0, st>>>(n, fOut.ptr, devForce, devStride, devScale);
+    else
+        CU(cudaMemcpyAsync(fH.ptr, fOut.ptr, m*sizeof(double), cudaMemcpyDeviceToHost, st));
     CU(cudaMemcpyAsync(accH.ptr, acc.ptr, NACC*sizeof(double), cudaMemcpyDeviceToHost, st));
     CU(cudaMemcpyAsync(scalH.ptr, scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, st));
 }
@@ -1976,6 +2008,33 @@ void Engine::Impl::releaseGraphs() {
             cudaGraphExecDestroy(exec[v]);
             exec[v] = nullptr;
         }
+}
+
+/** captureGraph; on a failure the capture is ended (the stream usable again), false after a second one. */
+bool Engine::Impl::tryCapture(bool strain, bool dual) {
+#if PGM_CUDA_GRAPHS
+    for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+            captureGraph(strain, dual);
+            return true;
+        }
+        catch (const std::exception& e) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(st, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+                cudaGraph_t g = nullptr;
+                cudaStreamEndCapture(st, &g);
+                if (g)
+                    cudaGraphDestroy(g);
+            }
+            cudaGetLastError();
+            fprintf(stderr, "pgm_cuda: graph capture failed (%s)%s\n", e.what(),
+                    attempt == 0 ? ", retrying" : ", running without graphs");
+        }
+    }
+#endif
+    (void) strain;
+    (void) dual;
+    return false;
 }
 
 /** The whole evaluation as one graph: pre, CG init, while (CG iteration), post. */
@@ -2033,8 +2092,11 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     impl->s = settings;
     if (settings.order < 3 || settings.order > MAX_ORDER)
         throw std::runtime_error("pgm_cuda: PME order must be 3..12");
-    CU(cudaSetDevice(settings.device));
-    CU(cudaStreamCreate(&impl->st));   // blocking: ordered after the synchronous set-up copies
+    if (settings.device >= 0)
+        CU(cudaSetDevice(settings.device));
+    // non-blocking: no implicit order with the legacy stream, whose use by another thread would invalidate a
+    // capture; the synchronous set-up copies wait for their completion (DevArray)
+    CU(cudaStreamCreateWithFlags(&impl->st, cudaStreamNonBlocking));
     const int K1 = settings.grid[0], K2 = settings.grid[1], K3 = settings.grid[2];
     CUFFT(cufftPlan3d(&impl->planF, K1, K2, K3, CUFFT_R2C));
     CUFFT(cufftPlan3d(&impl->planB, K1, K2, K3, CUFFT_C2R));
@@ -2068,6 +2130,8 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
 
 Engine::~Engine() {
     impl->releaseGraphs();
+    if (impl->devEvent)
+        cudaEventDestroy(impl->devEvent);
     if (impl->regPtr)
         cudaHostUnregister(const_cast<float*>(impl->regPtr));
     if (impl->planF)
@@ -2086,7 +2150,8 @@ Engine::~Engine() {
 void Engine::setAtoms(int n, const double* q, const double* radius, const double* alpha, const int* globalIndex,
                       int numGlobal) {
     Impl& I = *impl;
-    CU(cudaSetDevice(I.s.device));
+    if (I.s.device >= 0)
+        CU(cudaSetDevice(I.s.device));
     CU(cudaStreamSynchronize(I.st));
     const bool resized = (n != I.n || numGlobal != I.nGlobal);
     if (resized)
@@ -2313,12 +2378,31 @@ Terms Engine::computeF(const float* pos, const double box[3][3], bool newStep, d
 
 const double* Engine::forces() const { return impl->fH.ptr; }
 
+Terms Engine::computeDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed,
+                            int stride, double fixedScale, void* stream) {
+    Impl& I = *impl;
+    if (!I.devEvent)
+        CU(cudaEventCreateWithFlags(&I.devEvent, cudaEventDisableTiming));
+    // the caller's work so far (its positions, its cleared force buffer) before ours
+    CU(cudaEventRecord(I.devEvent, (cudaStream_t) stream));
+    CU(cudaStreamWaitEvent(I.st, I.devEvent, 0));
+    I.devPos = (const float4*) posq4;
+    I.devForce = forceFixed;
+    I.devStride = stride;
+    I.devScale = fixedScale;
+    const Terms t = I.evaluate(nullptr, nullptr, box, newStep, nullptr, nullptr);
+    I.devPos = nullptr;
+    I.devForce = nullptr;
+    return t;
+}
+
 Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
                              double* strain) {
     Impl& I = *this;
     const int n = I.n, m = 3*n;
     const Settings& s = I.s;
-    CU(cudaSetDevice(s.device));   // the calling thread may be another than the constructor's
+    if (s.device >= 0)
+        CU(cudaSetDevice(s.device));   // the calling thread may be another than the constructor's
     const double tA = I.timing ? wallSeconds() : 0;
     // box, reciprocal box, volume
     const double (*H)[3] = box;
@@ -2348,20 +2432,21 @@ Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double 
     // float positions in host memory registered with CUDA: the upload and the packing with the charges
     // are part of the evaluation (graph); else packed here into pinned memory
     I.usePosF = posF && I.registerPositions(posF);
-    if (posF && !I.usePosF)
+    // (computeDevice: packed on the device)
+    if (!I.devPos && posF && !I.usePosF)
         for (int i = 0; i < n; i++) {
             pq[i].x = posF[3*i];
             pq[i].y = posF[3*i+1];
             pq[i].z = posF[3*i+2];
         }
-    else if (!posF)
+    else if (!I.devPos && !posF)
         for (int i = 0; i < n; i++) {
             pq[i].x = (float) pos[3*i];
             pq[i].y = (float) pos[3*i+1];
             pq[i].z = (float) pos[3*i+2];
         }
     CU(cudaMemcpyToSymbolAsync(c_box, I.boxH.ptr, sizeof(Box), 0, cudaMemcpyHostToDevice, I.st));
-    if (!I.usePosF)
+    if (!I.usePosF && !I.devPos)
         CU(cudaMemcpyAsync(I.posq.ptr, pq, n*sizeof(float4), cudaMemcpyHostToDevice, I.st));
     else if (I.listStaleBefore())
         I.uploadPositions();   // the list build needs them before the evaluation
@@ -2401,7 +2486,11 @@ Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double 
         if (I.useGraphs) {
             const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
             if (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey())
-                I.captureGraph(wantStrain, dual);
+                if (!I.tryCapture(wantStrain, dual))
+                    I.useGraphs = false;
+        }
+        if (I.useGraphs) {
+            const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
             CU(cudaGraphLaunch(I.exec[v], I.st));
             CU(cudaStreamSynchronize(I.st));
             it = (int) I.scalH.ptr[9];
