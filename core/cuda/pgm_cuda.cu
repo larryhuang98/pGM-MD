@@ -1602,6 +1602,23 @@ struct Engine::Impl {
     bool tryCapture(bool strain, bool dual);
     Terms evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
                    double* strain);
+    // evaluate = begin (inputs, list, guess, the evaluation enqueued) + finish (wait, check, outputs)
+    void begin(const double* pos, const float* posF, const double box[3][3], bool newStep, bool wantStrain);
+    bool finish(double* f, double* strain, Terms& t, bool canRepeat = true);
+    void settle() {   // completes an evaluation launched by launchDevice (its bookkeeping)
+        if (inFlight) {
+            Terms t;
+            finish(nullptr, nullptr, t, false);
+        }
+    }
+    bool inFlight = false;
+    cudaEvent_t doneEvent = nullptr;
+    Terms lastTerms;
+    long numLate = 0;   // out-of-date lists found after the forces were used (launchDevice without finishDevice)
+    bool retry = false;        // the last evaluation used an out-of-date list: the next repeats it (same guess)
+    bool pendingPush = false;  // the evaluation in flight enters the predictor history
+    int pendingIt = 0;
+    double pendingErr = 0, tStamp[3] = {0, 0, 0};
     // positions straight from the caller's (registered) float array
     const float* regPtr = nullptr;
     size_t regBytes = 0;
@@ -2129,7 +2146,11 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
 }
 
 Engine::~Engine() {
+    if (impl->inFlight)
+        cudaStreamSynchronize(impl->st);
     impl->releaseGraphs();
+    if (impl->doneEvent)
+        cudaEventDestroy(impl->doneEvent);
     if (impl->devEvent)
         cudaEventDestroy(impl->devEvent);
     if (impl->regPtr)
@@ -2150,6 +2171,7 @@ Engine::~Engine() {
 void Engine::setAtoms(int n, const double* q, const double* radius, const double* alpha, const int* globalIndex,
                       int numGlobal) {
     Impl& I = *impl;
+    I.settle();
     if (I.s.device >= 0)
         CU(cudaSetDevice(I.s.device));
     CU(cudaStreamSynchronize(I.st));
@@ -2269,6 +2291,7 @@ void Engine::Impl::remapList(const std::vector<int>& newOf) {
 void Engine::setGvdw(int repulsion, double rvdw, const double* sqrtA, const double* sqrtC6, const double* b,
                      int nskip, const int* skipI, const int* skipJ) {
     Impl& I = *impl;
+    I.settle();
     CU(cudaStreamSynchronize(I.st));
     const int n = I.n;
     std::vector<float4> gvH(n);
@@ -2302,6 +2325,7 @@ void Engine::setGvdw(int repulsion, double rvdw, const double* sqrtA, const doub
 
 void Engine::setCovalent(int ncov, const int* atom, const int* partner, const double* strength) {
     Impl& I = *impl;
+    I.settle();
     CU(cudaStreamSynchronize(I.st));
     I.ncov = ncov;
     std::vector<int> start(I.n+1, 0), partnerS(ncov);
@@ -2326,6 +2350,7 @@ void Engine::setCovalent(int ncov, const int* atom, const int* partner, const do
 
 void Engine::setCandidates(int nseg, const int* segI, const int* segShift, const int* segBegin, const int* candJ) {
     Impl& I = *impl;
+    I.settle();
     CU(cudaStreamSynchronize(I.st));
     const int n = I.n;
     // the full list: (i, j, t) and (j, i, -t), per atom; shifts packed 4 bits per component (|t| <= 7)
@@ -2378,28 +2403,64 @@ Terms Engine::computeF(const float* pos, const double box[3][3], bool newStep, d
 
 const double* Engine::forces() const { return impl->fH.ptr; }
 
-Terms Engine::computeDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed,
-                            int stride, double fixedScale, void* stream) {
+void Engine::launchDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed, int stride,
+                          double fixedScale, void* stream) {
     Impl& I = *impl;
+    I.settle();   // the bookkeeping of the evaluation before (deferred: its list check now)
     if (!I.devEvent)
         CU(cudaEventCreateWithFlags(&I.devEvent, cudaEventDisableTiming));
-    // the caller's work so far (its positions, its cleared force buffer) before ours
+    if (!I.doneEvent)
+        CU(cudaEventCreateWithFlags(&I.doneEvent, cudaEventDisableTiming));
+    // the work of the caller so far (its positions, its cleared force buffer) before ours
     CU(cudaEventRecord(I.devEvent, (cudaStream_t) stream));
     CU(cudaStreamWaitEvent(I.st, I.devEvent, 0));
     I.devPos = (const float4*) posq4;
     I.devForce = forceFixed;
     I.devStride = stride;
     I.devScale = fixedScale;
-    const Terms t = I.evaluate(nullptr, nullptr, box, newStep, nullptr, nullptr);
+    I.begin(nullptr, nullptr, box, newStep, false);
+    CU(cudaEventRecord(I.doneEvent, I.st));
+    I.inFlight = true;
     I.devPos = nullptr;
     I.devForce = nullptr;
+}
+
+void Engine::waitDevice(void* stream) {
+    if (impl->inFlight)
+        CU(cudaStreamWaitEvent((cudaStream_t) stream, impl->doneEvent, 0));
+}
+
+bool Engine::finishDevice(Terms& terms) {
+    if (!impl->inFlight) {
+        terms = impl->lastTerms;
+        return true;
+    }
+    return impl->finish(nullptr, nullptr, terms);
+}
+
+Terms Engine::computeDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed,
+                            int stride, double fixedScale, void* stream) {
+    Terms t;
+    do
+        launchDevice(posq4, box, newStep, forceFixed, stride, fixedScale, stream);
+    while (!finishDevice(t));
     return t;
 }
 
 Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double box[3][3], bool newStep, double* f,
                              double* strain) {
+    settle();
+    Terms t;
+    do
+        begin(pos, posF, box, newStep, strain != nullptr);
+    while (!finish(f, strain, t));
+    return t;
+}
+
+void Engine::Impl::begin(const double* pos, const float* posF, const double box[3][3], bool newStep,
+                         bool wantStrain) {
     Impl& I = *this;
-    const int n = I.n, m = 3*n;
+    const int n = I.n;
     const Settings& s = I.s;
     if (s.device >= 0)
         CU(cudaSetDevice(s.device));   // the calling thread may be another than the constructor's
@@ -2455,147 +2516,174 @@ Terms Engine::Impl::evaluate(const double* pos, const float* posF, const double 
     if (I.listStaleBefore())
         I.buildList();
 
-    // the initial guess and the history slots
+    // the initial guess and the history slots (a repeated evaluation: those of the first)
     Control& c = *I.ctlH.ptr;
-    const int h = I.numHist;
-    for (int k = 0; k < 4; k++)
-        c.c[k] = 0;
-    if (!newStep && h > 0)
-        c.c[0] = 1;
-    else if (s.predictor == 2 && h >= 4)
-        c.c[0] = 4, c.c[1] = -6, c.c[2] = 4, c.c[3] = -1;
-    else if (s.predictor >= 1 && h >= 3)
-        c.c[0] = 3, c.c[1] = -3, c.c[2] = 1;
-    else if (s.predictor >= 1 && h >= 1)
-        c.c[0] = 1;
-    c.head = I.head;
-    const bool push = I.polarizable && (newStep || h == 0);
-    c.pushSlot = push ? (I.head+NHIST-1)%NHIST : -1;   // a slot the guess does not read becomes the newest
+    if (!I.retry) {
+        const int h = I.numHist;
+        for (int k = 0; k < 4; k++)
+            c.c[k] = 0;
+        if (!newStep && h > 0)
+            c.c[0] = 1;
+        else if (s.predictor == 2 && h >= 4)
+            c.c[0] = 4, c.c[1] = -6, c.c[2] = 4, c.c[3] = -1;
+        else if (s.predictor >= 1 && h >= 3)
+            c.c[0] = 3, c.c[1] = -3, c.c[2] = 1;
+        else if (s.predictor >= 1 && h >= 1)
+            c.c[0] = 1;
+        c.head = I.head;
+        I.pendingPush = I.polarizable && (newStep || h == 0);
+        c.pushSlot = I.pendingPush ? (I.head+NHIST-1)%NHIST : -1;   // a slot the guess does not read: the newest
+    }
     CU(cudaMemcpyAsync(I.ctl.ptr, I.ctlH.ptr, sizeof(Control), cudaMemcpyHostToDevice, I.st));
-
-    const bool wantStrain = (strain != nullptr);
     // the permanent field and the guess's field together when the guess comes from the history
     static const bool noDual = std::getenv("PGM_CUDA_NO_DUAL") != nullptr;
     const bool dual = I.polarizable && c.c[0] != 0 && I.dualOrder() && !noDual;
     const double tC = I.timing ? wallSeconds() : 0;
+    if (I.timing) {
+        I.tPhase[0] += tB-tA;
+        I.tPhase[1] += tC-tB;
+        I.tStamp[0] = tC;
+    }
+    if (I.gvdwOn && !I.skipsMarked)
+        I.markSkipList();
+    const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
+    if (I.useGraphs && (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey()))
+        if (!I.tryCapture(wantStrain, dual))
+            I.useGraphs = false;
+    if (I.useGraphs) {
+        CU(cudaGraphLaunch(I.exec[v], I.st));
+        return;
+    }
     int it = 0;
     double err = 0;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        if (I.gvdwOn && !I.skipsMarked)
-            I.markSkipList();
-        if (I.useGraphs) {
-            const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
-            if (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey())
-                if (!I.tryCapture(wantStrain, dual))
-                    I.useGraphs = false;
-        }
-        if (I.useGraphs) {
-            const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
-            CU(cudaGraphLaunch(I.exec[v], I.st));
+    I.enqueuePre(dual);
+    if (I.polarizable) {
+        I.enqueueCgInit(0, false, dual);
+        CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
+        CU(cudaStreamSynchronize(I.st));
+        err = I.scalH.ptr[2];
+        while (err > s.tol && it < s.maxIter) {
+            I.enqueueCgIteration(0, false);
+            CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
             CU(cudaStreamSynchronize(I.st));
-            it = (int) I.scalH.ptr[9];
             err = I.scalH.ptr[2];
+            it++;
         }
-        else {
-            it = 0;
-            I.enqueuePre(dual);
-            if (I.polarizable) {
-                I.enqueueCgInit(0, false, dual);
-                CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
-                CU(cudaStreamSynchronize(I.st));
-                err = I.scalH.ptr[2];
-                while (err > s.tol && it < s.maxIter) {
-                    I.enqueueCgIteration(0, false);
-                    CU(cudaMemcpyAsync(I.scalH.ptr, I.scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, I.st));
-                    CU(cudaStreamSynchronize(I.st));
-                    err = I.scalH.ptr[2];
-                    it++;
-                }
-            }
-            I.enqueuePost(wantStrain);
-            CU(cudaStreamSynchronize(I.st));
-        }
-        if (attempt == 0 && !I.externalList) {   // this step's largest move (not over a reordering)
-            float s2;
-            std::memcpy(&s2, I.dispH.ptr+1, sizeof(float));
-            if (I.prevValid)
-                I.lastS2 = s2;
-            I.prevValid = true;
-        }
-        if (!I.listStaleAfter())
-            break;
-        I.buildList();   // the prediction failed: rebuild and repeat
-        I.numRepeats++;
     }
-    if (!I.externalList) {
-        float d2;
-        std::memcpy(&d2, I.dispH.ptr, sizeof(float));
-        I.lastD2 = d2;
-    }
-    const double tD = I.timing ? wallSeconds() : 0;
-    if (!I.polarizable)
-        it = 0, err = 0;
-    if (push) {
-        I.head = c.pushSlot;
-        I.numHist = std::min(I.numHist+1, 4);
-    }
-    I.lastIterations = it;
-    I.lastResidual = err;
+    I.enqueuePost(wantStrain);
+    I.pendingIt = it;
+    I.pendingErr = err;
+}
 
-    const double* accH = I.accH.ptr;
+/** Waits for the evaluation that begin() enqueued; false: its list was out of date (rebuilt now), repeat it. */
+bool Engine::Impl::finish(double* f, double* strain, Terms& t, bool canRepeat) {
+    const int m = 3*n;
+    inFlight = false;
+    CU(cudaStreamSynchronize(st));
+    int it = pendingIt;
+    double err = pendingErr;
+    if (useGraphs) {
+        it = (int) scalH.ptr[9];
+        err = scalH.ptr[2];
+    }
+    if (!retry && !externalList) {   // the largest move of this step (not over a reordering)
+        float s2;
+        std::memcpy(&s2, dispH.ptr+1, sizeof(float));
+        if (prevValid)
+            lastS2 = s2;
+        prevValid = true;
+    }
+    bool rebuilt = false;
+    if (!retry && listStaleAfter()) {
+        buildList();   // the prediction failed: rebuild and repeat
+        if (canRepeat) {
+            numRepeats++;
+            retry = true;
+            return false;
+        }
+        numLate++;   // too late to repeat: the next evaluation has the new list
+        rebuilt = true;
+    }
+    retry = false;
+    if (!externalList && !rebuilt) {
+        float d2;
+        std::memcpy(&d2, dispH.ptr, sizeof(float));
+        lastD2 = d2;
+    }
+    const double tD = timing ? wallSeconds() : 0;
+    if (!polarizable)
+        it = 0, err = 0;
+    if (pendingPush) {
+        head = ctlH.ptr->pushSlot;
+        numHist = std::min(numHist+1, 4);
+    }
+    lastIterations = it;
+    lastResidual = err;
+    const double* acc = accH.ptr;
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
-    Terms t;
-    t.direct = s.ke*accH[0];
-    t.reciprocal = s.ke*accH[10];
-    t.self = s.ke*(-(s.beta/pgmcore::SQRT_PI)*I.q2-0.5*cs*accH[29]);
-    const double background = -pgmcore::PI*I.Qtot*I.Qtot/(2.0*I.volume*s.beta*s.beta);
+    t = Terms();
+    t.direct = s.ke*acc[0];
+    t.reciprocal = s.ke*acc[10];
+    t.self = s.ke*(-(s.beta/pgmcore::SQRT_PI)*q2-0.5*cs*acc[29]);
+    const double background = -pgmcore::PI*Qtot*Qtot/(2.0*volume*s.beta*s.beta);
     t.background = s.ke*background;
-    t.polarization = s.ke*accH[30];
-    t.gvdw = I.gvdwOn ? accH[40] : 0.0;
+    t.polarization = s.ke*acc[30];
+    t.gvdw = gvdwOn ? acc[40] : 0.0;
     if (f)
         for (int k = 0; k < m; k++)
-            f[k] += I.fH.ptr[k];
+            f[k] += fH.ptr[k];
     if (strain) {
         double S[9];
         for (int a = 0; a < 9; a++)
-            S[a] = accH[1+a]+accH[11+a]+accH[20+a]+accH[31+a];
+            S[a] = acc[1+a]+acc[11+a]+acc[20+a]+acc[31+a];
         for (int a = 0; a < 3; a++)
             S[4*a] -= background;
         for (int a = 0; a < 9; a++)
             strain[a] += s.ke*S[a];
     }
     CU(cudaGetLastError());
-    if (I.timing) {
+    if (timing) {
         const double tE = wallSeconds();
-        I.tPhase[0] += tB-tA;
-        I.tPhase[1] += tC-tB;
-        I.tPhase[2] += tD-tC;
-        I.tPhase[3] += tE-tD;
-        if (++I.numCalls%1000 == 0)
+        tPhase[2] += tD-tStamp[0];
+        tPhase[3] += tE-tD;
+        if (++numCalls%1000 == 0)
             fprintf(stderr,
                     "pgm_cuda ms per call (%ld): inputs %.3f, list builds %.3f, GPU %.3f, outputs %.3f; %ld builds, "
-                    "%ld repeated evaluations\n",
-                    I.numCalls, 1e3*I.tPhase[0]/I.numCalls, 1e3*I.tPhase[1]/I.numCalls, 1e3*I.tPhase[2]/I.numCalls,
-                    1e3*I.tPhase[3]/I.numCalls, I.numBuilds, I.numRepeats);
+                    "%ld repeated evaluations, %ld found late\n",
+                    numCalls, 1e3*tPhase[0]/numCalls, 1e3*tPhase[1]/numCalls, 1e3*tPhase[2]/numCalls,
+                    1e3*tPhase[3]/numCalls, numBuilds, numRepeats, numLate);
     }
-    return t;
+    lastTerms = t;
+    return true;
 }
 
-int Engine::iterations() const { return impl->lastIterations; }
-double Engine::residual() const { return impl->lastResidual; }
+int Engine::iterations() const {
+    impl->settle();
+    return impl->lastIterations;
+}
+double Engine::residual() const {
+    impl->settle();
+    return impl->lastResidual;
+}
 void Engine::inducedDipoles(double* mu) const {
+    impl->settle();
     if (!impl->muValid)
         impl->x.download(impl->mu.data(), 3*(size_t) impl->n);
     impl->muValid = true;
     std::copy(impl->mu.begin(), impl->mu.end(), mu);
 }
 void Engine::permanentDipoles(double* p) const {
+    impl->settle();
     if (!impl->permValid)
         impl->perm.download(impl->permH.data(), 3*(size_t) impl->n);
     impl->permValid = true;
     std::copy(impl->permH.begin(), impl->permH.end(), p);
 }
-void Engine::resetHistory() { impl->numHist = 0; }
+void Engine::resetHistory() {
+    impl->settle();
+    impl->numHist = 0;
+}
+long Engine::lateListChecks() const { return impl->numLate; }
 long Engine::listBuilds() const { return impl->numBuilds; }
 int Engine::numCandidates() const { return impl->ncand; }
 

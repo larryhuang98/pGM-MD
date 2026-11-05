@@ -153,9 +153,33 @@ forces to OpenMM's fixed-point force buffer (2^32) and follows OpenMM's atom reo
 covalent dipoles permuted by `getAtomIndex`, the predictor history kept in the original order).
 `runs/gpu_tests.sh` with it: all API tests passed; mixed vs CPU energies 1e-7 relative, forces max 0.14
 kJ/mol/nm (rms 1500), induced dipoles 1e-6 (as the Common kernels in single precision).
-Speed (the benchmark above, 10000 steps, energy every 1000): 107-115 ns/day over 7 runs (Common kernels
-80.8, pmemd.pgm.cuda 91.7, GROMACS G3 124); NVE drift 0.10-0.18 kJ/mol/ps, fluctuation 0.5-0.6 kJ/mol.
-NVE water512: 213 ns/day (Common 141).  The engine stream is non-blocking (a capture on a blocking stream
+Speed (the benchmark above, 10000 steps, energy every 1000): 152-154 ns/day (Common kernels 99,
+pmemd.pgm.cuda 91.7, GROMACS G3 124 at nstlist 10, 155 at 40); NVE drift 0.11-0.19 kJ/mol/ps, fluctuation
+0.5-0.6 kJ/mol.  NVE water512: 247 ns/day.  Before, the LJ tail correction was a CustomVolumeForce, which
+OpenMM evaluates on the host with the positions downloaded and forces uploaded at every step (0.15 ms per
+step, the host waiting for the GPU): 110 ns/day.  It is now `TailCorrectionForce` (E = c/V from the box,
+no kernel, no copies; `tests/test_tail.py`).  GVDW (Slater) instead of LJ, 4096 waters (the GVDW box
+replicated 2x2x2, `md_nve.py --replicate 2 2 2`): 151.5 ns/day, total energy -1.6887e6 kJ/mol as GROMACS;
+the combination-rule GVDW takes the place of LJ in OpenMM's nonbonded kernel, so moving it into the engine
+would not pay.
+
+The engine runs on its own stream beside OpenMM's other force kernels (launched in `execute`, waited for
+in a ForcePostComputation before the force buffers are reduced); an out-of-date pair list found then makes
+OpenMM compute the forces again (`setForcesValid(false)`).  `PGM_OPENMM_DEFER=1` skips the host wait at
+steps without energies (the list check one evaluation later): 1 percent, not the default.
+
+Larger boxes (the 4096 box replicated with `md_nve.py --replicate`, the grid scaled, the other settings
+as above; pmemd.pgm.cuda from /home8/larry/pgm-exp/gpubench out_s*_040_9_*, the same settings), ns/day:
+
+| waters (atoms) | grid | OpenMM engine | OpenMM Common | GROMACS G3 nstlist 10 / 40 | pmemd.pgm.cuda |
+|---|---|---|---|---|---|
+| 4096 (12288) | 56^3 | 152 | 99 | 124 / 155 | 83.7 (91.7 in another run) |
+| 32768 (98304) | 112^3 | 24.0 | 20.4 | 18.0 / 23.3 | 21.4 |
+| 110592 (331776) | 168^3 | 7.5 | | 5.2 / 6.7 | 6.8 |
+
+NPT water512 (`tests/md_npt.py`, `runs/omm_npt.sh`: 298 K, 1 bar, Langevin 1/ps, MonteCarloBarostat every
+25 steps, 2 fs, 300 ps, the mean after 50 ps): density 1017.0, 1017.8, 1019.5 (TailCorrectionForce),
+1019.0 (deferred) +- 1.4 kg/m3 with the engine, 1018.7, 1019.3 with the Common kernels.  The engine stream is non-blocking (a capture on a blocking stream
 is invalidated when another thread uses the legacy stream: this ended some runs with
 `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`); a failed capture is ended and retried once, then the engine
 runs without graphs.

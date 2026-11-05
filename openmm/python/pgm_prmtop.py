@@ -12,7 +12,7 @@ What it builds (docs/spec.md):
   tables, the exclusions and the 1-4 LJ pairs of the prmtop), cut at the cutoff without a switch and
   without OpenMM's dispersion correction;
 * the LJ long-range correction of Amber's vdwmeth = 1 (pGM-JAX lj_lrc): -2 pi/(3 V rc^3) sum_ij B_ij over
-  all ordered atom pairs, as a CustomVolumeForce (only the r^-6 term, unlike OpenMM's correction);
+  all ordered atom pairs, as a TailCorrectionForce (only the r^-6 term, unlike OpenMM's correction);
 * or, with vdw="gvdw", GVDWForce (the Gaussian-density van der Waals of pmemd-pgm igvdw = 1) in place
   of the Lennard-Jones: the pGM radii, GVDW parameters from `gvdw` (pmemd-pgm's global
   gvdw_arep / gvdw_c6 / b_rep_scale on the atoms that carry LJ, as pmemd-pgm, or per atom type), the
@@ -194,7 +194,7 @@ def create_system(
         system.removeForce([k for k, f in enumerate(system.getForces()) if isinstance(f, mm.NonbondedForce)][0])
     elif vdw == "lj" and periodic and lj_lrc:
         c = 2.0 * math.pi * lj_tail_constant(par["sections"]) / (3.0 * cutoff**3)
-        tail = mm.CustomVolumeForce(f"-{float(c):.17g}/v")
+        tail = openmmpgm.TailCorrectionForce(-float(c))   # E = -c/V (CustomVolumeForce: host copies every step)
         tail.setForceGroup(lj_group)
         system.addForce(tail)
     elif vdw == "gvdw":

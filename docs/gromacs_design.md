@@ -354,7 +354,7 @@ Speed, 4096 waters (12288 atoms), pmemd's benchmark settings (rc 0.9 nm, beta 4/
 | the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 155 |
 | GROMACS, pGM + GVDW on the GPU, nstlist 10 | 117 |
 | pmemd.pgm.cuda (SPFP) | 91.7 |
-| OpenMM plugin, CUDA mixed (this engine; Common kernels 77.2) | 110 |
+| OpenMM plugin, CUDA mixed (this engine; Common kernels 99, before TailCorrectionForce 77.2) | 152 |
 | GROMACS, CPU path (8 threads), LJ | 4.3 |
 
 Per step at nstlist 40 (0.52 ms): the GPU part 0.43 ms of kernels (2 CG iterations; per step the
@@ -372,7 +372,12 @@ in every pass instead of stored (`PGM_CUDA_KERNELS_ON_THE_FLY`, slower), G0/G3 s
 2. **GPU with DD**: one engine per rank on its home + halo atoms (the module's halo communication), or
    one GPU engine for the whole system on the main rank.
    One rank: the kernels are now the step (FFT, spread and pair passes about equal); LJ on the GPU would
-   only help when the CPU's share stops being hidden (fewer CPU cores).
+   only help when the CPU's share stops being hidden (fewer CPU cores).  Measured (4096 waters, nstlist 10):
+   -ntomp 1 / 2 / 4 / 8 / 16: 30.7 / 57.9 / 93.8 / 124 / 133 ns/day; at 8 threads the CPU nonbonded is
+   hidden and the rest is GROMACS's pair search and atom sorting (1.2 + 0.36 ms per search step, 22 percent
+   at nstlist 10), which stay on the CPU with -nb gpu too: nstlist 40 (155 ns/day) is the lever.  32768
+   waters: 18.0 / 23.3 ns/day at nstlist 10 / 40 (OpenMM 24.0).  -nb gpu would also need the nbnxm GPU
+   kernels for coulombtype = pGM (LJ only): not done.  Several ranks with the GPU stop with an error.
 3. CPU, if needed: the remaining field passes (~0.2 ms each) as 4xM cluster SIMD tiles; the FFT
    (0.9 ms per step at 36^3, 14 transforms) with fewer threads or a batched 3D FFT.
 

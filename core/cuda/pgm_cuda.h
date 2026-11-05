@@ -89,6 +89,24 @@ public:
      */
     Terms computeDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed, int stride,
                         double fixedScale, void* stream);
+    /**
+     * computeDevice in two parts, the caller doing other work on the GPU in between (its forces into the same
+     * buffer: the additions are atomic).  launchDevice enqueues the evaluation and returns at once; finishDevice
+     * waits for it (before the caller reads the forces) and returns false if the pair list turned out to be out
+     * of date for these positions: the forces are incomplete, the list has been rebuilt, and launchDevice
+     * (same positions; the same guess and predictor history entry) + finishDevice must follow.
+     */
+    void launchDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed, int stride,
+                      double fixedScale, void* stream);
+    bool finishDevice(Terms& terms);
+    /**
+     * Instead of finishDevice (no energies, no host wait): stream (the caller) waits on the GPU for the forces
+     * of the evaluation in flight.  Its pair-list check happens at the next call (any): a list found out of
+     * date then is rebuilt, but the forces of that evaluation were used (counted by lateListChecks; the
+     * prediction that rebuilds lists ahead makes it rare).
+     */
+    void waitDevice(void* stream);
+    long lateListChecks() const;
 
     int iterations() const;
     double residual() const;

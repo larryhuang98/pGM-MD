@@ -9,6 +9,8 @@ W=$HOME/project/pGM-JAX/examples/water512
 nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
 echo "== test_pgm_api (Reference, CUDA)"
 $PY -u ../tests/test_pgm_api.py $W/pgm3p25_512.prmtop $W/pgm3p25_512.rst7 --platforms Reference CUDA 2>&1 | grep -v -i warning
+echo "== test_tail (TailCorrectionForce)"
+$PY -u ../tests/test_tail.py Reference CPU CUDA 2>&1 | grep -E "FAIL|PASS|failures"
 echo "== test_gvdw_api (Reference, CUDA)"
 $PY -u ../tests/test_gvdw_api.py --platforms Reference CUDA 2>&1 | grep -E "FAIL|PASS|failures"
 for prec in double mixed single; do

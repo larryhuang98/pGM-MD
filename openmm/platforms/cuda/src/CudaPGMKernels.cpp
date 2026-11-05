@@ -55,6 +55,33 @@ private:
     CudaCalcPGMForceKernel& owner;
 };
 
+/**
+ * The engine runs on its own stream beside the rest of the force computation (OpenMM nonbonded kernels and
+ * other forces); after all forces were launched, before the force buffers are reduced, the host waits for
+ * it.  A pair list found out of date then marks the forces invalid: OpenMM computes them again (the list
+ * rebuilt).  PGM_OPENMM_DEFER=1: at steps without energies the context stream waits on the GPU instead and
+ * the list check comes with the next evaluation (Engine::waitDevice; 1 percent faster, 4096 waters).
+ */
+class CudaCalcPGMForceKernel::PostComputation : public ComputeContext::ForcePostComputation {
+public:
+    PostComputation(CudaCalcPGMForceKernel& owner) : owner(owner) {
+    }
+    double computeForceAndEnergy(bool includeForces, bool includeEnergy, int groups) {
+        if (!owner.launched)
+            return 0.0;
+        if (owner.deferred && !owner.wantEnergy && !includeEnergy) {
+            owner.launched = false;
+            owner.evaluated = true;
+            ContextSelector selector(owner.cu);
+            owner.engine->waitDevice((void*) owner.cu.getCurrentStream());
+            return 0.0;
+        }
+        return owner.finish(includeEnergy);
+    }
+private:
+    CudaCalcPGMForceKernel& owner;
+};
+
 CudaCalcPGMForceKernel::CudaCalcPGMForceKernel(string name, const Platform& platform, CudaContext& cu,
                                                const System& system)
         : CalcPGMForceKernel(name, platform), cu(cu), system(system) {
@@ -100,6 +127,8 @@ void CudaCalcPGMForceKernel::initialize(const System& system, const PGMForce& fo
     info = new ForceInfo(force);
     cu.addForce(info);
     cu.addReorderListener(new ReorderListener(*this));
+    cu.addPostComputation(new PostComputation(*this));
+    deferred = (getenv("PGM_OPENMM_DEFER") != nullptr);
 }
 
 void CudaCalcPGMForceKernel::setAtoms() {
@@ -137,10 +166,22 @@ double CudaCalcPGMForceKernel::execute(ContextImpl& context, bool includeForces,
     const long long step = cu.getStepCount();
     const bool newStep = (step != lastStep);
     lastStep = step;
-    const pgmcuda::Terms t = engine->computeDevice((const void*) cu.getPosq().getDevicePointer(), box, newStep,
-                                                   (long long*) cu.getLongForceBuffer().getDevicePointer(),
-                                                   cu.getPaddedNumAtoms(), (double) 0x100000000LL,
-                                                   (void*) cu.getCurrentStream());
+    engine->launchDevice((const void*) cu.getPosq().getDevicePointer(), box, newStep,
+                         (long long*) cu.getLongForceBuffer().getDevicePointer(), cu.getPaddedNumAtoms(),
+                         (double) 0x100000000LL, (void*) cu.getCurrentStream());
+    launched = true;
+    wantEnergy = includeEnergy;
+    return 0.0;   // the energy: finish()
+}
+
+double CudaCalcPGMForceKernel::finish(bool includeEnergy) {
+    ContextSelector selector(cu);
+    launched = false;
+    pgmcuda::Terms t;
+    if (!engine->finishDevice(t)) {
+        cu.setForcesValid(false);   // computed again, the same step
+        return 0.0;
+    }
     lastIterations = engine->iterations();
     evaluated = true;
     return includeEnergy ? t.total() : 0.0;
@@ -175,7 +216,10 @@ void CudaCalcPGMForceKernel::getPermanentDipoles(ContextImpl& context, vector<Ve
 }
 
 int CudaCalcPGMForceKernel::getInducedDipoleIterations() {
-    return common ? common->getInducedDipoleIterations() : lastIterations;
+    if (common)
+        return common->getInducedDipoleIterations();
+    ContextSelector selector(cu);
+    return engine->iterations();
 }
 
 void CudaCalcPGMForceKernel::loadParameters(const PGMForce& force) {

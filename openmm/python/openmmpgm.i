@@ -11,6 +11,7 @@ namespace std {
 %{
 #include "GVDWForce.h"
 #include "PGMForce.h"
+#include "TailCorrectionForce.h"
 #include "OpenMM.h"
 #include "OpenMMAmoeba.h"
 #include "OpenMMDrude.h"
@@ -213,6 +214,30 @@ public:
         %}
         static bool isinstance(OpenMM::Force& force) {
             return (dynamic_cast<PGMPlugin::GVDWForce*>(&force) != NULL);
+        }
+    }
+};
+
+class TailCorrectionForce : public OpenMM::Force {
+public:
+    TailCorrectionForce(double coefficient = 0.0);
+    double getCoefficient() const;
+    void setCoefficient(double c);
+    bool usesPeriodicBoundaryConditions() const;
+    %extend {
+        static PGMPlugin::TailCorrectionForce& _cast(OpenMM::Force& force) {
+            return dynamic_cast<PGMPlugin::TailCorrectionForce&>(force);
+        }
+        %pythoncode %{
+          @staticmethod
+          def cast(force):
+              """The TailCorrectionForce behind a generic Force; keeps `force` alive."""
+              result = TailCorrectionForce._cast(force)
+              result._owner = force
+              return result
+        %}
+        static bool isinstance(OpenMM::Force& force) {
+            return (dynamic_cast<PGMPlugin::TailCorrectionForce*>(&force) != NULL);
         }
     }
 };

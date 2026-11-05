@@ -14,6 +14,7 @@ import numpy as np
 import openmm as mm
 from openmm import app, unit
 
+import openmmpgm
 import pgm_prmtop
 
 ap = argparse.ArgumentParser()
@@ -34,6 +35,7 @@ ap.add_argument("--cutoff", type=float, default=0.9)
 ap.add_argument("--vdw", default="lj", help="lj | gvdw | none")
 ap.add_argument("--gvdw", default="slater", help="pgm_prmtop.PGM3P_GVDW key (with --vdw gvdw)")
 ap.add_argument("--lrc", action="store_true", help="vdW dispersion correction")
+ap.add_argument("--replicate", type=int, nargs=3, default=None, help="the box nx ny nz times (tests/replicate.py)")
 a = ap.parse_args()
 
 system, top, pgm = pgm_prmtop.create_system(
@@ -41,18 +43,25 @@ system, top, pgm = pgm_prmtop.create_system(
     vdw=a.vdw, gvdw=a.gvdw if a.vdw == "gvdw" else None, lj_lrc=a.lrc,
 )  # fmt: skip
 crd = app.AmberInpcrdFile(a.rst7)
-system.setDefaultPeriodicBoxVectors(*crd.boxVectors)
+positions = crd.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+boxv = [mm.Vec3(*[float(x) for x in v.value_in_unit(unit.nanometer)]) for v in crd.boxVectors]
+if a.replicate:
+    import replicate
+    system, positions, B = replicate.replicate(system, positions, [[v.x, v.y, v.z] for v in boxv], a.replicate)
+    boxv = [mm.Vec3(*row) for row in B]
+    pgm = [openmmpgm.PGMForce.cast(f) for f in system.getForces() if openmmpgm.PGMForce.isinstance(f)][0]
+system.setDefaultPeriodicBoxVectors(*boxv)
 plat = mm.Platform.getPlatformByName(a.platform)
 props = {"Precision": a.precision} if a.platform in ("CUDA", "OpenCL", "HIP") else {}
 integ = mm.VerletIntegrator(a.dt_fs * unit.femtosecond)
 integ.setConstraintTolerance(1e-8)
 ctx = mm.Context(system, integ, plat, props)
-ctx.setPositions(crd.positions)
-ctx.setPeriodicBoxVectors(*crd.boxVectors)
+ctx.setPositions(positions)
+ctx.setPeriodicBoxVectors(*boxv)
 ctx.applyConstraints(1e-8)
 ctx.setVelocitiesToTemperature(298 * unit.kelvin, a.seed)
 ctx.applyVelocityConstraints(1e-8)
-print(f"# vdw {a.vdw}{' ' + a.gvdw if a.vdw == 'gvdw' else ''}, cutoff {a.cutoff}; {a.platform} {a.precision}, dt {a.dt_fs} fs, tol {a.tol}, predictor {a.predictor}, peek {a.peek}")
+print(f"# {system.getNumParticles()} atoms; vdw {a.vdw}{' ' + a.gvdw if a.vdw == 'gvdw' else ''}, cutoff {a.cutoff}; {a.platform} {a.precision}, dt {a.dt_fs} fs, tol {a.tol}, predictor {a.predictor}, peek {a.peek}")
 print("# step    epot            ekin          etot            iters")
 rows = []
 t0 = time.time()

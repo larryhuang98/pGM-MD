@@ -22,6 +22,14 @@ public:
     void* deserialize(const OpenMM::SerializationNode& node) const;
 };
 
+/** XML serialization of TailCorrectionForce. */
+class OPENMM_EXPORT_PGM TailCorrectionForceProxy : public OpenMM::SerializationProxy {
+public:
+    TailCorrectionForceProxy();
+    void serialize(const void* object, OpenMM::SerializationNode& node) const;
+    void* deserialize(const OpenMM::SerializationNode& node) const;
+};
+
 } // namespace PGMPlugin
 
 #endif

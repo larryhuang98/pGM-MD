@@ -36,6 +36,8 @@ public:
 private:
     class ForceInfo;
     class ReorderListener;
+    class PostComputation;
+    double finish(bool includeEnergy);   // the evaluation launched by execute (PostComputation)
     void setAtoms();   // the parameters in the context's current atom order
     void loadParameters(const PGMForce& force);
     OpenMM::CudaContext& cu;
@@ -44,7 +46,8 @@ private:
     std::unique_ptr<pgmcuda::Engine> engine;
     int numParticles = 0, forceGroup = 0, gridX = 0, gridY = 0, gridZ = 0, lastIterations = 0;
     double beta = 0;
-    bool polarizable = true, atomsDirty = true, evaluated = false, loaded = false;
+    bool polarizable = true, atomsDirty = true, evaluated = false, loaded = false, launched = false;
+    bool wantEnergy = false, deferred = false;   // deferred: no host wait at steps without energies
     long long lastStep = -1;
     std::vector<double> q, radius, alpha;   // the original order
     std::vector<int> covAtom, covPartner;

@@ -1,6 +1,7 @@
 #include "PGMSerializationProxies.h"
 #include "GVDWForce.h"
 #include "PGMForce.h"
+#include "TailCorrectionForce.h"
 #include "openmm/OpenMMException.h"
 #include "openmm/serialization/SerializationNode.h"
 #include <typeinfo>
@@ -136,6 +137,27 @@ void* GVDWForceProxy::deserialize(const SerializationNode& node) const {
 }
 
 // Registered when the library is loaded (as the AMOEBA plugin does).
+TailCorrectionForceProxy::TailCorrectionForceProxy() : SerializationProxy("TailCorrectionForce") {
+}
+
+void TailCorrectionForceProxy::serialize(const void* object, SerializationNode& node) const {
+    node.setIntProperty("version", 1);
+    const TailCorrectionForce& force = *reinterpret_cast<const TailCorrectionForce*>(object);
+    node.setIntProperty("forceGroup", force.getForceGroup());
+    node.setStringProperty("name", force.getName());
+    node.setDoubleProperty("coefficient", force.getCoefficient());
+}
+
+void* TailCorrectionForceProxy::deserialize(const SerializationNode& node) const {
+    int version = node.getIntProperty("version");
+    if (version < 1 || version > 1)
+        throw OpenMMException("Unsupported version number of TailCorrectionForce");
+    TailCorrectionForce* force = new TailCorrectionForce(node.getDoubleProperty("coefficient"));
+    force->setForceGroup(node.getIntProperty("forceGroup", 0));
+    force->setName(node.getStringProperty("name", force->getName()));
+    return force;
+}
+
 #if defined(WIN32)
 #include <windows.h>
 extern "C" OPENMM_EXPORT_PGM void registerPGMSerializationProxies();
@@ -151,4 +173,5 @@ extern "C" void __attribute__((constructor)) registerPGMSerializationProxies();
 extern "C" OPENMM_EXPORT_PGM void registerPGMSerializationProxies() {
     SerializationProxy::registerProxy(typeid(PGMForce), new PGMForceProxy());
     SerializationProxy::registerProxy(typeid(GVDWForce), new GVDWForceProxy());
+    SerializationProxy::registerProxy(typeid(TailCorrectionForce), new TailCorrectionForceProxy());
 }
