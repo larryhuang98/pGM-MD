@@ -199,6 +199,7 @@ int main(int argc, char** argv) {
         printf("computeF: total %.10f vs %.10f from doubles (rel %.2e), again %.2e\n", Tf.total(), Td.total(),
                (Tf.total()-Td.total())/fabs(Td.total()), (Tf2.total()-Td.total())/fabs(Td.total()));
         ownOk = ownOk && fabs(Tf.total()-Td.total()) < 1e-9*fabs(Td.total());
+        own.releasePositions();   // pf goes now
     }
 
     // the same atoms in another order (as after a GROMACS pair search): the list is renamed, not rebuilt
@@ -346,6 +347,30 @@ int main(int argc, char** argv) {
         own.compute(pd.data(), B, true, F.data(), nullptr);
     const double ms = 1e3*chrono::duration<double>(chrono::steady_clock::now()-t0).count()/reps;
     printf("timing (own list): %.3f ms per evaluation (%d iterations, tol %.1e)\n", ms, own.iterations(), tol);
+    // timing as in MD: smooth motions (amplitude 0.01 nm, period 100 evaluations, random phases), the predictor
+    {
+        vector<double> pm(pd), ph(3*(size_t) n);
+        unsigned seed = 12345;
+        for (auto& v : ph) {
+            seed = seed*1103515245u+12345u;
+            v = 6.283185307*(seed>>8)/16777216.0;
+        }
+        const int warm = 20, steps = 300;
+        long itSum = 0;
+        double tm = 0;
+        for (int st = 0; st < warm+steps; st++) {
+            for (size_t k = 0; k < pm.size(); k++)
+                pm[k] = pd[k]+0.01*sin(6.283185307*st/100.0+ph[k]);
+            auto t1 = chrono::steady_clock::now();
+            own.compute(pm.data(), B, true, F.data(), nullptr);
+            if (st >= warm) {
+                tm += chrono::duration<double>(chrono::steady_clock::now()-t1).count();
+                itSum += own.iterations();
+            }
+        }
+        printf("timing (moving): %.3f ms per evaluation (%.2f iterations on average, tol %.1e, %ld list builds)\n",
+               1e3*tm/steps, (double) itSum/steps, tol, own.listBuilds());
+    }
     const bool ok = fabs(T.total()-Tr.total()) < 1e-6*fabs(Tr.total()) && dF < 1e-3*sqrt(F2/(3.0*n))*100 && ownOk;
     printf("%s\n", ok ? "PASSED" : "CHECK");
     return ok ? 0 : 1;

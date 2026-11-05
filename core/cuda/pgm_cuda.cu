@@ -1181,6 +1181,14 @@ __global__ void spreadDual(int n, const float4* posq, const float4* dip1, const 
 // ------------------------------------------------------------------ vectors
 
 /** out = fixed field + reciprocal field + cself d (3n). */
+/** n1 words src1 -> dst1, n2 words src2 -> dst2 (dst: pinned host memory, mapped). */
+__global__ void copyWords(const unsigned* src1, unsigned* dst1, int n1, const unsigned* src2, unsigned* dst2, int n2) {
+    for (int k = threadIdx.x; k < n1; k += blockDim.x)
+        dst1[k] = src1[k];
+    for (int k = threadIdx.x; k < n2; k += blockDim.x)
+        dst2[k] = src2[k];
+}
+
 __global__ void combineField(int m, const double* fld, const double* erec, const double* d, double cself, double* out) {
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x)
         out[k] = fld[k]+erec[k]+cself*d[k];
@@ -1349,7 +1357,7 @@ __device__ inline bool lastBlock(double* scal) {
 __global__ void cgInitK(int m, const double* b, const double* Tx, const double* fldB, const double* erecB,
                         const double* perm, const double* fldT, const double* erecT, double cs,
                         const double* alpha, const double* x, double* r, double* z, double* p, double* scal,
-                        double tol, int maxIter, CondHandle h, bool useHandle) {
+                        double tol, int maxIter, CondHandle h, bool useHandle, float4* pf) {
     double rz = 0, nrm = 0, err = 0;
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
         const double a = alpha[k/3];
@@ -1359,6 +1367,8 @@ __global__ void cgInitK(int m, const double* b, const double* Tx, const double* 
         r[k] = rr;
         z[k] = zz;
         p[k] = zz;
+        if (pf)   // p for the next field pass (toFloat)
+            ((float*) pf)[4*(k/3)+k%3] = (float) zz;
         rz += rr*zz;
         nrm += fabs(a*bk);
         err = fmax(err, fabs(zz));
@@ -1372,6 +1382,7 @@ __global__ void cgInitK(int m, const double* b, const double* Tx, const double* 
         scal[2] = __longlong_as_double((long long) *(ull*) (scal+8))/scal[1];
         scal[5] = scal[6] = scal[7] = 0;
         scal[9] = 0;
+        scal[11] = (scal[2] <= tol ? 0.0 : 1e9);   // the first iteration that met the tolerance
         *(ull*) (scal+8) = 0;
         cgContinue(scal, tol, maxIter, h, useHandle);
     }
@@ -1413,10 +1424,14 @@ __global__ void cgUpdate(int m, const double* alpha, double* x, double* r, doubl
 /** p = z + beta p, beta = num / r.z (Polak-Ribiere); then (the last block) the scalars of the next
  * iteration and the loop condition. */
 __global__ void cgDirection(int m, const double* z, double* p, double* scal, double tol, int maxIter, CondHandle h,
-                            bool useHandle) {
+                            bool useHandle, float4* pf) {
     const double beta = scal[6]/fmax(scal[0], 1e-300);
-    for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x)
-        p[k] = z[k]+beta*p[k];
+    for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
+        const double v = z[k]+beta*p[k];
+        p[k] = v;
+        if (pf)   // p for the next field pass (toFloat; w stays 0)
+            ((float*) pf)[4*(k/3)+k%3] = (float) v;
+    }
     if (lastBlock(scal)) {
         scal[3] = scal[0]/fmax(scal[5], 1e-300);
         scal[4] = scal[6]/fmax(scal[0], 1e-300);
@@ -1424,6 +1439,8 @@ __global__ void cgDirection(int m, const double* z, double* p, double* scal, dou
         scal[2] = __longlong_as_double((long long) *(ull*) (scal+8))/scal[1];
         scal[5] = scal[6] = scal[7] = 0;
         scal[9] += 1;
+        if (scal[11] > 1e8 && scal[2] <= tol)
+            scal[11] = scal[9];
         *(ull*) (scal+8) = 0;
         cgContinue(scal, tol, maxIter, h, useHandle);
     }
@@ -1527,6 +1544,37 @@ struct Engine::Impl {
     DevArray<float4> gvP;
     DevArray<int> skipStart, skipJ;
     cufftHandle planF = 0, planB = 0, planF2 = 0, planB2 = 0;   // single, batched (two grids)
+    // the PME work on a second stream beside the pair kernels (fork / join; in a graph: parallel branches)
+    cudaStream_t st2 = nullptr;
+    cudaEvent_t evFork = nullptr, evJoin = nullptr;
+    bool useFork = std::getenv("PGM_CUDA_NO_FORK") == nullptr;
+    cudaStream_t ps() const { return useFork ? st2 : st; }
+    void fork() {
+        if (useFork) {
+            CU(cudaEventRecord(evFork, st));
+            CU(cudaStreamWaitEvent(st2, evFork, 0));
+        }
+    }
+    void join() {
+        if (useFork) {
+            CU(cudaEventRecord(evJoin, st2));
+            CU(cudaStreamWaitEvent(st, evJoin, 0));
+        }
+    }
+    // the results to the host written by a kernel (pinned memory, mapped) instead of copy nodes
+    bool useExport = std::getenv("PGM_CUDA_NO_EXPORT") == nullptr;
+    // CG iterations unrolled in the graph before its while node: the fewest of the recent evaluations (the
+    // while node launches its body with a latency of its own); curUnroll: those of the graph being captured
+    bool useUnroll = std::getenv("PGM_CUDA_NO_UNROLL") == nullptr;
+    int recentIt[16] = {}, numRecent = 0, recentPos = 0, curUnroll = 0, execUnroll[4] = {-1, -1, -1, -1};
+    int unrollWanted() const {
+        if (!useUnroll || numRecent < 4)
+            return 0;
+        int k = 1 << 30;
+        for (int i = 0; i < std::min(numRecent, 16); i++)
+            k = std::min(k, recentIt[i]);
+        return std::max(0, std::min(k, std::min(s.maxIter, 8)));
+    }
     // own pair list
     bool externalList = false, haveList = false;
     long numBuilds = 0;
@@ -1565,7 +1613,7 @@ struct Engine::Impl {
     double tPhase[4] = {0, 0, 0, 0};
     long numCalls = 0;
 
-    void field(bool withQ, const double* dvec, double* out);   // out == nullptr: leave fld + erec
+    void field(bool withQ, const double* dvec, double* out, bool inFloat = false);   // out == nullptr: leave fld + erec
     void fieldDual(bool pairsDone);   // b = field(q, perm), T = field(x), together
     bool dualOrder() const { return s.order == 4 || s.order == 5 || s.order == 6 || s.order == 8; }
     void pme(bool withQ, bool final, int energyMode, double* acc10);
@@ -1618,13 +1666,22 @@ struct Engine::Impl {
     bool retry = false;        // the last evaluation used an out-of-date list: the next repeats it (same guess)
     bool pendingPush = false;  // the evaluation in flight enters the predictor history
     int pendingIt = 0;
-    double pendingErr = 0, tStamp[3] = {0, 0, 0};
+    double pendingErr = 0, tStamp[3] = {0, 0, 0}, tLaunch = 0;
     // positions straight from the caller's (registered) float array
     const float* regPtr = nullptr;
     size_t regBytes = 0;
     bool usePosF = false;
     DevArray<float> pos3, qF;
     bool registerPositions(const float* p);
+    void releasePositions() {   // (a registered range the caller frees would break later copies from its pages)
+        if (regPtr) {
+            cudaStreamSynchronize(st);
+            cudaHostUnregister(const_cast<float*>(regPtr));
+            regPtr = nullptr;
+            regBytes = 0;
+            g_allocations++;   // the graph copy read from it
+        }
+    }
     void uploadPositions();
     // device input / output (computeDevice)
     const float4* devPos = nullptr;
@@ -1750,7 +1807,7 @@ void Engine::Impl::markSkipList() {
 void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
     const int K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], P = s.order;
     const size_t gsize = (size_t) K1*K2*K3;
-    CU(cudaMemsetAsync(gridFix.ptr, 0, gsize*sizeof(ull), st));
+    CU(cudaMemsetAsync(gridFix.ptr, 0, gsize*sizeof(ull), ps()));
     // the order as a compile-time constant for the usual orders
 #define PGM_ORDER_DISPATCH(CALL) \
     switch (P) {                 \
@@ -1762,37 +1819,37 @@ void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
     }
 #define PGM_SPREAD(PC)                                                                                          \
     if (withQ)                                                                                                  \
-        spread<PC, true><<<(n+3)/4, 128, 0, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr,  \
+        spread<PC, true><<<(n+3)/4, 128, 0, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr,  \
                                                   gidx.ptr, gridFix.ptr);                                       \
     else                                                                                                        \
-        spread<PC, false><<<(n+3)/4, 128, 0, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
+        spread<PC, false><<<(n+3)/4, 128, 0, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                                    gidx.ptr, gridFix.ptr)
     PGM_ORDER_DISPATCH(PGM_SPREAD)
-    fixedToReal<<<blocksFor(gsize, 256), 256, 0, st>>>(gsize, gridFix.ptr, grid.ptr);
+    fixedToReal<<<blocksFor(gsize, 256), 256, 0, ps()>>>(gsize, gridFix.ptr, grid.ptr);
     CUFFT(cufftExecR2C(planF, grid.ptr, cgrid.ptr));
     const size_t csize = (size_t) K1*K2*(K3/2+1);
     const float beta = (float) s.beta;
     if (final && energyMode == 2)
-        convolution<2><<<blocksFor(csize, 256), 256, 0, st>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
+        convolution<2><<<blocksFor(csize, 256), 256, 0, ps()>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
                                                                cgrid.ptr, accDev, 1);
     else if (final && energyMode == 1)
-        convolution<1><<<blocksFor(csize, 256), 256, 0, st>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
+        convolution<1><<<blocksFor(csize, 256), 256, 0, ps()>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
                                                                cgrid.ptr, accDev, 1);
     else
-        convolution<0><<<blocksFor(csize, 256), 256, 0, st>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
+        convolution<0><<<blocksFor(csize, 256), 256, 0, ps()>>>(K1, K2, K3, beta, mod1.ptr, mod2.ptr, mod3.ptr,
                                                                cgrid.ptr, nullptr, 1);
     CUFFT(cufftExecC2R(planB, cgrid.ptr, grid.ptr));
     // the usual orders: one thread per atom (gatherT, FINAL also for the field gathers, see there)
 #define PGM_GATHER(PC)                                                                                          \
     if (PC > 0)                                                                                                 \
-        gatherT<PC ? PC : 4, true><<<(n+63)/64, 64, gatherSmem, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,   \
+        gatherT<PC ? PC : 4, true><<<(n+63)/64, 64, gatherSmem, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,   \
                                                             dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr,       \
                                                             erec.ptr, frec.ptr);                               \
     else if (final)                                                                                             \
-        gather<PC, true><<<(n+3)/4, 128, 0, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr,  \
+        gather<PC, true><<<(n+3)/4, 128, 0, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr,  \
                                                   d2theta.ptr, gidx.ptr, grid.ptr, erec.ptr, frec.ptr);         \
     else                                                                                                        \
-        gather<PC, false><<<(n+3)/4, 128, 0, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
+        gather<PC, false><<<(n+3)/4, 128, 0, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                                    d2theta.ptr, gidx.ptr, grid.ptr, erec.ptr, nullptr)
     PGM_ORDER_DISPATCH(PGM_GATHER)
 #undef PGM_GATHER
@@ -1801,11 +1858,13 @@ void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
 }
 
 /** out = T d (+ the charges' field if withQ): direct + reciprocal + self, for the dipoles dvec (double). */
-void Engine::Impl::field(bool withQ, const double* dvec, double* out) {
+void Engine::Impl::field(bool withQ, const double* dvec, double* out, bool inFloat) {
     const int m = 3*n;
-    toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, dvec, nullptr, dipF.ptr);
+    if (!inFloat)
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, dvec, nullptr, dipF.ptr);
     const int warpsPerBlock = 4, threads = 32*warpsPerBlock;
     const int blocks = (n+warpsPerBlock-1)/warpsPerBlock;
+    fork();
     if (withQ)
         fieldPass<true><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
                                                     dipF.ptr, kernels(), fld.ptr);
@@ -1813,6 +1872,7 @@ void Engine::Impl::field(bool withQ, const double* dvec, double* out) {
         fieldPass<false><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
                                                      dipF.ptr, kernels(), fld.ptr);
     pme(withQ, false, 0, nullptr);
+    join();
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     if (out)
         combineField<<<blocksFor(m, 256), 256, 0, st>>>(m, fld.ptr, erec.ptr, dvec, cs, out);
@@ -1821,27 +1881,29 @@ void Engine::Impl::field(bool withQ, const double* dvec, double* out) {
 void Engine::Impl::fieldDual(bool pairsDone) {
     const int m = 3*n, K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], P = s.order;
     const size_t gsize = (size_t) K1*K2*K3, csize = (size_t) K1*K2*(K3/2+1);
-    if (!pairsDone) {   // (else pairSetupDual did the pair part)
+    if (!pairsDone) {   // (else the caller launched pairSetupDual, the pair part, after fork())
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
         const int warpsPerBlock = 4, threads = 32*warpsPerBlock, blocks = (n+warpsPerBlock-1)/warpsPerBlock;
+        fork();
         fieldPassDual<<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
                                                   dipF.ptr, dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
     }
-    CU(cudaMemsetAsync(gridFix.ptr, 0, 2*gsize*sizeof(ull), st));
+    const cudaStream_t q = ps();
+    CU(cudaMemsetAsync(gridFix.ptr, 0, 2*gsize*sizeof(ull), q));
 #define PGM_DUAL(PC)                                                                                           \
-    spreadDual<PC><<<(n+3)/4, 128, 0, st>>>(n, posq.ptr, dipF.ptr, dipF2.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
+    spreadDual<PC><<<(n+3)/4, 128, 0, q>>>(n, posq.ptr, dipF.ptr, dipF2.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                             gidx.ptr, gridFix.ptr);                                            \
-    fixedToReal<<<blocksFor(2*gsize, 256), 256, 0, st>>>(2*gsize, gridFix.ptr, grid.ptr);                      \
+    fixedToReal<<<blocksFor(2*gsize, 256), 256, 0, q>>>(2*gsize, gridFix.ptr, grid.ptr);                      \
     CUFFT(cufftExecR2C(planF2, grid.ptr, cgrid.ptr));                                                          \
-    convolution<0><<<blocksFor(2*csize, 256), 256, 0, st>>>(K1, K2, K3, (float) s.beta, mod1.ptr, mod2.ptr,     \
+    convolution<0><<<blocksFor(2*csize, 256), 256, 0, q>>>(K1, K2, K3, (float) s.beta, mod1.ptr, mod2.ptr,     \
                                                              mod3.ptr, cgrid.ptr, nullptr, 2);                 \
     CUFFT(cufftExecC2R(planB2, cgrid.ptr, grid.ptr));                                                          \
     /* both gathers with gatherT<FINAL> (frec as scratch): faster than one kernel for both on sm_120 */      \
-    gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, st>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,         \
+    gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, q>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,         \
                                                          dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr, erec.ptr,   \
                                                          frec.ptr);                                               \
-    gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, st>>>(n, P, posq.ptr, dipF2.ptr, K1, K2, K3, theta.ptr,        \
+    gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, q>>>(n, P, posq.ptr, dipF2.ptr, K1, K2, K3, theta.ptr,        \
                                                          dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr+gsize,       \
                                                          erec2.ptr, frec.ptr)
     switch (P) {
@@ -1851,6 +1913,7 @@ void Engine::Impl::fieldDual(bool pairsDone) {
         default: PGM_DUAL(8); break;   // dualOrder()
     }
 #undef PGM_DUAL
+    join();
     // b and T x are combined from the field parts in cgInitK
 }
 
@@ -1895,7 +1958,10 @@ void Engine::Impl::enqueuePre(bool dual) {
         CU(cudaMemsetAsync(maxDisp.ptr, 0, 2*sizeof(unsigned), st));
         displacements<<<std::min(blocksFor(n, 256), 1024), 256, 0, st>>>(n, posq.ptr, posBuild.ptr, posPrev.ptr,
                                                                           maxDisp.ptr);
-        CU(cudaMemcpyAsync(dispH.ptr, maxDisp.ptr, 2*sizeof(unsigned), cudaMemcpyDeviceToHost, st));
+        if (useExport)
+            copyWords<<<1, 32, 0, st>>>(maxDisp.ptr, dispH.ptr, 2, nullptr, nullptr, 0);
+        else
+            CU(cudaMemcpyAsync(dispH.ptr, maxDisp.ptr, 2*sizeof(unsigned), cudaMemcpyDeviceToHost, st));
     }
     const int warpsPerBlock = 4, threads = 32*warpsPerBlock;
     const int pblocks = (n+warpsPerBlock-1)/warpsPerBlock;
@@ -1904,24 +1970,6 @@ void Engine::Impl::enqueuePre(bool dual) {
     const bool fused = dual && polarizable && !externalList && storeKernels;
     permDipolesKernel<<<blocksFor(n, 128), 128, 0, st>>>(n, posq.ptr, covStart.ptr, covPartnerSorted.ptr,
                                                          covStrengthSorted.ptr, perm.ptr);
-    if (fused) {
-        initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr, b.ptr,
-                                                        x.ptr);   // the predictor: b not needed
-        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
-        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
-        pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
-                                                   rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
-                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr);
-    }
-    else if (externalList)
-        pairSetup<true><<<pblocks, threads, 0, st>>>(n, nullptr, atomStart.ptr, candJ.ptr, candT.ptr, posq.ptr,
-                                                     rg.ptr, rc2, rp2, beta, PJ.ptr, storeKernels ? G12.ptr : nullptr,
-                                                     storeG03 ? G03.ptr : nullptr, pairEnd.ptr);
-    else
-        pairSetup<false><<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, nullptr,
-                                                      posq.ptr, rg.ptr, rc2, rp2, beta, PJ.ptr,
-                                                      storeKernels ? G12.ptr : nullptr, storeG03 ? G03.ptr : nullptr,
-                                                      pairEnd.ptr);
 #define PGM_SPLINES(PC)                                                                                     \
     splines<PC><<<blocksFor(3*n, 128), 128, 0, st>>>(n, s.order, posq.ptr, s.grid[0], s.grid[1], s.grid[2],    \
                                                      theta.ptr, dtheta.ptr, d2theta.ptr, gidx.ptr)
@@ -1933,15 +1981,35 @@ void Engine::Impl::enqueuePre(bool dual) {
         default: PGM_SPLINES(0);
     }
 #undef PGM_SPLINES
+    if (fused) {   // the pair setup with the first pair pass, beside the PME of both dipole sets
+        initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr, b.ptr,
+                                                        x.ptr);   // the predictor: b not needed
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
+        toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
+        fork();
+        pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
+                                                   rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
+                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr);
+        fieldDual(true);   // (its join)
+        return;
+    }
+    if (externalList)
+        pairSetup<true><<<pblocks, threads, 0, st>>>(n, nullptr, atomStart.ptr, candJ.ptr, candT.ptr, posq.ptr,
+                                                     rg.ptr, rc2, rp2, beta, PJ.ptr, storeKernels ? G12.ptr : nullptr,
+                                                     storeG03 ? G03.ptr : nullptr, pairEnd.ptr);
+    else
+        pairSetup<false><<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, nullptr,
+                                                      posq.ptr, rg.ptr, rc2, rp2, beta, PJ.ptr,
+                                                      storeKernels ? G12.ptr : nullptr, storeG03 ? G03.ptr : nullptr,
+                                                      pairEnd.ptr);
     if (!polarizable) {
         CU(cudaMemsetAsync(x.ptr, 0, m*sizeof(double), st));
         return;
     }
     if (dual) {
-        if (!fused)
-            initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr,
-                                                            b.ptr, x.ptr);   // the predictor: b not needed
-        fieldDual(fused);
+        initialGuess<<<blocksFor(m, 256), 256, 0, st>>>(n, ctl.ptr, globalIdx.ptr, histPtrs(), alphaD.ptr,
+                                                        b.ptr, x.ptr);   // the predictor: b not needed
+        fieldDual(false);
         return;
     }
     field(true, perm.ptr, b.ptr);
@@ -1956,16 +2024,16 @@ void Engine::Impl::enqueueCgInit(CondHandle h, bool useHandle, bool dual) {
     CU(cudaMemsetAsync(scal.ptr, 0, 16*sizeof(double), st));
     cgInitK<<<cgBlocks, CG_THREADS, 0, st>>>(m, b.ptr, T.ptr, dual ? fld.ptr : nullptr, erec.ptr, perm.ptr, fld2.ptr,
                                              erec2.ptr, cs, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, scal.ptr, s.tol,
-                                             s.maxIter, h, useHandle);
+                                             s.maxIter, h, useHandle, dipF.ptr);
 }
 
 void Engine::Impl::enqueueCgIteration(CondHandle h, bool useHandle) {
     const int m = 3*n, cgBlocks = std::max(1, std::min(blocksFor(m, CG_THREADS), 1024));
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
-    field(false, p.ptr, nullptr);   // T p combined in cgApply
+    field(false, p.ptr, nullptr, true);   // T p combined in cgApply; p in dipF already (cgInitK, cgDirection)
     cgApply<<<cgBlocks, CG_THREADS, 0, st>>>(m, fld.ptr, erec.ptr, cs, alphaD.ptr, p.ptr, Ap.ptr, scal.ptr);
     cgUpdate<<<cgBlocks, CG_THREADS, 0, st>>>(m, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, Ap.ptr, scal.ptr);
-    cgDirection<<<cgBlocks, CG_THREADS, 0, st>>>(m, z.ptr, p.ptr, scal.ptr, s.tol, s.maxIter, h, useHandle);
+    cgDirection<<<cgBlocks, CG_THREADS, 0, st>>>(m, z.ptr, p.ptr, scal.ptr, s.tol, s.maxIter, h, useHandle, dipF.ptr);
 }
 
 /** Peek, the history, energies, forces, the field at the total dipoles; the copies to the host. */
@@ -1984,6 +2052,7 @@ void Engine::Impl::enqueuePost(bool strain) {
     CU(cudaMemsetAsync(frc.ptr, 0, m*sizeof(ull), st));
     CU(cudaMemsetAsync(acc.ptr, 0, NACC*sizeof(double), st));
     const float rvdw2 = (float) (rvdw*rvdw), invKe = (float) (1.0/s.ke);
+    fork();
 #define PGM_FINAL(STRAIN, GV)                                                                                    \
     finalPass<STRAIN, GV><<<pblocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,  \
                                                        dipF.ptr, kernels(), rg.ptr, gvP.ptr, gvdwSlater,         \
@@ -1998,6 +2067,7 @@ void Engine::Impl::enqueuePost(bool strain) {
         PGM_FINAL(false, false);
 #undef PGM_FINAL
     pme(true, true, strain ? 2 : 1, acc.ptr+10);
+    join();
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     combineField<<<blocksFor(m, 256), 256, 0, st>>>(m, fld.ptr, erec.ptr, dTot.ptr, cs, Etot.ptr);
     if (ncov > 0)
@@ -2015,8 +2085,13 @@ void Engine::Impl::enqueuePost(bool strain) {
         addForcesFixed<<<blocksFor(m, 256), 256, 0, st>>>(n, fOut.ptr, devForce, devStride, devScale);
     else
         CU(cudaMemcpyAsync(fH.ptr, fOut.ptr, m*sizeof(double), cudaMemcpyDeviceToHost, st));
-    CU(cudaMemcpyAsync(accH.ptr, acc.ptr, NACC*sizeof(double), cudaMemcpyDeviceToHost, st));
-    CU(cudaMemcpyAsync(scalH.ptr, scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, st));
+    if (useExport)
+        copyWords<<<1, 256, 0, st>>>((const unsigned*) acc.ptr, (unsigned*) accH.ptr, 2*NACC,
+                                     (const unsigned*) scal.ptr, (unsigned*) scalH.ptr, 32);
+    else {
+        CU(cudaMemcpyAsync(accH.ptr, acc.ptr, NACC*sizeof(double), cudaMemcpyDeviceToHost, st));
+        CU(cudaMemcpyAsync(scalH.ptr, scal.ptr, 16*sizeof(double), cudaMemcpyDeviceToHost, st));
+    }
 }
 
 void Engine::Impl::releaseGraphs() {
@@ -2071,7 +2146,10 @@ void Engine::Impl::captureGraph(bool strain, bool dual) {
     enqueuePre(dual);
     cudaGraph_t body = nullptr;
     if (polarizable) {
-        enqueueCgInit(handle, true, dual);
+        const int K = curUnroll;   // iterations before the while node, unconditional
+        enqueueCgInit(handle, K == 0, dual);
+        for (int k = 0; k < K; k++)
+            enqueueCgIteration(handle, k == K-1);   // the last one sets the condition of the while node
         // the while node after what was captured so far, the rest after it
         cudaStreamCaptureStatus status;
         const cudaGraphNode_t* deps = nullptr;
@@ -2099,6 +2177,7 @@ void Engine::Impl::captureGraph(bool strain, bool dual) {
     CU(cudaGraphDestroy(graph));
     execAllocations[v] = g_allocations;
     execKey[v] = graphKey();
+    execUnroll[v] = curUnroll;
 #else
     (void) strain;
     (void) dual;
@@ -2114,6 +2193,9 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     // non-blocking: no implicit order with the legacy stream, whose use by another thread would invalidate a
     // capture; the synchronous set-up copies wait for their completion (DevArray)
     CU(cudaStreamCreateWithFlags(&impl->st, cudaStreamNonBlocking));
+    CU(cudaStreamCreateWithFlags(&impl->st2, cudaStreamNonBlocking));
+    CU(cudaEventCreateWithFlags(&impl->evFork, cudaEventDisableTiming));
+    CU(cudaEventCreateWithFlags(&impl->evJoin, cudaEventDisableTiming));
     const int K1 = settings.grid[0], K2 = settings.grid[1], K3 = settings.grid[2];
     CUFFT(cufftPlan3d(&impl->planF, K1, K2, K3, CUFFT_R2C));
     CUFFT(cufftPlan3d(&impl->planB, K1, K2, K3, CUFFT_C2R));
@@ -2121,7 +2203,7 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     CUFFT(cufftPlanMany(&impl->planF2, 3, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_R2C, 2));
     CUFFT(cufftPlanMany(&impl->planB2, 3, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, 2));
     for (cufftHandle h : {impl->planF, impl->planB, impl->planF2, impl->planB2})
-        CUFFT(cufftSetStream(h, impl->st));
+        CUFFT(cufftSetStream(h, impl->ps()));
     impl->gridFix.resize(2*(size_t) K1*K2*K3);   // two grids for fieldDual
     impl->grid.resize(2*(size_t) K1*K2*K3);
     impl->cgrid.resize(2*(size_t) K1*K2*(K3/2+1));
@@ -2163,6 +2245,12 @@ Engine::~Engine() {
         cufftDestroy(impl->planF2);
     if (impl->planB2)
         cufftDestroy(impl->planB2);
+    if (impl->evFork)
+        cudaEventDestroy(impl->evFork);
+    if (impl->evJoin)
+        cudaEventDestroy(impl->evJoin);
+    if (impl->st2)
+        cudaStreamDestroy(impl->st2);
     if (impl->st)
         cudaStreamDestroy(impl->st);
     delete impl;
@@ -2176,8 +2264,10 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
         CU(cudaSetDevice(I.s.device));
     CU(cudaStreamSynchronize(I.st));
     const bool resized = (n != I.n || numGlobal != I.nGlobal);
-    if (resized)
+    if (resized) {
         I.numHist = 0;
+        I.releasePositions();   // another atom count: another position array of the caller too
+    }
     // the same atoms in another order: keep the list (renamed) instead of building it again
     std::vector<int> newOf;
     if (!resized && I.haveList && !I.externalList && globalIndex && (int) I.giHost.size() == n) {
@@ -2403,6 +2493,11 @@ Terms Engine::computeF(const float* pos, const double box[3][3], bool newStep, d
 
 const double* Engine::forces() const { return impl->fH.ptr; }
 
+void Engine::releasePositions() {
+    impl->settle();
+    impl->releasePositions();
+}
+
 void Engine::launchDevice(const void* posq4, const double box[3][3], bool newStep, long long* forceFixed, int stride,
                           double fixedScale, void* stream) {
     Impl& I = *impl;
@@ -2547,11 +2642,16 @@ void Engine::Impl::begin(const double* pos, const float* posF, const double box[
     if (I.gvdwOn && !I.skipsMarked)
         I.markSkipList();
     const int v = (wantStrain ? 1 : 0)+(dual ? 2 : 0);
-    if (I.useGraphs && (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey()))
+    I.curUnroll = I.polarizable ? I.unrollWanted() : 0;
+    if (I.useGraphs && (!I.exec[v] || I.execAllocations[v] != g_allocations || I.execKey[v] != I.graphKey()
+                        || I.execUnroll[v] != I.curUnroll))
         if (!I.tryCapture(wantStrain, dual))
             I.useGraphs = false;
     if (I.useGraphs) {
+        const double tL = I.timing ? wallSeconds() : 0;
         CU(cudaGraphLaunch(I.exec[v], I.st));
+        if (I.timing)
+            I.tLaunch += wallSeconds()-tL;
         return;
     }
     int it = 0;
@@ -2619,6 +2719,13 @@ bool Engine::Impl::finish(double* f, double* strain, Terms& t, bool canRepeat) {
     }
     lastIterations = it;
     lastResidual = err;
+    if (polarizable) {
+        // the iterations the tolerance needed (unrolled ones run regardless: counting those would keep them)
+        const int need = (useGraphs && scalH.ptr[11] < 1e8) ? (int) scalH.ptr[11] : it;
+        recentIt[recentPos] = need;
+        recentPos = (recentPos+1)%16;
+        numRecent = std::min(numRecent+1, 16);
+    }
     const double* acc = accH.ptr;
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     t = Terms();
@@ -2648,10 +2755,10 @@ bool Engine::Impl::finish(double* f, double* strain, Terms& t, bool canRepeat) {
         tPhase[3] += tE-tD;
         if (++numCalls%1000 == 0)
             fprintf(stderr,
-                    "pgm_cuda ms per call (%ld): inputs %.3f, list builds %.3f, GPU %.3f, outputs %.3f; %ld builds, "
-                    "%ld repeated evaluations, %ld found late\n",
+                    "pgm_cuda ms per call (%ld): inputs %.3f, list builds %.3f, GPU %.3f (graph launch call %.3f), "
+                    "outputs %.3f; %ld builds, %ld repeated evaluations, %ld found late; CG unrolled %d\n",
                     numCalls, 1e3*tPhase[0]/numCalls, 1e3*tPhase[1]/numCalls, 1e3*tPhase[2]/numCalls,
-                    1e3*tPhase[3]/numCalls, numBuilds, numRepeats, numLate);
+                    1e3*tLaunch/numCalls, 1e3*tPhase[3]/numCalls, numBuilds, numRepeats, numLate, curUnroll);
     }
     lastTerms = t;
     return true;

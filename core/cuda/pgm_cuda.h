@@ -80,6 +80,9 @@ public:
     /** compute() with float positions (3n), the forces left in forces() (3n, kJ/mol/nm, valid until the
      * next call): no copies for callers in single precision. */
     Terms computeF(const float* pos, const double box[3][3], bool newStep, double* strain);
+    /** computeF registers pos with CUDA (pinned) until releasePositions(), computeF with another array, setAtoms
+     * with another atom count or the destructor: the caller keeps it allocated meanwhile or calls this first. */
+    void releasePositions();
     const double* forces() const;
     /**
      * compute() on device data of a caller on the same GPU context (OpenMM): positions xyz from the
