@@ -189,7 +189,17 @@ long), 152 -> 167; the accumulators cleared by the kernels that use them and the
 instead of memset and copy nodes, 167 -> 170.  Kept off (environment switches): CG iterations unrolled
 before the while node (`PGM_CUDA_NO_UNROLL` turns them off; no difference), a short-range preconditioner
 (`PGM_CUDA_PRECOND=<radius nm>`, Tinker style: still 2 iterations per step at tol 1e-4, 1 instead of 1.3
-at 4e-4), an 8-lane field gather (`PGM_CUDA_GATHER8`, slower).  The skin (0.10-0.22 nm) changes nothing.
+at 4e-4), an 8-lane field gather (`PGM_CUDA_GATHER8`, slower).  The skin (0.10-0.22 nm) changes nothing.  Also tried:
+Jacobi with the self term of the diagonal (`PGM_CUDA_JACOBI_SELF`, as pmemd: the same iterations), the PME
+stream at the highest priority (no change), the pair pass after the spread of the PME branch
+(`PGM_CUDA_SPREADFIRST`, 2 percent slower), the pair kernels computed in every pass (6 percent slower).
+
+Iterations at the same tolerance are not the same accuracy across codes: pmemd tests convergence after
+groups of three iterations (3.00 per step at tol 1e-4 in this NVE, the accepted residual about that of a
+test after every iteration at 3e-5), the engine after every iteration (2.03 per step at 1e-4).  At 3e-5
+(3 iterations) OpenMM runs at 145 ns/day here and the NVE drift falls from 0.16 to 0.002-0.03 kJ/mol/ps;
+an iteration costs about 75 us of engine time.  Speed comparisons with pmemd must match the accepted
+residual (this tolerance, or pmemd with a test after every iteration).
 
 NPT water512 (`tests/md_npt.py`, `runs/omm_npt.sh`: 298 K, 1 bar, Langevin 1/ps, MonteCarloBarostat every
 25 steps, 2 fs, 300 ps, the mean after 50 ps): density 1017.0, 1017.8, 1019.5 (TailCorrectionForce),

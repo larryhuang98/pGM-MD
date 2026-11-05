@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cmath>
 #include <deque>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1447,16 +1448,16 @@ __device__ inline bool lastBlock(double* scal) {
 __global__ void cgInitK(int m, const double* b, const double* Tx, const double* fldB, const double* erecB,
                         const double* perm, const double* fldT, const double* erecT, double cs,
                         const double* alpha, const double* x, double* r, double* z, double* p, double* scal,
-                        double tol, int maxIter, CondHandle h, bool useHandle, float4* pf, bool pre) {
+                        double tol, int maxIter, CondHandle h, bool useHandle, float4* pf, bool pre, double cj) {
     double rz = 0, nrm = 0, err = 0;
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
         const double a = alpha[k/3];
         const double bk = fldB ? fldB[k]+erecB[k]+cs*perm[k] : b[k];
         const double tk = fldB ? fldT[k]+erecT[k]+cs*x[k] : Tx[k];
-        const double rr = (a > 0 ? bk-(x[k]/a-tk) : 0.0), zz = a*rr;
+        const double rr = (a > 0 ? bk-(x[k]/a-tk) : 0.0), zz = a/(1-a*cj)*rr;   // cj: the self term in Jacobi
         r[k] = rr;
         nrm += fabs(a*bk);
-        err = fmax(err, fabs(zz));
+        err = fmax(err, fabs(a*rr));
         if (pre)   // z, p and r.z: precondK
             continue;
         z[k] = zz;
@@ -1500,14 +1501,14 @@ __global__ void cgApply(int m, const double* fld, const double* erec, double cs,
 
 /** x += step p, r' = r - step Ap, z' = alpha r'; sums z'.(r'-r), r'.z', max |z'|. */
 __global__ void cgUpdate(int m, const double* alpha, double* x, double* r, double* z, const double* p, const double* Ap,
-                         double* scal, bool pre) {
+                         double* scal, bool pre, double cj) {
     const double step = scal[0]/fmax(scal[5], 1e-300);
     double num = 0, rz = 0, err = 0;
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
         const double a = alpha[k/3];
         x[k] += step*p[k];
-        const double rn = r[k]-step*Ap[k], zn = a*rn;
-        err = fmax(err, fabs(zn));   // the tolerance is on |alpha r| with every preconditioner
+        const double rn = r[k]-step*Ap[k], zn = a/(1-a*cj)*rn;
+        err = fmax(err, fabs(a*rn));   // the tolerance is on |alpha r| with every preconditioner
         if (!pre) {
             num += zn*(rn-r[k]);
             rz += rn*zn;
@@ -1720,7 +1721,29 @@ struct Engine::Impl {
             CU(cudaStreamWaitEvent(st2, evFork, 0));
         }
     }
+    // the pair pass after the spread of the PME branch (spreadFirst): with both started together the pair
+    // pass takes the GPU and the spread waits for its blocks; after the spread the rest of the PME branch
+    // (FFTs, convolution, gather: small grids) runs beside the pair pass
+    bool spreadFirst = std::getenv("PGM_CUDA_SPREADFIRST") != nullptr;   // (2 percent slower, 4096 waters)
+    cudaEvent_t evMid = nullptr;
+    std::function<void()> midWork;
+    void pairAfterSpread(const std::function<void()>& pairs) {   // (between fork and the PME call)
+        if (useFork && spreadFirst)
+            midWork = pairs;
+        else
+            pairs();
+    }
+    void runMid() {   // in the PME branch after its spread
+        if (!midWork)
+            return;
+        CU(cudaEventRecord(evMid, st2));
+        CU(cudaStreamWaitEvent(st, evMid, 0));
+        std::function<void()> w;
+        w.swap(midWork);
+        w();
+    }
     void join() {
+        runMid();   // (a PME call without the spread hook)
         if (useFork) {
             CU(cudaEventRecord(evJoin, st2));
             CU(cudaStreamWaitEvent(st, evJoin, 0));
@@ -1735,6 +1758,11 @@ struct Engine::Impl {
     DevArray<float2> srG;
     DevArray<unsigned> srOver;
     bool curPre = false;   // the CG being enqueued uses it (set by enqueueCgInit)
+    // Jacobi with the self term of the diagonal, alpha / (1 - alpha c_self) (as pmemd), or alpha alone
+    bool useJacobiSelf = std::getenv("PGM_CUDA_JACOBI_SELF") != nullptr;
+    double jacobiSelf() const {
+        return useJacobiSelf ? 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI) : 0.0;
+    }
     bool preFor(bool dual) const {   // this evaluation: the fused pair setup fills the short-range list
         return rpre > 0 && dual && polarizable && !externalList && storeKernels;
     }
@@ -1999,6 +2027,7 @@ void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
         spread<PC, false><<<(n+3)/4, 128, 0, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                                    gidx.ptr, gridFix.ptr)
     PGM_ORDER_DISPATCH(PGM_SPREAD)
+    runMid();
     fixedToReal<<<blocksFor(gsize, 256), 256, 0, ps()>>>(gsize, gridFix.ptr, grid.ptr);
     CUFFT(cufftExecR2C(planF, grid.ptr, cgrid.ptr));
     const size_t csize = (size_t) K1*K2*(K3/2+1);
@@ -2043,12 +2072,14 @@ void Engine::Impl::field(bool withQ, const double* dvec, double* out, bool inFlo
     const int warpsPerBlock = 4, threads = 32*warpsPerBlock;
     const int blocks = (n+warpsPerBlock-1)/warpsPerBlock;
     fork();
-    if (withQ)
-        fieldPass<true><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
-                                                    dipF.ptr, kernels(), fld.ptr);
-    else
-        fieldPass<false><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
-                                                     dipF.ptr, kernels(), fld.ptr);
+    pairAfterSpread([&] {
+        if (withQ)
+            fieldPass<true><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
+                                                        dipF.ptr, kernels(), fld.ptr);
+        else
+            fieldPass<false><<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
+                                                         dipF.ptr, kernels(), fld.ptr);
+    });
     pme(withQ, false, 0, nullptr);
     join();
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
@@ -2064,13 +2095,16 @@ void Engine::Impl::fieldDual(bool pairsDone) {
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
         const int warpsPerBlock = 4, threads = 32*warpsPerBlock, blocks = (n+warpsPerBlock-1)/warpsPerBlock;
         fork();
-        fieldPassDual<<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
-                                                  dipF.ptr, dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
+        pairAfterSpread([=] {
+            fieldPassDual<<<blocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,
+                                                      dipF.ptr, dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
+        });
     }
     const cudaStream_t q = ps();
 #define PGM_DUAL(PC)                                                                                           \
     spreadDual<PC><<<(n+3)/4, 128, 0, q>>>(n, posq.ptr, dipF.ptr, dipF2.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                             gidx.ptr, gridFix.ptr);                                            \
+    runMid();                                                                                                  \
     fixedToReal<<<blocksFor(2*gsize, 256), 256, 0, q>>>(2*gsize, gridFix.ptr, grid.ptr);                      \
     CUFFT(cufftExecR2C(planF2, grid.ptr, cgrid.ptr));                                                          \
     convolution<0><<<blocksFor(2*csize, 256), 256, 0, q>>>(K1, K2, K3, (float) s.beta, mod1.ptr, mod2.ptr,     \
@@ -2173,11 +2207,13 @@ void Engine::Impl::enqueuePre(bool dual) {
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
         const bool pre = preFor(true);
         fork();
-        pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
-                                                   rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
-                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr,
-                                                   pre ? (float) (rpre*rpre) : 0.0f, pre ? srCount.ptr : nullptr,
-                                                   srJ.ptr, srG.ptr, srOver.ptr);
+        pairAfterSpread([&] {
+            pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
+                                                       rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
+                                                       storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr,
+                                                       pre ? (float) (rpre*rpre) : 0.0f, pre ? srCount.ptr : nullptr,
+                                                       srJ.ptr, srG.ptr, srOver.ptr);
+        });
         fieldDual(true);   // (its join)
         return;
     }
@@ -2213,7 +2249,7 @@ void Engine::Impl::enqueueCgInit(CondHandle h, bool useHandle, bool dual) {
     curPre = pre;
     cgInitK<<<cgBlocks, CG_THREADS, 0, st>>>(m, b.ptr, T.ptr, dual ? fld.ptr : nullptr, erec.ptr, perm.ptr, fld2.ptr,
                                              erec2.ptr, cs, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, scal.ptr, s.tol,
-                                             s.maxIter, h, useHandle && !pre, dipF.ptr, pre);
+                                             s.maxIter, h, useHandle && !pre, dipF.ptr, pre, jacobiSelf());
     if (pre)
         precondK<true><<<std::max(1, std::min(blocksFor(n, CG_THREADS), 1024)), CG_THREADS, 0, st>>>(
                 n, posq.ptr, srCount.ptr, srJ.ptr, srG.ptr, srOver.ptr, alphaD.ptr, r.ptr, nullptr, z.ptr, p.ptr,
@@ -2225,7 +2261,8 @@ void Engine::Impl::enqueueCgIteration(CondHandle h, bool useHandle) {
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     field(false, p.ptr, nullptr, true);   // T p combined in cgApply; p in dipF already (cgInitK, cgDirection)
     cgApply<<<cgBlocks, CG_THREADS, 0, st>>>(m, fld.ptr, erec.ptr, cs, alphaD.ptr, p.ptr, Ap.ptr, scal.ptr);
-    cgUpdate<<<cgBlocks, CG_THREADS, 0, st>>>(m, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, Ap.ptr, scal.ptr, curPre);
+    cgUpdate<<<cgBlocks, CG_THREADS, 0, st>>>(m, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, Ap.ptr, scal.ptr, curPre,
+                                              jacobiSelf());
     if (curPre)
         precondK<false><<<std::max(1, std::min(blocksFor(n, CG_THREADS), 1024)), CG_THREADS, 0, st>>>(
                 n, posq.ptr, srCount.ptr, srJ.ptr, srG.ptr, srOver.ptr, alphaD.ptr, r.ptr, Ap.ptr, z.ptr, nullptr,
@@ -2252,14 +2289,16 @@ void Engine::Impl::enqueuePost(bool strain) {
     finalPass<STRAIN, GV><<<pblocks, threads, 0, st>>>(n, order(), atomStart.ptr, pairEnd.ptr, PJ.ptr, posq.ptr,  \
                                                        dipF.ptr, kernels(), rg.ptr, gvP.ptr, gvdwSlater,         \
                                                        rvdw2, invKe, fld.ptr, fpair.ptr, acc.ptr)
-    if (strain && gvdwOn)
-        PGM_FINAL(true, true);
-    else if (strain)
-        PGM_FINAL(true, false);
-    else if (gvdwOn)
-        PGM_FINAL(false, true);
-    else
-        PGM_FINAL(false, false);
+    pairAfterSpread([&] {
+        if (strain && gvdwOn)
+            PGM_FINAL(true, true);
+        else if (strain)
+            PGM_FINAL(true, false);
+        else if (gvdwOn)
+            PGM_FINAL(false, true);
+        else
+            PGM_FINAL(false, false);
+    });
 #undef PGM_FINAL
     pme(true, true, strain ? 2 : 1, acc.ptr+10);
     join();
@@ -2393,9 +2432,15 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     // non-blocking: no implicit order with the legacy stream, whose use by another thread would invalidate a
     // capture; the synchronous set-up copies wait for their completion (DevArray)
     CU(cudaStreamCreateWithFlags(&impl->st, cudaStreamNonBlocking));
-    CU(cudaStreamCreateWithFlags(&impl->st2, cudaStreamNonBlocking));
+    {   // the PME branch first: its blocks start before the pair pass fills the GPU (the pair pass takes the rest)
+        int least = 0, greatest = 0;
+        CU(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        const bool prio = std::getenv("PGM_CUDA_NO_PRIORITY") == nullptr;
+        CU(cudaStreamCreateWithPriority(&impl->st2, cudaStreamNonBlocking, prio ? greatest : least));
+    }
     CU(cudaEventCreateWithFlags(&impl->evFork, cudaEventDisableTiming));
     CU(cudaEventCreateWithFlags(&impl->evJoin, cudaEventDisableTiming));
+    CU(cudaEventCreateWithFlags(&impl->evMid, cudaEventDisableTiming));
     const int K1 = settings.grid[0], K2 = settings.grid[1], K3 = settings.grid[2];
     CUFFT(cufftPlan3d(&impl->planF, K1, K2, K3, CUFFT_R2C));
     CUFFT(cufftPlan3d(&impl->planB, K1, K2, K3, CUFFT_C2R));
@@ -2449,6 +2494,8 @@ Engine::~Engine() {
         cudaEventDestroy(impl->evFork);
     if (impl->evJoin)
         cudaEventDestroy(impl->evJoin);
+    if (impl->evMid)
+        cudaEventDestroy(impl->evMid);
     if (impl->st2)
         cudaStreamDestroy(impl->st2);
     if (impl->st)
