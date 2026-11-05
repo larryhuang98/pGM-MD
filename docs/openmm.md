@@ -173,9 +173,23 @@ as above; pmemd.pgm.cuda from /home8/larry/pgm-exp/gpubench out_s*_040_9_*, the 
 
 | waters (atoms) | grid | OpenMM engine | OpenMM Common | GROMACS G3 nstlist 10 / 40 | pmemd.pgm.cuda |
 |---|---|---|---|---|---|
-| 4096 (12288) | 56^3 | 152 | 99 | 124 / 155 | 83.7 (91.7 in another run) |
+| 4096 (12288) | 56^3 | 152; 170 (engine of c40d9be) | 99 | 124 / 155; 136 / 173 (c40d9be) | 83.7 (91.7 in another run) |
 | 32768 (98304) | 112^3 | 24.0 | 20.4 | 18.0 / 23.3 | 21.4 |
 | 110592 (331776) | 168^3 | 7.5 | | 5.2 / 6.7 | 6.8 |
+
+The pmemd.pgm.cuda column is the old build (`~/ambers/pgm-larry-install`, `scf_solv_opt=3`: the solver
+before the optimizations of the pGM paper, which reports them 1.5-2.2 times faster).  The optimized pmemd:
+167 ns/day on an RTX 5090 (4096 waters, tol 1e-4, NVE; paper), 165 on this RTX PRO 6000 at tol 1e-3 with a
+thermostat.  A comparison at the same settings on the same GPU (the current build, `build24_c128`) is still
+to be done; until then the plugin and GROMACS are at par with the optimized pmemd, not faster.
+
+Engine changes of 191b714 and c40d9be (4096 waters, `md_nve.py` as above): the PME of each field pass on a
+second stream beside the pair pass (in the graph: parallel branches; PME and the pair pass take about as
+long), 152 -> 167; the accumulators cleared by the kernels that use them and the forces copied by a kernel
+instead of memset and copy nodes, 167 -> 170.  Kept off (environment switches): CG iterations unrolled
+before the while node (`PGM_CUDA_NO_UNROLL` turns them off; no difference), a short-range preconditioner
+(`PGM_CUDA_PRECOND=<radius nm>`, Tinker style: still 2 iterations per step at tol 1e-4, 1 instead of 1.3
+at 4e-4), an 8-lane field gather (`PGM_CUDA_GATHER8`, slower).  The skin (0.10-0.22 nm) changes nothing.
 
 NPT water512 (`tests/md_npt.py`, `runs/omm_npt.sh`: 298 K, 1 bar, Langevin 1/ps, MonteCarloBarostat every
 25 steps, 2 fs, 300 ps, the mean after 50 ps): density 1017.0, 1017.8, 1019.5 (TailCorrectionForce),

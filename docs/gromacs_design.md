@@ -350,11 +350,11 @@ Speed, 4096 waters (12288 atoms), pmemd's benchmark settings (rc 0.9 nm, beta 4/
 
 | | ns/day |
 |---|---|
-| GROMACS, pGM on the GPU, LJ, nstlist 10 | 124 |
-| the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 155 |
+| GROMACS, pGM on the GPU, LJ, nstlist 10 | 124; 136 (c40d9be) |
+| the same, nstlist 40 (GROMACS's Verlet buffer for LJ) | 155; 173 (c40d9be) |
 | GROMACS, pGM + GVDW on the GPU, nstlist 10 | 117 |
-| pmemd.pgm.cuda (SPFP) | 91.7 |
-| OpenMM plugin, CUDA mixed (this engine; Common kernels 99, before TailCorrectionForce 77.2) | 152 |
+| pmemd.pgm.cuda (SPFP), the old build (`scf_solv_opt=3`; see docs/openmm.md for the optimized one) | 91.7 |
+| OpenMM plugin, CUDA mixed (this engine; Common kernels 99, before TailCorrectionForce 77.2) | 152; 170 (c40d9be) |
 | GROMACS, CPU path (8 threads), LJ | 4.3 |
 
 Per step at nstlist 40 (0.52 ms): the GPU part 0.43 ms of kernels (2 CG iterations; per step the
