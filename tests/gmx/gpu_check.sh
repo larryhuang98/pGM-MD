@@ -8,7 +8,7 @@
 set -e
 D=$(cd "$(dirname "$0")" && pwd)
 R=$D/../../runs
-G=$HOME/project/gromacs-pgm/install-cuda/bin/gmx
+G=${GMX:-$HOME/project/gromacs-pgm/install-cuda/bin/gmx}
 P=$HOME/miniconda3/envs/SE3nv/bin/python
 export LD_LIBRARY_PATH=/home3/apps/cuda-12.8/lib64:/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} GMX_PGM_QUIET=1

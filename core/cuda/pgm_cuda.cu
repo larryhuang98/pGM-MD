@@ -158,6 +158,7 @@ __device__ inline float3 unpackShift(int code, const Box& bx) {
  * minimum image (SHIFTS: x = r_i + t.box - r_j as given, the same for pairs within the cut-off). */
 constexpr int SKIP_BIT = 1<<30;     // in a partner index: no combination-rule GVDW for this pair
 constexpr int INDEX_MASK = SKIP_BIT-1;
+constexpr int PRE_CAP = 48;   // short-range pairs per atom kept for the preconditioner
 
 /** The pairs of atom i within rp = max(rc, rvdw), compacted (in candidate order) to [atomStart[i],
  * pairEnd[i]): the partner j (with SKIP_BIT) and the kernels G_1, G_2 (G12, the field passes) and G_0, G_3
@@ -832,9 +833,32 @@ __global__ void spread(int n, int pRun, const float4* posq, const float4* dip, i
     }
 }
 
-__global__ void fixedToReal(size_t count, const ull* in, float* out) {
-    for (size_t k = blockIdx.x*(size_t) blockDim.x+threadIdx.x; k < count; k += (size_t) gridDim.x*blockDim.x)
+/** out = in / FIX, in = 0 (the next spread finds it cleared: no memset node). */
+__global__ void fixedToReal(size_t count, ull* in, float* out) {
+    for (size_t k = blockIdx.x*(size_t) blockDim.x+threadIdx.x; k < count; k += (size_t) gridDim.x*blockDim.x) {
         out[k] = (float) ((double) (long long) in[k]/FIX);
+        in[k] = 0;
+    }
+}
+
+/** n16 16-byte words src -> dst (pinned host memory), the odd last double separately. */
+__global__ void copyToHost(const uint4* src, uint4* dst, size_t n16, const double* s8, double* d8, int m) {
+    for (size_t k = blockIdx.x*(size_t) blockDim.x+threadIdx.x; k < n16; k += (size_t) gridDim.x*blockDim.x)
+        dst[k] = src[k];
+    if (blockIdx.x == 0 && threadIdx.x == 0 && (m&1))
+        d8[m-1] = s8[m-1];
+}
+
+/** Clears the small accumulators of an evaluation in one node (memset nodes cost more in a graph). */
+__global__ void zeroSmall(unsigned* a, int na, double* b, int nb, double* c, int nc, unsigned* d, int nd) {
+    for (int k = threadIdx.x; k < na; k += blockDim.x)
+        a[k] = 0;
+    for (int k = threadIdx.x; k < nb; k += blockDim.x)
+        b[k] = 0;
+    for (int k = threadIdx.x; k < nc; k += blockDim.x)
+        c[k] = 0;
+    for (int k = threadIdx.x; k < nd; k += blockDim.x)
+        d[k] = 0;
 }
 
 /** F *= G (influence), with the energy (acc[0], MODE >= 1) and the k-space strain (acc[1..9], MODE 2). */
@@ -1031,12 +1055,61 @@ __global__ void gatherT(int n, int, const float4* posq, const float4* dip, int K
     }
 }
 
+/** The field gather only (erec = -grad phi at every atom), 8 lanes per atom, lane l < P doing the plane
+ * j1 = l: more loads in flight than one thread per atom (gatherT). */
+template<int PC>
+__global__ void gatherField8(int n, int K1, int K2, int K3, const float* theta, const float* dtheta, const int* gidx,
+                             const float* phi, double* erec) {
+    const Box bx = c_box;
+    const int t = blockIdx.x*blockDim.x+threadIdx.x;
+    const int i = t>>3, l = t&7;
+    constexpr int P = PC;
+    float f0 = 0, f1 = 0, f2 = 0;
+    if (i < n && l < P) {
+        float T1[P], U1[P], T2[P], U2[P];
+        int g3[P];
+        const int b2 = gidx[n+i], b3 = gidx[2*n+i];
+#pragma unroll
+        for (int j = 0; j < P; j++) {
+            T1[j] = theta[((size_t) n+i)*P+j];
+            U1[j] = dtheta[((size_t) n+i)*P+j];
+            T2[j] = theta[((size_t) 2*n+i)*P+j];
+            U2[j] = dtheta[((size_t) 2*n+i)*P+j];
+            g3[j] = wrapDown(b3-j, K3);
+        }
+        const float T0 = theta[(size_t) i*P+l], U0 = dtheta[(size_t) i*P+l];
+        const int g1 = wrapDown(gidx[i]-l, K1);
+#pragma unroll
+        for (int j2 = 0; j2 < P; j2++) {
+            const float* row = phi+((size_t) g1*K2+wrapDown(b2-j2, K2))*K3;
+            float s0 = 0, s1 = 0;
+#pragma unroll
+            for (int j3 = 0; j3 < P; j3++) {
+                const float ph = row[g3[j3]];
+                s0 += T2[j3]*ph;
+                s1 += U2[j3]*ph;
+            }
+            f0 += U0*T1[j2]*s0;
+            f1 += T0*U1[j2]*s0;
+            f2 += T0*T1[j2]*s1;
+        }
+    }
+    for (int o = 4; o > 0; o >>= 1) {
+        f0 += __shfl_xor_sync(0xffffffff, f0, o);
+        f1 += __shfl_xor_sync(0xffffffff, f1, o);
+        f2 += __shfl_xor_sync(0xffffffff, f2, o);
+    }
+    if (i < n && l == 0)
+        for (int k = 0; k < 3; k++)
+            erec[3*i+k] = -(K1*(double) bx.r[3*k]*f0+K2*(double) bx.r[3*k+1]*f1+K3*(double) bx.r[3*k+2]*f2);
+}
+
 /** pairSetup<false> and fieldPassDual in one pass over the candidates: the first pair pass of a step
  * (the field of the charges and permanent dipoles dip1 and of the guess dip2) while the pairs are found. */
 __global__ void pairSetupDual(int n, const int* order, const int* atomStart, const int* candJ, const float4* posq,
                               const float* rg, float rc2, float rp2, float beta, const float4* dip1,
                               const float4* dip2, int* PJ, float2* G12, float2* G03, int* pairEnd, double* fld1,
-                              double* fld2) {
+                              double* fld2, float rpre2, int* srCount, int* srJ, float2* srG, unsigned* srOver) {
     const Box bx = c_box;
     const int w = (blockIdx.x*blockDim.x+threadIdx.x)/32, lane = threadIdx.x%32;
     if (w >= n)
@@ -1046,7 +1119,7 @@ __global__ void pairSetupDual(int n, const int* order, const int* atomStart, con
     const float rgi = rg[i];
     const unsigned below = (1u<<lane)-1;
     const int end = atomStart[i+1];
-    int out = atomStart[i];
+    int out = atomStart[i], srOut = 0;
     float e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0};
     for (int k0 = atomStart[i]; k0 < end; k0 += 32) {
         const int k = k0+lane;
@@ -1062,12 +1135,22 @@ __global__ void pairSetupDual(int n, const int* order, const int* atomStart, con
             minImage(d, bx);
             inside = d.x*d.x+d.y*d.y+d.z*d.z < rp2;
         }
-        const unsigned mask = __ballot_sync(0xffffffff, inside);
+        const bool shortPair = inside && d.x*d.x+d.y*d.y+d.z*d.z < rpre2;   // (the preconditioner)
+        const unsigned mask = __ballot_sync(0xffffffff, inside), smask = __ballot_sync(0xffffffff, shortPair);
         if (inside) {
             const float r2 = d.x*d.x+d.y*d.y+d.z*d.z, r = sqrtf(r2);
             float g[4] = {0, 0, 0, 0};
             if (r2 < rc2)
                 pairKernels(rgi+rg[j], r, r > 0 ? 1/r : 0.0f, beta, g);
+            if (shortPair) {
+                const int qs = srOut+__popc(smask&below);
+                if (qs < PRE_CAP) {
+                    srJ[(size_t) i*PRE_CAP+qs] = j;
+                    srG[(size_t) i*PRE_CAP+qs] = make_float2(g[1], g[2]);
+                }
+                else
+                    atomicOr(srOver, 1u);
+            }
             const int q = out+__popc(mask&below);
             PJ[q] = jraw;
             G12[q] = make_float2(g[1], g[2]);
@@ -1083,6 +1166,7 @@ __global__ void pairSetupDual(int n, const int* order, const int* atomStart, con
             }
         }
         out += __popc(mask);
+        srOut += __popc(smask);
     }
     for (int c = 0; c < 3; c++) {
         e1[c] = warpSum(e1[c]);
@@ -1090,6 +1174,8 @@ __global__ void pairSetupDual(int n, const int* order, const int* atomStart, con
     }
     if (lane == 0) {
         pairEnd[i] = out;
+        if (srCount)
+            srCount[i] = min(srOut, PRE_CAP);
         for (int c = 0; c < 3; c++) {
             fld1[3*i+c] = e1[c];
             fld2[3*i+c] = e2[c];
@@ -1266,14 +1352,18 @@ __global__ void pushHistory(int n, const Control* ctl, const int* gidx, HistPtrs
 /** f = ke (covalent + pair + reciprocal forces); acc[29] |d|^2, acc[30] sum mu^2/(2 alpha), acc[31..39]
  * sum E_rec,a d_b. */
 template<bool STRAIN>
-__global__ void finalReduce(int n, double ke, const ull* frc, const double* fpair, const double* frec,
+__global__ void finalReduce(int n, double ke, ull* frc, const double* fpair, const double* frec,
                             const double* erec, const double* d, const double* mu, const double* alpha, double* f,
-                            double* acc) {
+                            double* acc, double* fHost) {
     double d2 = 0, pol = 0, S[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
         for (int k = 0; k < 3; k++) {
             const int c = 3*i+k;
-            f[c] = ke*((double) (long long) frc[c]/FIX+fpair[c]+frec[c]);
+            const double fc = ke*((double) (long long) frc[c]/FIX+fpair[c]+frec[c]);
+            frc[c] = 0;   // cleared for the next evaluation
+            f[c] = fc;
+            if (fHost)   // pinned host memory (computeF / compute)
+                fHost[c] = fc;
             d2 += d[c]*d[c];
             if (STRAIN)
                 for (int b = 0; b < 3; b++)
@@ -1357,7 +1447,7 @@ __device__ inline bool lastBlock(double* scal) {
 __global__ void cgInitK(int m, const double* b, const double* Tx, const double* fldB, const double* erecB,
                         const double* perm, const double* fldT, const double* erecT, double cs,
                         const double* alpha, const double* x, double* r, double* z, double* p, double* scal,
-                        double tol, int maxIter, CondHandle h, bool useHandle, float4* pf) {
+                        double tol, int maxIter, CondHandle h, bool useHandle, float4* pf, bool pre) {
     double rz = 0, nrm = 0, err = 0;
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
         const double a = alpha[k/3];
@@ -1365,13 +1455,20 @@ __global__ void cgInitK(int m, const double* b, const double* Tx, const double* 
         const double tk = fldB ? fldT[k]+erecT[k]+cs*x[k] : Tx[k];
         const double rr = (a > 0 ? bk-(x[k]/a-tk) : 0.0), zz = a*rr;
         r[k] = rr;
+        nrm += fabs(a*bk);
+        err = fmax(err, fabs(zz));
+        if (pre)   // z, p and r.z: precondK
+            continue;
         z[k] = zz;
         p[k] = zz;
         if (pf)   // p for the next field pass (toFloat)
             ((float*) pf)[4*(k/3)+k%3] = (float) zz;
         rz += rr*zz;
-        nrm += fabs(a*bk);
-        err = fmax(err, fabs(zz));
+    }
+    if (pre) {
+        blockAdd(nrm, scal+6);
+        blockMaxBits(err, (ull*) (scal+8));
+        return;
     }
     blockAdd(rz, scal+7);
     blockAdd(nrm, scal+6);
@@ -1403,22 +1500,90 @@ __global__ void cgApply(int m, const double* fld, const double* erec, double cs,
 
 /** x += step p, r' = r - step Ap, z' = alpha r'; sums z'.(r'-r), r'.z', max |z'|. */
 __global__ void cgUpdate(int m, const double* alpha, double* x, double* r, double* z, const double* p, const double* Ap,
-                         double* scal) {
+                         double* scal, bool pre) {
     const double step = scal[0]/fmax(scal[5], 1e-300);
     double num = 0, rz = 0, err = 0;
     for (int k = blockIdx.x*blockDim.x+threadIdx.x; k < m; k += gridDim.x*blockDim.x) {
         const double a = alpha[k/3];
         x[k] += step*p[k];
         const double rn = r[k]-step*Ap[k], zn = a*rn;
-        num += zn*(rn-r[k]);
-        rz += rn*zn;
-        err = fmax(err, fabs(zn));
+        err = fmax(err, fabs(zn));   // the tolerance is on |alpha r| with every preconditioner
+        if (!pre) {
+            num += zn*(rn-r[k]);
+            rz += rn*zn;
+            z[k] = zn;
+        }
         r[k] = rn;
-        z[k] = zn;
     }
-    blockAdd(num, scal+6);
-    blockAdd(rz, scal+7);
+    if (!pre) {
+        blockAdd(num, scal+6);
+        blockAdd(rz, scal+7);
+    }
     blockMaxBits(err, (ull*) (scal+8));
+}
+
+/**
+ * The short-range preconditioner (as Tinker): z = M r, M = D + D T_s D, D = diag(alpha), T_s the direct-space
+ * dipole field tensor of the pairs within the preconditioner radius (the pair kernels of this step); a
+ * truncated list somewhere (srOver): M = D everywhere.  INIT: p = z (and its floats), sum r.z, then (the last
+ * block) the scalars and the loop condition as cgInitK; else sum r.z and z.(r_new - r_old) = -step z.Ap.
+ */
+template<bool INIT>
+__global__ void precondK(int n, const float4* posq, const int* srCount, const int* srJ, const float2* srG,
+                         const unsigned* srOver, const double* alpha, const double* r, const double* Ap, double* z,
+                         double* p, float4* pf, double* scal, double tol, int maxIter, CondHandle h, bool useHandle) {
+    const Box bx = c_box;
+    const bool useT = (*srOver == 0);
+    const double step = INIT ? 0.0 : scal[0]/fmax(scal[5], 1e-300);
+    double rz = 0, num = 0;
+    for (int i = blockIdx.x*blockDim.x+threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        const double ai = alpha[i];
+        double e[3] = {0, 0, 0};
+        if (useT && ai > 0) {
+            const float4 pi = posq[i];
+            const int cnt = srCount[i];
+            for (int s = 0; s < cnt; s++) {
+                const int j = srJ[(size_t) i*PRE_CAP+s];
+                const double aj = alpha[j];
+                if (aj == 0)
+                    continue;
+                const float2 g = srG[(size_t) i*PRE_CAP+s];
+                const float4 pj = posq[j];
+                float3 v = make_float3(pi.x-pj.x, pi.y-pj.y, pi.z-pj.z);
+                minImage(v, bx);
+                const double u[3] = {aj*r[3*j], aj*r[3*j+1], aj*r[3*j+2]}, x[3] = {v.x, v.y, v.z};
+                const double ux = u[0]*x[0]+u[1]*x[1]+u[2]*x[2];
+                for (int c = 0; c < 3; c++)
+                    e[c] += -u[c]*g.x+ux*x[c]*g.y;
+            }
+        }
+        for (int c = 0; c < 3; c++) {
+            const int k = 3*i+c;
+            const double zk = ai*(r[k]+e[c]);
+            z[k] = zk;
+            rz += r[k]*zk;
+            if (INIT) {
+                p[k] = zk;
+                ((float*) pf)[4*i+c] = (float) zk;
+            }
+            else
+                num -= step*zk*Ap[k];
+        }
+    }
+    blockAdd(rz, scal+7);
+    if (!INIT)
+        blockAdd(num, scal+6);
+    else if (lastBlock(scal)) {
+        const int m = 3*n;
+        scal[0] = scal[7];
+        scal[1] = scal[6]/m+1e-300;
+        scal[2] = __longlong_as_double((long long) *(ull*) (scal+8))/scal[1];
+        scal[5] = scal[6] = scal[7] = 0;
+        scal[9] = 0;
+        scal[11] = (scal[2] <= tol ? 0.0 : 1e9);
+        *(ull*) (scal+8) = 0;
+        cgContinue(scal, tol, maxIter, h, useHandle);
+    }
 }
 
 /** p = z + beta p, beta = num / r.z (Polak-Ribiere); then (the last block) the scalars of the next
@@ -1563,6 +1728,16 @@ struct Engine::Impl {
     }
     // the results to the host written by a kernel (pinned memory, mapped) instead of copy nodes
     bool useExport = std::getenv("PGM_CUDA_NO_EXPORT") == nullptr;
+    bool useGather8 = std::getenv("PGM_CUDA_GATHER8") != nullptr;   // gatherField8 for the field gathers (slower on sm_120)
+    // the short-range preconditioner (PGM_CUDA_PRECOND = its radius [nm]; 0: Jacobi), with the fused pair setup
+    double rpre = std::getenv("PGM_CUDA_PRECOND") ? std::atof(std::getenv("PGM_CUDA_PRECOND")) : 0.0;
+    DevArray<int> srCount, srJ;
+    DevArray<float2> srG;
+    DevArray<unsigned> srOver;
+    bool curPre = false;   // the CG being enqueued uses it (set by enqueueCgInit)
+    bool preFor(bool dual) const {   // this evaluation: the fused pair setup fills the short-range list
+        return rpre > 0 && dual && polarizable && !externalList && storeKernels;
+    }
     // CG iterations unrolled in the graph before its while node: the fewest of the recent evaluations (the
     // while node launches its body with a latency of its own); curUnroll: those of the graph being captured
     bool useUnroll = std::getenv("PGM_CUDA_NO_UNROLL") == nullptr;
@@ -1807,7 +1982,6 @@ void Engine::Impl::markSkipList() {
 void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
     const int K1 = s.grid[0], K2 = s.grid[1], K3 = s.grid[2], P = s.order;
     const size_t gsize = (size_t) K1*K2*K3;
-    CU(cudaMemsetAsync(gridFix.ptr, 0, gsize*sizeof(ull), ps()));
     // the order as a compile-time constant for the usual orders
 #define PGM_ORDER_DISPATCH(CALL) \
     switch (P) {                 \
@@ -1841,7 +2015,11 @@ void Engine::Impl::pme(bool withQ, bool final, int energyMode, double* accDev) {
     CUFFT(cufftExecC2R(planB, cgrid.ptr, grid.ptr));
     // the usual orders: one thread per atom (gatherT, FINAL also for the field gathers, see there)
 #define PGM_GATHER(PC)                                                                                          \
-    if (PC > 0)                                                                                                 \
+    if (PC > 0 && !final && useGather8)                                                                         \
+        gatherField8<PC ? PC : 4><<<blocksFor(8*(size_t) n, 128), 128, 0, ps()>>>(n, K1, K2, K3, theta.ptr,      \
+                                                                                 dtheta.ptr, gidx.ptr, grid.ptr,  \
+                                                                                 erec.ptr);                       \
+    else if (PC > 0)                                                                                            \
         gatherT<PC ? PC : 4, true><<<(n+63)/64, 64, gatherSmem, ps()>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,   \
                                                             dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr,       \
                                                             erec.ptr, frec.ptr);                               \
@@ -1890,7 +2068,6 @@ void Engine::Impl::fieldDual(bool pairsDone) {
                                                   dipF.ptr, dipF2.ptr, kernels(), fld.ptr, fld2.ptr);
     }
     const cudaStream_t q = ps();
-    CU(cudaMemsetAsync(gridFix.ptr, 0, 2*gsize*sizeof(ull), q));
 #define PGM_DUAL(PC)                                                                                           \
     spreadDual<PC><<<(n+3)/4, 128, 0, q>>>(n, posq.ptr, dipF.ptr, dipF2.ptr, K1, K2, K3, theta.ptr, dtheta.ptr, \
                                             gidx.ptr, gridFix.ptr);                                            \
@@ -1900,12 +2077,20 @@ void Engine::Impl::fieldDual(bool pairsDone) {
                                                              mod3.ptr, cgrid.ptr, nullptr, 2);                 \
     CUFFT(cufftExecC2R(planB2, cgrid.ptr, grid.ptr));                                                          \
     /* both gathers with gatherT<FINAL> (frec as scratch): faster than one kernel for both on sm_120 */      \
+    if (useGather8) {                                                                                          \
+        gatherField8<PC><<<blocksFor(8*(size_t) n, 128), 128, 0, q>>>(n, K1, K2, K3, theta.ptr, dtheta.ptr,      \
+                                                                       gidx.ptr, grid.ptr, erec.ptr);            \
+        gatherField8<PC><<<blocksFor(8*(size_t) n, 128), 128, 0, q>>>(n, K1, K2, K3, theta.ptr, dtheta.ptr,      \
+                                                                       gidx.ptr, grid.ptr+gsize, erec2.ptr);     \
+    }                                                                                                          \
+    else {                                                                                                     \
     gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, q>>>(n, P, posq.ptr, dipF.ptr, K1, K2, K3, theta.ptr,         \
                                                          dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr, erec.ptr,   \
                                                          frec.ptr);                                               \
     gatherT<PC, true><<<(n+63)/64, 64, gatherSmem, q>>>(n, P, posq.ptr, dipF2.ptr, K1, K2, K3, theta.ptr,        \
                                                          dtheta.ptr, d2theta.ptr, gidx.ptr, grid.ptr+gsize,       \
-                                                         erec2.ptr, frec.ptr)
+                                                         erec2.ptr, frec.ptr);                                    \
+    }
     switch (P) {
         case 4: PGM_DUAL(4); break;
         case 5: PGM_DUAL(5); break;
@@ -1952,10 +2137,10 @@ bool Engine::Impl::registerPositions(const float* p) {
 
 void Engine::Impl::enqueuePre(bool dual) {
     const int m = 3*n;
+    zeroSmall<<<1, 64, 0, st>>>(maxDisp.ptr, 2, scal.ptr, 16, acc.ptr, NACC, srOver.ptr, srOver.ptr ? 1 : 0);
     if (usePosF || devPos)
         uploadPositions();
     if (!externalList) {
-        CU(cudaMemsetAsync(maxDisp.ptr, 0, 2*sizeof(unsigned), st));
         displacements<<<std::min(blocksFor(n, 256), 1024), 256, 0, st>>>(n, posq.ptr, posBuild.ptr, posPrev.ptr,
                                                                           maxDisp.ptr);
         if (useExport)
@@ -1986,10 +2171,13 @@ void Engine::Impl::enqueuePre(bool dual) {
                                                         x.ptr);   // the predictor: b not needed
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, perm.ptr, nullptr, dipF.ptr);
         toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, x.ptr, nullptr, dipF2.ptr);
+        const bool pre = preFor(true);
         fork();
         pairSetupDual<<<pblocks, threads, 0, st>>>(n, cellAtomSorted.ptr, atomStart.ptr, candJ.ptr, posq.ptr,
                                                    rg.ptr, rc2, rp2, beta, dipF.ptr, dipF2.ptr, PJ.ptr, G12.ptr,
-                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr);
+                                                   storeG03 ? G03.ptr : nullptr, pairEnd.ptr, fld.ptr, fld2.ptr,
+                                                   pre ? (float) (rpre*rpre) : 0.0f, pre ? srCount.ptr : nullptr,
+                                                   srJ.ptr, srG.ptr, srOver.ptr);
         fieldDual(true);   // (its join)
         return;
     }
@@ -2021,10 +2209,15 @@ void Engine::Impl::enqueuePre(bool dual) {
 void Engine::Impl::enqueueCgInit(CondHandle h, bool useHandle, bool dual) {
     const int m = 3*n, cgBlocks = std::max(1, std::min(blocksFor(m, CG_THREADS), 1024));
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
-    CU(cudaMemsetAsync(scal.ptr, 0, 16*sizeof(double), st));
+    const bool pre = preFor(dual);
+    curPre = pre;
     cgInitK<<<cgBlocks, CG_THREADS, 0, st>>>(m, b.ptr, T.ptr, dual ? fld.ptr : nullptr, erec.ptr, perm.ptr, fld2.ptr,
                                              erec2.ptr, cs, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, scal.ptr, s.tol,
-                                             s.maxIter, h, useHandle, dipF.ptr);
+                                             s.maxIter, h, useHandle && !pre, dipF.ptr, pre);
+    if (pre)
+        precondK<true><<<std::max(1, std::min(blocksFor(n, CG_THREADS), 1024)), CG_THREADS, 0, st>>>(
+                n, posq.ptr, srCount.ptr, srJ.ptr, srG.ptr, srOver.ptr, alphaD.ptr, r.ptr, nullptr, z.ptr, p.ptr,
+                dipF.ptr, scal.ptr, s.tol, s.maxIter, h, useHandle);
 }
 
 void Engine::Impl::enqueueCgIteration(CondHandle h, bool useHandle) {
@@ -2032,7 +2225,11 @@ void Engine::Impl::enqueueCgIteration(CondHandle h, bool useHandle) {
     const double cs = 4.0*s.beta*s.beta*s.beta/(3.0*pgmcore::SQRT_PI);
     field(false, p.ptr, nullptr, true);   // T p combined in cgApply; p in dipF already (cgInitK, cgDirection)
     cgApply<<<cgBlocks, CG_THREADS, 0, st>>>(m, fld.ptr, erec.ptr, cs, alphaD.ptr, p.ptr, Ap.ptr, scal.ptr);
-    cgUpdate<<<cgBlocks, CG_THREADS, 0, st>>>(m, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, Ap.ptr, scal.ptr);
+    cgUpdate<<<cgBlocks, CG_THREADS, 0, st>>>(m, alphaD.ptr, x.ptr, r.ptr, z.ptr, p.ptr, Ap.ptr, scal.ptr, curPre);
+    if (curPre)
+        precondK<false><<<std::max(1, std::min(blocksFor(n, CG_THREADS), 1024)), CG_THREADS, 0, st>>>(
+                n, posq.ptr, srCount.ptr, srJ.ptr, srG.ptr, srOver.ptr, alphaD.ptr, r.ptr, Ap.ptr, z.ptr, nullptr,
+                nullptr, scal.ptr, s.tol, s.maxIter, h, false);
     cgDirection<<<cgBlocks, CG_THREADS, 0, st>>>(m, z.ptr, p.ptr, scal.ptr, s.tol, s.maxIter, h, useHandle, dipF.ptr);
 }
 
@@ -2049,8 +2246,6 @@ void Engine::Impl::enqueuePost(bool strain) {
     }
     addVec<<<blocksFor(m, 256), 256, 0, st>>>(m, perm.ptr, x.ptr, dTot.ptr);
     toFloat<<<blocksFor(n, 256), 256, 0, st>>>(m, dTot.ptr, nullptr, dipF.ptr);
-    CU(cudaMemsetAsync(frc.ptr, 0, m*sizeof(ull), st));
-    CU(cudaMemsetAsync(acc.ptr, 0, NACC*sizeof(double), st));
     const float rvdw2 = (float) (rvdw*rvdw), invKe = (float) (1.0/s.ke);
     fork();
 #define PGM_FINAL(STRAIN, GV)                                                                                    \
@@ -2075,14 +2270,19 @@ void Engine::Impl::enqueuePost(bool strain) {
                                                              covStrength.ptr, Etot.ptr, frc.ptr,
                                                              strain ? acc.ptr+20 : nullptr);
     const int rblocks = std::min(blocksFor(n, 256), 1024);
+    double* fHost = nullptr;   // (finalReduce writing pinned host memory directly: 4 ms for 4096 waters)
     if (strain)
         finalReduce<true><<<rblocks, 256, 0, st>>>(n, s.ke, frc.ptr, fpair.ptr, frec.ptr, erec.ptr, dTot.ptr, x.ptr,
-                                                   alphaD.ptr, fOut.ptr, acc.ptr);
+                                                   alphaD.ptr, fOut.ptr, acc.ptr, fHost);
     else
         finalReduce<false><<<rblocks, 256, 0, st>>>(n, s.ke, frc.ptr, fpair.ptr, frec.ptr, erec.ptr, dTot.ptr, x.ptr,
-                                                    alphaD.ptr, fOut.ptr, acc.ptr);
+                                                    alphaD.ptr, fOut.ptr, acc.ptr, fHost);
     if (devForce)
         addForcesFixed<<<blocksFor(m, 256), 256, 0, st>>>(n, fOut.ptr, devForce, devStride, devScale);
+    else if (useExport)   // coalesced 16-byte stores to pinned memory (a copy node costs more)
+        copyToHost<<<std::min(blocksFor((size_t) m/2, 256), 1024), 256, 0, st>>>((const uint4*) fOut.ptr,
+                                                                                  (uint4*) fH.ptr, (size_t) m/2,
+                                                                                  fOut.ptr, fH.ptr, m);
     else
         CU(cudaMemcpyAsync(fH.ptr, fOut.ptr, m*sizeof(double), cudaMemcpyDeviceToHost, st));
     if (useExport)
@@ -2204,7 +2404,7 @@ Engine::Engine(const Settings& settings) : impl(new Impl) {
     CUFFT(cufftPlanMany(&impl->planB2, 3, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, 2));
     for (cufftHandle h : {impl->planF, impl->planB, impl->planF2, impl->planB2})
         CUFFT(cufftSetStream(h, impl->ps()));
-    impl->gridFix.resize(2*(size_t) K1*K2*K3);   // two grids for fieldDual
+    impl->gridFix.zero(2*(size_t) K1*K2*K3);   // two grids for fieldDual; cleared again by fixedToReal
     impl->grid.resize(2*(size_t) K1*K2*K3);
     impl->cgrid.resize(2*(size_t) K1*K2*(K3/2+1));
     std::vector<double> m[3] = {pgmcore::bsplineModuli(K1, settings.order), pgmcore::bsplineModuli(K2, settings.order),
@@ -2326,7 +2526,7 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
         I.atomStart.zero(n+1);
         I.pairEnd.zero(n);
     }
-    I.frc.resize(m);
+    I.frc.zero(m);   // then cleared by finalReduce
     const size_t np = (size_t) 3*n*I.s.order;
     I.theta.resize(np);
     I.dtheta.resize(np);
@@ -2347,6 +2547,12 @@ void Engine::setAtoms(int n, const double* q, const double* radius, const double
     I.gvdwOn = false;   // setGvdw again for the new order
     I.skipsMarked = false;
     I.cellAtomSorted.resize(n);
+    if (I.rpre > 0) {
+        I.srCount.resize(n);
+        I.srJ.resize((size_t) n*PRE_CAP);
+        I.srG.resize((size_t) n*PRE_CAP);
+        I.srOver.resize(1);
+    }
 }
 
 void Engine::Impl::remapList(const std::vector<int>& newOf) {
