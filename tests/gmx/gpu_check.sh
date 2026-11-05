@@ -34,7 +34,7 @@ sp() {   # sp NAME MDP CONF TOP
         energies $1_$mode
     done
     echo "== single point $1: GPU vs CPU"
-    $P $D/dd_compare.py $1_cpu $1_gpu || true
+    $P $D/dd_compare.py --gpu $1_cpu $1_gpu || true
 }
 sp w512 $R/gmx_w512/sp.mdp $R/gmx_w512/w512.g96 $R/gmx_w512/w512.top
 sp w4096 $R/gmx_gpu4k/bench.mdp $R/gmx_gpu4k/w4096.gro $R/gmx_gpu4k/w4096.top
