@@ -35,12 +35,13 @@ ap.add_argument("--cutoff", type=float, default=0.9)
 ap.add_argument("--vdw", default="lj", help="lj | gvdw | none")
 ap.add_argument("--gvdw", default="slater", help="pgm_prmtop.PGM3P_GVDW key (with --vdw gvdw)")
 ap.add_argument("--lrc", action="store_true", help="vdW dispersion correction")
+ap.add_argument("--nopol", action="store_true", help="no induced dipoles (fixed charges + permanent dipoles)")
 ap.add_argument("--replicate", type=int, nargs=3, default=None, help="the box nx ny nz times (tests/replicate.py)")
 a = ap.parse_args()
 
 system, top, pgm = pgm_prmtop.create_system(
     a.prmtop, cutoff=a.cutoff, ewald_beta=a.beta, grid=tuple(a.grid), dipole_tol=a.tol, peek=a.peek, predictor=a.predictor,
-    vdw=a.vdw, gvdw=a.gvdw if a.vdw == "gvdw" else None, lj_lrc=a.lrc,
+    vdw=a.vdw, gvdw=a.gvdw if a.vdw == "gvdw" else None, lj_lrc=a.lrc, polarization=not a.nopol,
 )  # fmt: skip
 crd = app.AmberInpcrdFile(a.rst7)
 positions = crd.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
