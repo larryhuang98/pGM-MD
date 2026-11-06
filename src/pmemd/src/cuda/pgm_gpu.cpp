@@ -248,6 +248,7 @@ static int pgm_cache16 = 0;                        // env PGM_CACHE16: half2 B-f
 static bool pgm_in_cg_loop = false;
 static int pgm_pred_mode = -1;
 static int pgm_fused = 0;                          // env PGM_FUSED: fuse perm-field and r0 sweeps
+static int pgm_pcg_solver = 1;                     // scf_solv_opt (pgm_gpu_set_pcg_params_); >= 2: PCG, which needs separate fields
 static double pgm_peek_w = 0.0;                    // env PGM_PEEK: Richardson step weight after CG
 static double pgm_bnorm_frozen = -1.0;             // exact mean|b| captured on a non-fused step
 static int pgm_cg_batch_env = 0;                   // env PGM_CG_BATCH overrides all batch sizes if > 0
@@ -289,6 +290,9 @@ static void pgm_pred_init() {
   }
   const char* f = getenv("PGM_FUSED");
   if (f || e) pgm_fused = ((f && atoi(f) > 0 && (pgm_pred_mode == 4 || pgm_pred_mode == 5)) || pgm_pred_mode == 7) ? 1 : 0;
+  // The PCG path (scf_solv_opt = 2, 3) computes its own initial residual and is not compatible with the
+  // combined permanent-field + initial-residual sweep: use separate fields with it.
+  if (pgm_pcg_solver >= 2 && pgm_pred_mode != 7) pgm_fused = 0;
   { const char* ov = getenv("PGM_OVERLAP"); if (ov) pgm_overlap = (atoi(ov) > 0) ? 1 : 0; }
   const char* c16 = getenv("PGM_CACHE16");
 #ifndef use_DPFP
@@ -616,6 +620,7 @@ extern "C" void pgm_gpu_set_pcg_params_(int* solv_opt, int* local_niter,
                                           double* local_cut, double* sor_coeff)
 {
   gpu->pgm_scf_solv_opt    = *solv_opt;
+  pgm_pcg_solver           = *solv_opt;
   gpu->pgm_scf_local_niter = *local_niter;
   gpu->pgm_scf_local_cut   = *local_cut;
   gpu->pgm_scf_sor_coeff   = *sor_coeff;
