@@ -15,9 +15,9 @@ What it builds (docs/spec.md):
   all ordered atom pairs, as a TailCorrectionForce (only the r^-6 term, unlike OpenMM's correction);
 * or, with vdw="gvdw", GVDWForce (the Gaussian-density van der Waals of pmemd-pgm igvdw = 1) in place
   of the Lennard-Jones: the pGM radii, GVDW parameters from `gvdw` (pmemd-pgm's global
-  gvdw_arep / gvdw_c6 / b_rep_scale on the atoms that carry LJ, as pmemd-pgm, or per atom type), the
-  prmtop's exclusions (GVDW exceptions with A = C6 = 0); the 1-4 pairs keep their scaled Lennard-Jones
-  (NonbondedForce exceptions);
+  gvdw_arep / gvdw_c6 / b_rep_scale on the atoms that carry LJ, per atom type, or A and C6 per atom type
+  from the prmtop's ACOEF / BCOEF as pmemd-pgm igvdw = 1 reads them), the 1-2 and 1-3 pairs excluded
+  (GVDW exceptions with A = C6 = 0) and the 1-4 pairs with the full GVDW, as pmemd-pgm; no Lennard-Jones;
   dispersion correction of the C6 term with lj_lrc.
 
 Units: OpenMM's (nm, kJ/mol).
@@ -35,6 +35,8 @@ from openmm import app, unit
 import openmmpgm
 
 KCAL = 4.184
+# Coulomb constant of pmemd-pgm (332.05382 kcal/mol A/e^2), shared by all pGM implementations
+PMEMD_COULOMB = 332.05382 * KCAL / 10.0
 
 # pmemd-pgm GVDW water models of the GVDW manuscript (Huang, Luo, Duan; O-O only): &pol_gauss values
 PGM3P_GVDW = {
@@ -144,7 +146,7 @@ def create_system(
     gvdw: dict | str | None = None,
     rigid_water: bool = True,
     constraints=None,
-    coulomb: float | None = None,
+    coulomb: float | None = PMEMD_COULOMB,
     dipole_tol: float = 1e-5,
     max_iter: int = 100,
     peek: float = 0.65,
@@ -156,7 +158,8 @@ def create_system(
 
     cutoff [nm] applies to the direct-space electrostatics and the LJ; ewald_beta [1/nm] and grid set
     the PME (ewald_beta = 0: chosen from ewald_tol as NonbondedForce does).  predictor: "none", "mu3",
-    "mu4".  coulomb: the Coulomb constant (None: OpenMM's; pmemd-pgm's is 332.05382 * 0.4184).
+    "mu4".  coulomb: the Coulomb constant [kJ/mol nm/e^2]; default pmemd-pgm's 332.05382 kcal/mol A/e^2,
+    the value of every pGM implementation (None: OpenMM's ONE_4PI_EPS0).
 
     vdw: "lj" (the prmtop's Lennard-Jones), "gvdw" or "none" (lj=False is "none").  gvdw: a key of
     PGM3P_GVDW, a pmemd-style dict {"rep": "slater"|"gauss", "arep": kcal/mol, "c6": kcal/mol A^6,
@@ -229,29 +232,90 @@ def create_system(
     return system, amber.topology, pgm
 
 
+def amber_14_pairs(s: dict) -> list[tuple[int, int]]:
+    """The 1-4 pairs of a prmtop as pmemd builds its nb14 list: the end atoms of every dihedral whose third
+    index is positive (negative: end interactions ignored, e.g. ring duplicates) and fourth index is
+    positive (negative: improper).  0-based, each pair once."""
+    pairs = set()
+    for key in ("DIHEDRALS_INC_HYDROGEN", "DIHEDRALS_WITHOUT_HYDROGEN"):
+        d = s.get(key)
+        if d is None or len(d) == 0:
+            continue
+        for i, j, k, l, _ in np.asarray(d, int).reshape(-1, 5):
+            if k < 0 or l < 0:
+                continue
+            a, b = abs(i) // 3, abs(l) // 3
+            pairs.add((min(a, b), max(a, b)))
+    return sorted(pairs)
+
+
+def gvdw_from_topology(s: dict) -> list[tuple[float, float]]:
+    """Per-atom (sqrtA [kJ/mol]^1/2, sqrtC6 [kJ/mol nm^6]^1/2) from a GVDW prmtop, whose LENNARD_JONES_ACOEF /
+    BCOEF hold the GVDW A [kcal/mol] and C6 [kcal/mol A^6] per type pair (pmemd-pgm igvdw = 1).  The type-pair
+    tables must follow the geometric rule A_ij = sqrt(A_ii A_jj), C6_ij = sqrt(C6_ii C6_jj)."""
+    ntypes = int(s["POINTERS"][1])
+    types = s["ATOM_TYPE_INDEX"].astype(int) - 1
+    nbi = s["NONBONDED_PARM_INDEX"].astype(int)
+    A = np.asarray(s["LENNARD_JONES_ACOEF"], float)
+    C = np.asarray(s["LENNARD_JONES_BCOEF"], float)
+
+    def tab(t, a, b):
+        idx = nbi[a * ntypes + b]
+        if idx <= 0:
+            raise ValueError("GVDW topology: 10-12 (negative) NONBONDED_PARM_INDEX entries are not supported")
+        return t[idx - 1]
+
+    a = np.array([np.sqrt(max(tab(A, t, t), 0.0)) for t in range(ntypes)])
+    c = np.array([np.sqrt(max(tab(C, t, t), 0.0)) for t in range(ntypes)])
+    for x in range(ntypes):
+        for y in range(ntypes):
+            for t, v, name in ((A, a, "ACOEF"), (C, c, "BCOEF")):
+                want, got = v[x] * v[y], tab(t, x, y)
+                if abs(got - want) > 1e-9 * max(abs(got), abs(want), 1e-12):
+                    raise ValueError(f"GVDW topology: {name} of types {x + 1},{y + 1} is not the geometric mean "
+                                     f"({got} vs {want}); per-pair tables are not supported")
+    ka = np.sqrt(KCAL)
+    kc = np.sqrt(KCAL * 1e-6)
+    return [(float(a[t] * ka), float(c[t] * kc)) for t in types]
+
+
 def add_gvdw(system, nb, par, gvdw, cutoff, periodic, lrc, group):
-    """Replace the Lennard-Jones of `nb` (a charge-free NonbondedForce of `system`) by a GVDWForce."""
+    """Replace the Lennard-Jones of `nb` (a charge-free NonbondedForce of `system`) by a GVDWForce.
+
+    gvdw: a key of PGM3P_GVDW, a pmemd-style dict {"rep", "arep", "c6", "b"} (one A and C6 for every atom with
+    a Lennard-Jones epsilon), {"rep", "b"} alone (A and C6 per atom type from the prmtop's ACOEF/BCOEF, as
+    pmemd-pgm igvdw = 1 reads them), or {"rep", "types": {amber_atom_type: (sqrtA, sqrtC6, b)}} (OpenMM units).
+    As in pmemd-pgm, the 1-2 and 1-3 pairs are excluded and the 1-4 pairs get the full (unscaled) GVDW;
+    no Lennard-Jones remains."""
     if gvdw is None:
         raise ValueError("vdw='gvdw' needs the gvdw parameters (e.g. gvdw='slater')")
     if isinstance(gvdw, str):
         gvdw = PGM3P_GVDW[gvdw]
+    s = par["sections"]
     n = system.getNumParticles()
     eps = np.array([nb.getParticleParameters(i)[2].value_in_unit(unit.kilojoule_per_mole) for i in range(n)])
     if "types" in gvdw:
-        types = par["sections"]["AMBER_ATOM_TYPE"]
+        types = s["AMBER_ATOM_TYPE"]
         prm = [gvdw["types"].get(t, (0.0, 0.0, 1.0)) for t in types]
-    else:
+    elif "arep" in gvdw:
         one = gvdw_from_pmemd(gvdw["arep"], gvdw["c6"], gvdw["b"])
         prm = [one if e > 0 else (0.0, 0.0, 1.0) for e in eps]
+    else:
+        prm = [(sa, sc, float(gvdw["b"])) for sa, sc in gvdw_from_topology(s)]
     f = openmmpgm.GVDWForce()
     f.setRepulsionForm({"gauss": openmmpgm.GVDWForce.Gaussian, "slater": openmmpgm.GVDWForce.Slater}[gvdw["rep"]])
     for i in range(n):
         f.addParticle(float(par["radius"][i]), *(float(v) for v in prm[i]))
-    # every exception of the prmtop (1-2, 1-3, 1-4) is excluded from GVDW; the 1-4 pairs keep the prmtop's
-    # scaled Lennard-Jones below (pmemd-pgm evaluates GVDW only in the nonbonded pair list)
+    # exclusions of the prmtop: 1-2 and 1-3 pairs excluded; 1-4 pairs (pmemd's nb14 list) keep the full GVDW
+    pairs14 = set(amber_14_pairs(s))
     for k in range(nb.getNumExceptions()):
         i, j, _, _, _ = nb.getExceptionParameters(k)
-        f.addException(i, j, 0.0, 0.0, 0.0)
+        if (min(i, j), max(i, j)) in pairs14:
+            (sai, sci, bi), (saj, scj, bj) = prm[i], prm[j]
+            f.addException(i, j, sai * saj, sci * scj, 0.5 * (bi + bj))
+        else:
+            f.addException(i, j, 0.0, 0.0, 0.0)
+    f.setExceptionsUsePeriodicBoundaryConditions(periodic)
     if periodic:
         f.setNonbondedMethod(openmmpgm.GVDWForce.CutoffPeriodic)
         f.setCutoffDistance(cutoff)
@@ -260,11 +324,6 @@ def add_gvdw(system, nb, par, gvdw, cutoff, periodic, lrc, group):
         f.setNonbondedMethod(openmmpgm.GVDWForce.NoCutoff)
     f.setForceGroup(group)
     system.addForce(f)
-    # the Lennard-Jones goes; the scaled 1-4 Lennard-Jones (exceptions with epsilon != 0) stays
-    for i in range(n):
-        q, sig, _ = nb.getParticleParameters(i)
-        nb.setParticleParameters(i, q, sig, 0.0)
-    if not any(nb.getExceptionParameters(k)[4].value_in_unit(unit.kilojoule_per_mole) != 0
-               for k in range(nb.getNumExceptions())):
-        system.removeForce([k for k, g in enumerate(system.getForces()) if isinstance(g, mm.NonbondedForce)][0])
+    # no Lennard-Jones remains (the pGM electrostatics are in PGMForce): drop the NonbondedForce
+    system.removeForce([k for k, g in enumerate(system.getForces()) if g is nb or isinstance(g, mm.NonbondedForce)][0])
     return f
