@@ -1,0 +1,3689 @@
+diff --git a/cmake/CudaConfig.cmake b/cmake/CudaConfig.cmake
+index 1b956e3..feb132f 100644
+--- a/cmake/CudaConfig.cmake
++++ b/cmake/CudaConfig.cmake
+@@ -13,6 +13,11 @@ else()
+ 
+ 		set(CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+ 
++		#SM12.0 = Blackwell GeForce (RTX 50 series), SM10.0 = B200 (pGM patch: CUDA >= 12.8)
++		set(SM120FLAGS -gencode arch=compute_120,code=sm_120)
++		set(SM100FLAGS -gencode arch=compute_100,code=sm_100)
++		#SM8.9 = Ada (RTX 40 series)
++		set(SM89FLAGS -gencode arch=compute_89,code=sm_89)
+ 		#SM9.0 = GH200
+ 		set(SM90FLAGS -gencode arch=compute_90,code=sm_90)
+ 		#SM8.6  -- not currently used, but should be tested on Cuda 11.1
+@@ -71,8 +76,14 @@ else()
+ 			message(STATUS "Configuring for SM5.0, SM5.2, SM5.3, SM6.0, SM6.1, SM7.0, SM7.5, SM8.0, SM8.6, and SM9.0")
+ 			list(APPEND CUDA_NVCC_FLAGS ${SM50FLAGS} ${SM52FLAGS} ${SM53FLAGS} ${SM60FLAGS} ${SM61FLAGS} ${SM70FLAGS} ${SM75FLAGS} ${SM80FLAGS} ${SM86FLAGS} ${SM90FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations)
+ 
++		elseif((${CUDA_VERSION} VERSION_GREATER_EQUAL 12.5) AND (${CUDA_VERSION} VERSION_LESS 12.8))
++			message(STATUS "Configuring for SM5.0, SM5.2, SM5.3, SM6.0, SM6.1, SM7.0, SM7.5, SM8.0, SM8.6, SM8.9 and SM9.0")
++			list(APPEND CUDA_NVCC_FLAGS ${SM50FLAGS} ${SM52FLAGS} ${SM53FLAGS} ${SM60FLAGS} ${SM61FLAGS} ${SM70FLAGS} ${SM75FLAGS} ${SM80FLAGS} ${SM86FLAGS} ${SM89FLAGS} ${SM90FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations)
++		elseif((${CUDA_VERSION} VERSION_GREATER_EQUAL 12.8) AND (${CUDA_VERSION} VERSION_LESS 13.0))
++			message(STATUS "Configuring for SM7.0, SM7.5, SM8.0, SM8.6, SM8.9, SM9.0, SM10.0 and SM12.0")
++			list(APPEND CUDA_NVCC_FLAGS ${SM70FLAGS} ${SM75FLAGS} ${SM80FLAGS} ${SM86FLAGS} ${SM89FLAGS} ${SM90FLAGS} ${SM100FLAGS} ${SM120FLAGS} -Wno-deprecated-gpu-targets -Wno-deprecated-declarations)
+ 		else()
+-			message(FATAL_ERROR "Error: Untested CUDA version. AMBER currently requires CUDA version >= 7.5 and <  12.5.")
++			message(FATAL_ERROR "Error: Untested CUDA version. AMBER (with the pGM patch) requires CUDA version >= 7.5 and < 13.0.")
+ 		endif()
+ 
+ 		#  check maximum GNU compiler versions wrt cuda:
+diff --git a/src/pmemd/src/CMakeLists.txt b/src/pmemd/src/CMakeLists.txt
+index 01fff28..a17d202 100644
+--- a/src/pmemd/src/CMakeLists.txt
++++ b/src/pmemd/src/CMakeLists.txt
+@@ -286,3 +286,6 @@ endif()
+ 
+ 
+ 
++
++# pGM (external patch)
++include(${CMAKE_CURRENT_SOURCE_DIR}/pGM/pgm.cmake)
+diff --git a/src/pmemd/src/barostats.F90 b/src/pmemd/src/barostats.F90
+index b907c0e..5bb685b 100644
+--- a/src/pmemd/src/barostats.F90
++++ b/src/pmemd/src/barostats.F90
+@@ -137,7 +137,7 @@ subroutine mcbar_trial(atm_cnt, crd, frc, mass, new_list, orig_pot_ene, &
+   use pme_force_mod, only : pme_pot_ene_rec, pme_force
+ #endif
+   use mdin_ewald_dat_mod, only : skinnb
+-  use mdin_ctrl_dat_mod, only : ntf, ntc
++  use mdin_ctrl_dat_mod, only : ntf, ntc, ipgm
+   use mol_list_mod, only : gbl_mol_cnt
+   use processor_mod
+   use parallel_processor_mod
+@@ -409,6 +409,9 @@ end if !usemidpoint
+ 
+ #ifdef CUDA
+   call gpu_download_frc(frc)
++#ifdef PGM
++  if (ipgm >= 1) call pgm_gpu_save_dipole_state()
++#endif
+ #endif
+   ! Now we need to calculate our next energy, but do not print any nmropt values
+ 
+@@ -557,9 +560,12 @@ end if
+ #ifdef CUDA
+     ! For GPUs, reload the old forces back to the GPU
+     call gpu_upload_frc(frc)
++#ifdef PGM
++    ! Restore PGM induced-dipole state so the extrapolated initial guess
++    ! for the next step is not contaminated by the rejected trial geometry.
++    if (ipgm >= 1) call pgm_gpu_restore_dipole_state()
++#endif
+ #endif
+-    ! DEBUG
+-!   if(master) write(mdout, '(a)') 'Rejected'
+   end if
+ 
+   if (mod(mcbar_attempts, dvmax_interval) .eq. 0) then
+diff --git a/src/pmemd/src/bspline.F90 b/src/pmemd/src/bspline.F90
+index 2e75d50..037e639 100644
+--- a/src/pmemd/src/bspline.F90
++++ b/src/pmemd/src/bspline.F90
+@@ -1,5 +1,7 @@
+ #include "copyright.i"
+-
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: bspline_mod
+@@ -540,6 +542,10 @@ subroutine fill_bspline_2(w, order, array, darray, d2array)
+   double precision      d2array(order)
+ 
+   double precision      div
++#ifdef PGM
++  double precision      ww
++  double precision      w2
++#endif
+   integer               k
+ 
+   if (order .eq. 4) then
+@@ -589,6 +595,61 @@ subroutine fill_bspline_2(w, order, array, darray, d2array)
+ 
+     return
+ 
++#ifdef PGM
++  else if (order .eq. 5) then
++
++! Init order 2:
++
++!    array(2) = w
++!    array(1) = 1.d0 - w
++
++! One pass to order 3:
++
++!    array(3) = 0.5d0 * w * array(2)
++!    array(2) = 0.5d0 * ((w + 1.d0) * array(1) + (2.d0 - w) * array(2))
++!    array(1) = 0.5d0 * (1.d0 - w) * array(1)
++
++! Together:
++
++    ww = w * w
++    array(3) = 0.5d0 * ww
++    array(2) = 0.5d0 + w - ww
++    array(1) = 0.5d0 * (1.d0 + ww) - w
++
++! 2nd deriv, order 5
++
++     d2array(1) = array(1)
++     d2array(2) = array(2) - 2.d0 * array(1)
++     d2array(3) = array(1) - 2.d0 * array(2) + array(3)
++     d2array(4) = array(2) - 2.d0 * array(3)
++     d2array(5) = array(3)
++
++! One pass to order 4:
++
++    div = 1.d0/3.d0
++    array(4) = div * w * array(3)
++    array(3) = div * ((w + 1.d0) * array(2) + (3.d0 - w) * array(3))
++    array(2) = div * ((w + 2.d0) * array(1) + (2.d0 - w) * array(2))
++    array(1) = div * (1.d0 - w) * array(1)
++
++! Order four deriv:
++
++    darray(1) = - array(1)
++    darray(2) = array(1) - array(2)
++    darray(3) = array(2) - array(3)
++    darray(4) = array(3) - array(4)
++    darray(5) = array(4)
++
++! One pass to order 5:
++
++    div = 0.25d0
++    array(5) = div * w * array(4)
++    array(4) = div * ((w + 1.0d0) * array(3) + (4.0d0 - w) * array(4))
++    array(3) = div * ((w + 2.0d0) * array(2) + (3.0d0 - w) * array(3))
++    array(2) = div * ((w + 3.0d0) * array(1) + (2.0d0 - w) * array(2))
++    array(1) = div * (1.0d0 - w) * array(1)
++
++#endif   /* PGM */
+   else
+ 
+ ! Init order 2:
+@@ -630,6 +691,537 @@ subroutine fill_bspline_2(w, order, array, darray, d2array)
+ 
+ end subroutine fill_bspline_2
+ 
++#ifdef PGM
++!*******************************************************************************
++!
++! Subroutine:  fill_bspline_2_3d
++!
++! Description: calculate B-spline upto 2nd derivatives
++!
++! Use standard B-spline recursions: see doc file.
++! w is fraction between 0 and 1; 
++! order is the order of interpolation;
++! array is the array of shifted bsplines;
++! darray is array of derivs;
++! d2array is array of 2nd derivs;
++! Using notation from Essmann et al; w = u-[u] and
++! array(j) = M_n(w + order - j)  where n is order & w = u - [u]; 
++!              
++!*******************************************************************************
++
++subroutine fill_bspline_2_3d(w, order, array, darray, d2array)
++
++  implicit none
++
++  integer               order
++  double precision      w(3)
++  double precision      array(order,3)
++  double precision      darray(order,3)
++  double precision      d2array(order,3)
++
++  double precision      div, ww, w2
++  integer               k
++  integer               i
++
++  if (order .eq. 4) then
++
++  do i = 1, 3
++! Init order 2:
++
++    array(2,i) = w(i)
++    array(1,i) = 1.d0 - w(i)
++
++! In full:
++!   order three deriv
++!      darray(1) = -array(1)
++!      darray(2) = array(1) - array(2)
++!      darray(3) = array(2)
++!   deriv of deriv
++!      d2array(1) = -darray(1)
++!      d2array(2) = darray(1) - darray(2)
++!      d2array(3) = darray(2) - darray(3)
++!      d2array(4) = darray(3)
++! In short:
++
++    d2array(1,i) = array(1,i)
++    d2array(2,i) = array(2,i) - 2.d0 * array(1,i)
++    d2array(3,i) = array(1,i) - 2.d0 * array(2,i)
++    d2array(4,i) = array(2,i)
++
++! One pass to order 3:
++
++    array(3,i) = 0.5d0 * w(i) * array(2,i)
++    array(2,i) = 0.5d0 * ((w(i) + 1.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = 0.5d0 * (1.d0 - w(i)) * array(1,i)
++
++! Order four deriv:
++
++    darray(1,i) = - array(1,i)
++    darray(2,i) = array(1,i) - array(2,i)
++    darray(3,i) = array(2,i) - array(3,i)
++    darray(4,i) = array(3,i)
++
++! One pass to order 4:
++
++    div = 1.d0/3.d0
++    array(4,i) = div * w(i) * array(3,i)
++    array(3,i) = div * ((w(i) + 1.d0) * array(2,i) + (3.d0 - w(i)) * array(3,i))
++    array(2,i) = div * ((w(i) + 2.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = div * (1.d0 - w(i)) * array(1,i)
++
++  end do
++
++    return
++  else if (order .eq. 5) then
++
++  do i = 1, 3
++! Init order 2:
++
++!    array(2) = w
++!    array(1) = 1.d0 - w
++
++! One pass to order 3:
++
++!    array(3) = 0.5d0 * w * array(2)
++!    array(2) = 0.5d0 * ((w + 1.d0) * array(1) + (2.d0 - w) * array(2))
++!    array(1) = 0.5d0 * (1.d0 - w) * array(1)
++
++! Together:
++
++    ww = w(i) * w(i)
++    array(3,i) = 0.5d0 * ww
++    array(2,i) = 0.5d0 + w(i) - ww
++    array(1,i) = 0.5d0 * (1.d0 + ww) - w(i)
++
++! 2nd deriv, order 5
++
++     d2array(1,i) = array(1,i)
++     d2array(2,i) = array(2,i) - 2.d0 * array(1,i)
++     d2array(3,i) = array(1,i) - 2.d0 * array(2,i) + array(3,i)
++     d2array(4,i) = array(2,i) - 2.d0 * array(3,i)
++     d2array(5,i) = array(3,i)
++
++! One pass to order 4:
++
++    div = 1.d0/3.d0
++    array(4,i) = div * w(i) * array(3,i)
++    array(3,i) = div * ((w(i) + 1.d0) * array(2,i) + (3.d0 - w(i)) * array(3,i))
++    array(2,i) = div * ((w(i) + 2.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = div * (1.d0 - w(i)) * array(1,i)
++
++! Order four deriv:
++
++    darray(1,i) = - array(1,i)
++    darray(2,i) = array(1,i) - array(2,i)
++    darray(3,i) = array(2,i) - array(3,i)
++    darray(4,i) = array(3,i) - array(4,i)
++    darray(5,i) = array(4,i)
++
++! One pass to order 5:
++
++    div = 0.25d0
++    array(5,i) = div * w(i) * array(4,i)
++    array(4,i) = div * ((w(i) + 1.0d0) * array(3,i) + (4.0d0 - w(i)) * array(4,i))
++    array(3,i) = div * ((w(i) + 2.0d0) * array(2,i) + (3.0d0 - w(i)) * array(3,i))
++    array(2,i) = div * ((w(i) + 3.0d0) * array(1,i) + (2.0d0 - w(i)) * array(2,i))
++    array(1,i) = div * (1.0d0 - w(i)) * array(1,i)
++
++  end do
++
++    return
++  else
++
++! Init order 2:
++  do i = 1, 3
++    array(2,i) = w(i)
++    array(1,i) = 1.d0 - w(i)
++
++! One pass to order 3:
++
++    array(3,i) = 0.5d0 * w(i) * array(2,i)
++    array(2,i) = 0.5d0 * ((w(i) + 1.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = 0.5d0 * (1.d0 - w(i)) * array(1,i)
++
++! Compute standard b-spline recursion:
++
++    do k = 4, order - 2
++      call one_pass_bspline(array(1,i), w(i), k)
++    end do
++
++! Perform standard b-spline differentiation:
++
++    call diff_bspline(array(1,i), darray(1,i), order - 1) 
++! Deriv of deriv:
++
++    call diff_bspline(darray(1,i), d2array(1,i), order)
++
++! Perform standard b-spline differentiation:
++
++    call one_pass_bspline(array(1,i), w(i), order - 1)
++    call diff_bspline(array(1,i), darray(1,i), order)
++
++! One more recursion:
++
++    call one_pass_bspline(array(1,i), w(i), order)
++
++  end do
++
++    return
++
++  end if
++
++end subroutine fill_bspline_2_3d
++
++!*******************************************************************************
++!
++! Subroutine:  fill_bspline_3
++!
++! Description: calculate B-spline upto 3rd derivatives
++!
++! Use standard B-spline recursions: see doc file.
++! w is fraction between 0 and 1; 
++! order is the order of interpolation;
++! array is the array of shifted bsplines;
++! darray is array of derivs;
++! d2array is array of 2nd derivs;
++! d3array is array of 3rd derivs;
++! Using notation from Essmann et al; w = u-[u] and
++! array(j) = M_n(w + order - j)  where n is order & w = u - [u]; 
++!
++! added for PGM
++!              
++!*******************************************************************************
++
++subroutine fill_bspline_3(w, order, array, darray, d2array, d3array)
++
++  implicit none
++
++  integer               order
++  double precision      w
++  double precision      array(order)
++  double precision      darray(order)
++  double precision      d2array(order)
++  double precision      d3array(order)
++
++  double precision      div
++  integer               k
++
++  if (order .eq. 5) then
++
++! Init order 2:
++
++    array(2) = w
++    array(1) = 1.d0 - w
++
++! In full:
++!   order three deriv
++!      darray(1) = -array(1)
++!      darray(2) = array(1) - array(2)
++!      darray(3) = array(2)
++!   deriv of deriv
++!      d2array(1) = -darray(1)
++!      d2array(2) = darray(1) - darray(2)
++!      d2array(3) = darray(2) - darray(3)
++!      d2array(4) = darray(3)
++!   deriv 3rd
++!    d3array(1) = -d2array(1)  = -array(1)
++!    d3array(2) = d2array(1) - d2array(2) = 3.d0 * array(1) - array(2)
++!    d3array(3) = d2array(2) - d2array(3) = 3.d0 * array(2) - 3.d0 * array(1)
++!    d3array(4) = d2array(3) - d2array(4) = array(1) - 3.d0 * array(2)
++!    d3array(5) = d2arrau(4) = array(2)
++! In short:
++
++!    d2array(1) = array(1)
++!    d2array(2) = array(2) - 2.d0 * array(1)
++!    d2array(3) = array(1) - 2.d0 * array(2)
++!    d2array(4) = array(2)
++
++    d3array(1) = -array(1)
++    d3array(2) = 3.d0 * array(1) - array(2)
++    d3array(3) = 3.d0 * array(2) - 3.d0 * array(1)
++    d3array(4) = array(1) - 3.d0 * array(2)
++    d3array(5) = array(2)
++
++! One pass to order 3:
++
++    array(3) = 0.5d0 * w * array(2)
++    array(2) = 0.5d0 * ((w + 1.d0) * array(1) + (2.d0 - w) * array(2))
++    array(1) = 0.5d0 * (1.d0 - w) * array(1)
++
++! 1st deriv
++!    darray(1) = - array(1)
++!    darray(2) = array(1) - array(2)
++!    darray(3) = array(2) - array(3)
++!    darray(4) = array(3)
++! 2nd deriv
++!    d2array(1) = -darray(1)
++!    d2array(2) = darray(1) - darray(2)
++!    d2array(3) = darray(2) - darray(3)
++!    d2array(4) = darray(3) - darray(4)
++!    d2array(5) = darray(4)
++
++! in short:
++
++     d2array(1) = array(1)
++     d2array(2) = array(2) - 2.d0 * array(1)
++     d2array(3) = array(1) - 2.d0 * array(2) + array(3)
++     d2array(4) = array(2) - 2.d0 * array(3)
++     d2array(5) = array(3)
++
++! One pass to order 4:
++
++    div = 1.d0/3.d0
++    array(4) = div * w * array(3)
++    array(3) = div * ((w + 1.d0) * array(2) + (3.d0 - w) * array(3))
++    array(2) = div * ((w + 2.d0) * array(1) + (2.d0 - w) * array(2))
++    array(1) = div * (1.d0 - w) * array(1)
++
++! Order four deriv:
++
++    darray(1) = - array(1)
++    darray(2) = array(1) - array(2)
++    darray(3) = array(2) - array(3)
++    darray(4) = array(3) - array(4)
++    darray(5) = array(4)
++
++! One pass to order 5:
++
++    div = 0.25d0
++    array(5) = div * w * array(4)
++    array(4) = div * ((w + 1.0d0) * array(3) + (4.0d0 - w) * array(4))
++    array(3) = div * ((w + 2.0d0) * array(2) + (3.0d0 - w) * array(3))
++    array(2) = div * ((w + 3.0d0) * array(1) + (2.0d0 - w) * array(2))
++    array(1) = div * (1.0d0 - w) * array(1)
++
++    return
++
++  else
++
++! Init order 2:
++
++    array(2) = w
++    array(1) = 1.d0 - w
++
++! One pass to order 3:
++
++    array(3) = 0.5d0 * w * array(2)
++    array(2) = 0.5d0 * ((w + 1.d0) * array(1) + (2.d0 - w) * array(2))
++    array(1) = 0.5d0 * (1.d0 - w) * array(1)
++
++! Compute standard b-spline recursion up to order-3:
++
++    do k = 3, order - 3
++      call one_pass_bspline(array, w, k)
++    end do
++
++! 3rd deriv
++    call diff_bspline(array, darray, order-2)
++    call diff_bspline(darray, d2array, order-1)
++    call diff_bspline(d2array, d3array, order)
++
++    call one_pass_bspline(array, w, order-2)
++
++! Perform standard b-spline differentiation:
++
++    call diff_bspline(array, darray, order - 1) 
++! Deriv of deriv:
++
++    call diff_bspline(darray, d2array, order)
++
++! Perform standard b-spline differentiation:
++
++    call one_pass_bspline(array, w, order - 1)
++    call diff_bspline(array, darray, order)
++
++! One more recursion:
++
++    call one_pass_bspline(array, w, order)
++
++    return
++
++  end if
++
++end subroutine fill_bspline_3
++
++!*******************************************************************************
++!
++! Subroutine:  fill_bspline_3_3d
++!
++! Description: calculate B-spline upto 3rd derivatives
++!
++! Use standard B-spline recursions: see doc file.
++! w is fraction between 0 and 1; 
++! order is the order of interpolation;
++! array is the array of shifted bsplines;
++! darray is array of derivs;
++! d2array is array of 2nd derivs;
++! d3array is array of 3rd derivs;
++! Using notation from Essmann et al; w = u-[u] and
++! array(j) = M_n(w + order - j)  where n is order & w = u - [u]; 
++!
++! added for PGM
++!              
++!*******************************************************************************
++
++subroutine fill_bspline_3_3d(w, order, array, darray, d2array, d3array)
++
++  implicit none
++
++  integer               order
++  double precision      w(3)
++  double precision      array(order,3)
++  double precision      darray(order,3)
++  double precision      d2array(order,3)
++  double precision      d3array(order,3)
++
++  double precision      div
++  integer               k
++  integer               i
++
++  if (order .eq. 5) then
++
++   do i = 1, 3
++! Init order 2:
++
++    array(2,i) = w(i)
++    array(1,i) = 1.d0 - w(i)
++
++! In full:
++!   order three deriv
++!      darray(1) = -array(1)
++!      darray(2) = array(1) - array(2)
++!      darray(3) = array(2)
++!   deriv of deriv
++!      d2array(1) = -darray(1)
++!      d2array(2) = darray(1) - darray(2)
++!      d2array(3) = darray(2) - darray(3)
++!      d2array(4) = darray(3)
++!   deriv 3rd
++!    d3array(1) = -d2array(1)  = -array(1)
++!    d3array(2) = d2array(1) - d2array(2) = 3.d0 * array(1) - array(2)
++!    d3array(3) = d2array(2) - d2array(3) = 3.d0 * array(2) - 3.d0 * array(1)
++!    d3array(4) = d2array(3) - d2array(4) = array(1) - 3.d0 * array(2)
++!    d3array(5) = d2arrau(4) = array(2)
++! In short:
++
++!    d2array(1) = array(1)
++!    d2array(2) = array(2) - 2.d0 * array(1)
++!    d2array(3) = array(1) - 2.d0 * array(2)
++!    d2array(4) = array(2)
++
++    d3array(1,i) = -array(1,i)
++    d3array(2,i) = 3.d0 * array(1,i) - array(2,i)
++    d3array(3,i) = 3.d0 * (array(2,i) - array(1,i))
++    d3array(4,i) = array(1,i) - 3.d0 * array(2,i)
++    d3array(5,i) = array(2,i)
++
++! One pass to order 3:
++
++    array(3,i) = 0.5d0 * w(i) * array(2,i)
++    array(2,i) = 0.5d0 * ((w(i) + 1.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = 0.5d0 * (1.d0 - w(i)) * array(1,i)
++
++! 1st deriv
++!    darray(1) = - array(1)
++!    darray(2) = array(1) - array(2)
++!    darray(3) = array(2) - array(3)
++!    darray(4) = array(3)
++! 2nd deriv
++!    d2array(1) = -darray(1)
++!    d2array(2) = darray(1) - darray(2)
++!    d2array(3) = darray(2) - darray(3)
++!    d2array(4) = darray(3) - darray(4)
++!    d2array(5) = darray(4)
++
++! in short:
++
++     d2array(1,i) = array(1,i)
++     d2array(2,i) = array(2,i) - 2.d0 * array(1,i)
++     d2array(3,i) = array(1,i) - 2.d0 * array(2,i) + array(3,i)
++     d2array(4,i) = array(2,i) - 2.d0 * array(3,i)
++     d2array(5,i) = array(3,i)
++
++! One pass to order 4:
++
++    div = 1.d0/3.d0
++    array(4,i) = div * w(i) * array(3,i)
++    array(3,i) = div * ((w(i) + 1.d0) * array(2,i) + (3.d0 - w(i)) * array(3,i))
++    array(2,i) = div * ((w(i) + 2.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = div * (1.d0 - w(i)) * array(1,i)
++
++! Order four deriv:
++
++    darray(1,i) = - array(1,i)
++    darray(2,i) = array(1,i) - array(2,i)
++    darray(3,i) = array(2,i) - array(3,i)
++    darray(4,i) = array(3,i) - array(4,i)
++    darray(5,i) = array(4,i)
++
++    div = 0.25d0
++
++    array(5,i) = div * w(i) * array(4,i)
++    array(4,i) = div * ((w(i) + 1.0d0) * array(3,i) + (4.0d0 - w(i)) * array(4,i))
++    array(3,i) = div * ((w(i) + 2.0d0) * array(2,i) + (3.0d0 - w(i)) * array(3,i))
++    array(2,i) = div * ((w(i) + 3.0d0) * array(1,i) + (2.0d0 - w(i)) * array(2,i))
++    array(1,i) = div * (1.0d0 - w(i)) * array(1,i)
++
++    end do
++
++    return
++
++  else
++
++    do i = 1, 3
++! Init order 2:
++
++    array(2,i) = w(i)
++    array(1,i) = 1.d0 - w(i)
++
++! One pass to order 3:
++
++    array(3,i) = 0.5d0 * w(i) * array(2,i)
++    array(2,i) = 0.5d0 * ((w(i) + 1.d0) * array(1,i) + (2.d0 - w(i)) * array(2,i))
++    array(1,i) = 0.5d0 * (1.d0 - w(i)) * array(1,i)
++
++! Compute standard b-spline recursion up to order-3:
++
++    do k = 4, order - 3
++      call one_pass_bspline(array(1,i), w(i), k)
++    end do
++
++! 3rd deriv
++
++    call diff_bspline(array(1,i), darray(1,i), order-2)
++    call diff_bspline(darray(1,i), d2array(1,i), order-1)
++    call diff_bspline(d2array(1,i), d3array(1,i), order)
++
++    call one_pass_bspline(array(1,i), w(i), order-2)
++
++! Perform standard b-spline differentiation:
++
++    call diff_bspline(array(1,i), darray(1,i), order - 1) 
++! Deriv of deriv:
++
++    call diff_bspline(darray(1,i), d2array(1,i), order)
++
++! Perform standard b-spline differentiation:
++
++    call one_pass_bspline(array(1,i), w(i), order - 1)
++    call diff_bspline(array(1,i), darray(1,i), order)
++
++! One more recursion:
++
++    call one_pass_bspline(array(1,i), w(i), order)
++
++    end do
++
++    return
++
++  end if
++
++end subroutine fill_bspline_3_3d
++#endif  /* PGM */
++
+ !*******************************************************************************
+ !
+ ! Subroutine:  diff_bspline
+diff --git a/src/pmemd/src/cit.F90 b/src/pmemd/src/cit.F90
+index eb91995..0ea6be0 100644
+--- a/src/pmemd/src/cit.F90
++++ b/src/pmemd/src/cit.F90
+@@ -158,6 +158,24 @@ subroutine set_cit_tbl_dims(pbc_box, list_cutoff, cut_factor)
+   cit_tbl_z_dim = floor(pbc_box(3) / &
+                   (cut_factor(3) * list_cutoff * 0.5d0 + rnd_fudge))
+ #endif
++
++#ifdef PGM  /* a temporary "fix" to the missing nonbonded pair problem. YD */
++! The problem occurs for a box of 512 TIP3P water molecules in truncated octahedral box of 26.9668445**3.
++! With 9+1A cutoff, the "standard" 5x5x5 cit_tbl dims produce 7 pairs fewer than the full pairwise method.
++!  not sure the root cause of this problem. Updating bkt_size() did not help.
++!  bkt_size(1) = pbc_box(1)/cit_tbl_x_dim
++!  bkt_size(2) = pbc_box(2)/cit_tbl_y_dim
++!  bkt_size(3) = pbc_box(3)/cit_tbl_z_dim
++
++if (cit_tbl_x_dim .gt. 1) cit_tbl_x_dim = cit_tbl_x_dim - 1
++if (cit_tbl_y_dim .gt. 1) cit_tbl_y_dim = cit_tbl_y_dim - 1
++if (cit_tbl_z_dim .gt. 1) cit_tbl_z_dim = cit_tbl_z_dim - 1
++! update bkt_size() to be consistent with cit_tbl dims.
++  bkt_size(1) = cut_factor(1)*pbc_box(1)/cit_tbl_x_dim
++  bkt_size(2) = cut_factor(2)*pbc_box(2)/cit_tbl_y_dim
++  bkt_size(3) = cut_factor(3)*pbc_box(3)/cit_tbl_z_dim
++#endif
++
+   return
+ 
+ end subroutine set_cit_tbl_dims
+diff --git a/src/pmemd/src/constants.F90 b/src/pmemd/src/constants.F90
+index 4ff3b23..12fb9df 100644
+--- a/src/pmemd/src/constants.F90
++++ b/src/pmemd/src/constants.F90
+@@ -125,6 +125,7 @@ module constants_module
+   _REAL_, parameter :: FARADAY = 23.06054801 ! (kcal/mol)/V
+   _REAL_, parameter :: AMBER_ELECTROSTATIC = 18.2223d0
+   _REAL_, parameter :: AMBER_ELECTROSTATIC2 = AMBER_ELECTROSTATIC * AMBER_ELECTROSTATIC
++  _REAL_, parameter :: coulomb_const_kcal_per_mole = 332.05382d0  ! used in pGM
+   !Ratio by which to scale amber charges to get electron charges - amberchg * oneqscale = electron charges
+   ! = 1.0 / 18.2223d0
+   _REAL_, parameter :: INV_AMBER_ELECTROSTATIC = 1.0d0/AMBER_ELECTROSTATIC
+diff --git a/src/pmemd/src/cuda/CMakeLists.txt b/src/pmemd/src/cuda/CMakeLists.txt
+index 2699e24..dcbad03 100644
+--- a/src/pmemd/src/cuda/CMakeLists.txt
++++ b/src/pmemd/src/cuda/CMakeLists.txt
+@@ -98,3 +98,6 @@ foreach(PRECISION ${PMEMD_CUDA_PRECISIONS})
+ 	endif()
+ 
+ endforeach()
++
++# pGM (external patch)
++include(${CMAKE_CURRENT_SOURCE_DIR}/pgm_cuda.cmake)
+diff --git a/src/pmemd/src/cuda/base_gpuContext.h b/src/pmemd/src/cuda/base_gpuContext.h
+index 9b7c51d..b07ad17 100644
+--- a/src/pmemd/src/cuda/base_gpuContext.h
++++ b/src/pmemd/src/cuda/base_gpuContext.h
+@@ -778,5 +778,139 @@ public:
+   FILE* pPPEnergy;          // Pointer to energy output file
+   FILE* pPPVelocity;        // Pointer to velocity output file
+ #endif
++#ifdef PGM
++  // PGM flags and counts
++  int ipgm;
++  int pgmNumCovalent;
++
++  // Per-atom data (uploaded once from prmtop)
++  GpuBuffer<double>*       pbPGMPermChg;          // permanent charges [stride]
++  GpuBuffer<double>*       pbPGMRGauss;           // Gaussian radii [stride]
++  GpuBuffer<double>*       pbPGMPolarizability;    // polarizability [stride]
++  GpuBuffer<double>*       pbPGMPrecondInv;        // Jacobi precond M^{-1} [stride]
++
++  // Covalent bond CSR (uploaded once from prmtop)
++  GpuBuffer<int>*          pbPGMCovalentPtr;       // CSR row pointers [atoms+1]
++  GpuBuffer<int>*          pbPGMCovalentAtm;       // bonded atom indices [ncovalent]
++  GpuBuffer<double>*       pbPGMCovalentDip;       // bond dipole magnitudes [ncovalent]
++
++  // Permanent dipoles (global frame, computed on GPU each step)
++  GpuBuffer<double>*       pbPermDipX;
++  GpuBuffer<double>*       pbPermDipY;
++  GpuBuffer<double>*       pbPermDipZ;
++  GpuBuffer<PMEFloat2>*    pbPDipXYSP;
++  GpuBuffer<PMEFloat>*     pbPDipZSP;
++
++  // Fractional dipoles (for reciprocal grid fill)
++  GpuBuffer<PMEFloat>*     pbPGMFracDipX;
++  GpuBuffer<PMEFloat>*     pbPGMFracDipY;
++  GpuBuffer<PMEFloat>*     pbPGMFracDipZ;
++
++  // Induced dipoles (global frame, from SCF)
++  GpuBuffer<double>*       pbIndDipX;
++  GpuBuffer<double>*       pbIndDipY;
++  GpuBuffer<double>*       pbIndDipZ;
++  GpuBuffer<PMEFloat2>*    pbIDipXYSP;
++  GpuBuffer<PMEFloat>*     pbIDipZSP;
++
++  // Field accumulators
++  GpuBuffer<PMEAccumulator>* pbPGMFieldXAccumulator;
++  GpuBuffer<PMEAccumulator>* pbPGMFieldYAccumulator;
++  GpuBuffer<PMEAccumulator>* pbPGMFieldZAccumulator;
++
++  // Potential accumulator (phi_000, for energy)
++  GpuBuffer<PMEAccumulator>* pbPGMPotentialAccumulator;
++
++  // Total dipoles (perm + induced, global frame)
++  GpuBuffer<double>*         pbTotDipX;
++  GpuBuffer<double>*         pbTotDipY;
++  GpuBuffer<double>*         pbTotDipZ;
++  GpuBuffer<PMEFloat2>*      pbTDipXYSP;
++  GpuBuffer<PMEFloat>*       pbTDipZSP;
++
++  // Fractional total dipoles (for reciprocal grid fill in force mode)
++  GpuBuffer<PMEFloat>*       pbPGMFracTotDipX;
++  GpuBuffer<PMEFloat>*       pbPGMFracTotDipY;
++  GpuBuffer<PMEFloat>*       pbPGMFracTotDipZ;
++
++  // CG solver vectors
++  GpuBuffer<double>*         pbPGMCGx;
++  GpuBuffer<double>*         pbPGMCGr;
++  GpuBuffer<double>*         pbPGMCGp;
++  GpuBuffer<double>*         pbPGMCGz;
++  GpuBuffer<double>*         pbPGMCGb;
++  GpuBuffer<double>*         pbPGMCGScalars;
++
++  // PCG inner solver vectors (for local preconditioner)
++  GpuBuffer<double>*         pbPGMPCGzpc;    // preconditioned residual [3*stride]
++  GpuBuffer<double>*         pbPGMPCGru;     // inner CG residual [3*stride]
++  GpuBuffer<double>*         pbPGMPCGpu;     // inner CG search direction [3*stride]
++
++  // Saved charges/dipoles for SCF (device-side save/restore)
++  GpuBuffer<double>*         pbPGMSavedPermChg;
++  GpuBuffer<PMEFloat>*       pbPGMSavedAtomChgSP;
++  GpuBuffer<double>*         pbPGMSavedPermDipX;
++  GpuBuffer<double>*         pbPGMSavedPermDipY;
++  GpuBuffer<double>*         pbPGMSavedPermDipZ;
++
++  // Partial reduction buffer for CG
++  GpuBuffer<double>*         pbPGMCGPartials;
++
++  // T2 tensor cache (dipole-dipole coupling tensor, 6 per pair)
++  GpuBuffer<PMEFloat>* pbPGMT2Cache;        // single alloc [6 * total_pair_slots]
++  GpuBuffer<unsigned int>* pbPGMT2CacheH;   // half2 cache [total_pair_slots]
++  int                  pgmBFactorMaxPairsH;
++  GpuBuffer<int>*      pbPGMBFactorOffset;  // [max_nl_entries+1]
++  int                  pgmBFactorMaxPairs;  // current T2 allocation size (per component)
++  int                  pgmBFactorMaxEntries; // current offset allocation size
++
++  // Short-range preconditioner CSR cache (per-atom, Phase 2)
++  GpuBuffer<int>*      pbPGMShortPairOffset;  // CSR row pointers [atoms+1]
++  GpuBuffer<int>*      pbPGMShortPairAtom;    // partner atom indices [totalShortPairs]
++  GpuBuffer<PMEFloat>* pbPGMShortPairCache;   // single alloc [5 * totalShortPairs]
++  GpuBuffer<int>*      pbPGMShortPairCount;   // temporary per-atom counts [stride]
++  int                  pgmShortPairMaxPairs;  // current allocation size
++  int                  pgmShortPairMaxAtoms;  // current offset allocation size
++
++  // Host copies of PGM prmtop data (original atom order, stored once during init)
++  double* pgm_host_perm_chg;        // [natom] permanent charges
++  double* pgm_host_r_gauss;         // [natom] Gaussian radii
++  double* pgm_host_pol;             // [natom] polarizabilities
++
++  // GPU copies of original-order PGM data (for GPU NL remap, uploaded once)
++  GpuBuffer<double>* pbPGMOrigChg;
++  GpuBuffer<double>* pbPGMOrigRGauss;
++  GpuBuffer<double>* pbPGMOrigPol;
++  double  pgm_scf_tol;              // SCF convergence tolerance
++  int     pgm_scf_maxiter;          // max CG iterations
++  double  pgm_diprms;               // last SCF convergence metric (output)
++  double  pgm_dipiter;              // last SCF iteration count (output)
++  int     pgm_scf_solv_opt;        // solver option (1=CG, 2=PCG, 3=PKCG)
++  int     pgm_scf_local_niter;     // inner CG iterations for preconditioner
++  double  pgm_scf_local_cut;       // short-range cutoff for preconditioner
++  double  pgm_scf_sor_coeff;       // SOR coefficient for peek step
++
++  // Dipole history for multi-step extrapolation (initial guess predictor)
++  // K=6 LS quadratic has noise amplification 3.6 vs 5.0 for K=3, giving
++  // better initial guesses and typically 1 fewer CG iteration per step.
++  GpuBuffer<double>* pbPGMDipHistory[8]; // [6][3*stride] converged dipoles from last 6 steps
++  double* pgm_dip_hist_dev[8];           // device pointers (rotated for FIFO)
++  int     pgm_dip_history_count;         // number of valid history entries (0-6)
++
++  // Saved image lookup for remapping dipole history across NL rebuilds
++  GpuBuffer<unsigned int>* pbPGMOldImageLookup;
++
++  // CUDA graphs for PGM pipeline (eliminates kernel launch overhead)
++  cudaStream_t     pgmStream;            // 0 normally, captureStream during graph capture
++  cudaStream_t     pgmCaptureStream;     // dedicated stream for graph capture
++  cudaGraph_t      pgmCGGraph;           // captured CG iteration graph
++  cudaGraphExec_t  pgmCGGraphExec;       // instantiated executable graph
++  cudaGraph_t      pgmPermGraph;         // captured permanent field graph
++  cudaGraphExec_t  pgmPermGraphExec;     // instantiated perm field graph
++  cudaGraph_t      pgmForceGraph;        // captured force pipeline graph
++  cudaGraphExec_t  pgmForceGraphExec;    // instantiated force pipeline graph
++  bool             pgmGraphsValid;       // true when all graphs are captured and ready
++
++#endif
+ };
+ #endif //_BASE_GPU_CONTEXT
+diff --git a/src/pmemd/src/cuda/base_simulationConst.h b/src/pmemd/src/cuda/base_simulationConst.h
+index a7c74e0..a8170b2 100644
+--- a/src/pmemd/src/cuda/base_simulationConst.h
++++ b/src/pmemd/src/cuda/base_simulationConst.h
+@@ -1361,6 +1361,126 @@ public:
+   int* pImageGrplist2;                        // Pointer to image grplist
+   int* pImageIndexPHMD;                       //Pointer to image indices
+   int* pImageIndexPHMD2;                      //Pointer to image indices
++#ifdef PGM
++  // PGM flags and counts
++  int ipgm;
++  int pgmNumCovalent;              // total number of covalent bonds
++
++  // Scaling: VDW forces are in kcal/mol/A, but PGM electrostatic forces are in raw
++  // e^2/A^2 units (Fortran multiplies ALL forces by coulomb_const after download).
++  // To keep VDW correct, pre-divide VDW forces by coulomb_const on GPU.
++  PMEFloat invCoulombConst;          // 1.0 / 332.0522173...
++
++  // Per-atom data (uploaded once from prmtop)
++  double* pPGMPermChg;             // permanent monopole charges [atoms]
++  double* pPGMRGauss;              // Gaussian radii [atoms]
++  double* pPGMPolarizability;      // atomic polarizability [atoms]
++  double* pPGMPrecondInv;          // Jacobi preconditioner M^{-1} = 1/(1+alpha*selfPrefac) [atoms]
++
++  // Original-order per-atom data (for GPU NL remap: scatter orig→image order)
++  double* pPGMOrigChg;             // original-order charges [atoms]
++  double* pPGMOrigRGauss;          // original-order Gaussian radii [atoms]
++  double* pPGMOrigPol;             // original-order polarizabilities [atoms]
++
++  // Covalent bond CSR (uploaded once from prmtop, for local-to-global)
++  int* pPGMCovalentPtr;            // CSR row pointers [atoms+1]
++  int* pPGMCovalentAtm;            // CSR bonded atom indices [ncovalent]
++  double* pPGMCovalentDip;         // bond dipole magnitudes [ncovalent]
++
++  // Permanent dipoles (global frame, computed on GPU each step)
++  double* pPermDipX;               // X perm dipole (global frame)
++  double* pPermDipY;               // Y perm dipole (global frame)
++  double* pPermDipZ;               // Z perm dipole (global frame)
++  PMEFloat2* pPDipXYSP;            // Single Precision X and Y perm dipoles
++  PMEFloat* pPDipZSP;              // Single Precision Z perm dipoles
++
++  // Fractional dipoles (for reciprocal grid fill)
++  PMEFloat* pPGMFracDipX;          // fractional-frame perm dipole X [atoms]
++  PMEFloat* pPGMFracDipY;          // fractional-frame perm dipole Y [atoms]
++  PMEFloat* pPGMFracDipZ;          // fractional-frame perm dipole Z [atoms]
++
++  // Induced dipoles (global frame, from SCF)
++  double* pIndDipX;                // X induced dipole (global frame)
++  double* pIndDipY;                // Y induced dipole (global frame)
++  double* pIndDipZ;                // Z induced dipole (global frame)
++  PMEFloat2* pIDipXYSP;            // Single Precision X and Y induced dipoles
++  PMEFloat* pIDipZSP;              // Single Precision Z induced dipoles
++
++  // Field accumulators (reciprocal + direct + self → total gradphi on each atom)
++  PMEAccumulator* pPGMFieldXAccumulator;  // X gradphi accumulator
++  PMEAccumulator* pPGMFieldYAccumulator;  // Y gradphi accumulator
++  PMEAccumulator* pPGMFieldZAccumulator;  // Z gradphi accumulator
++
++  // Potential accumulator (phi_000, for energy computation)
++  PMEAccumulator* pPGMPotentialAccumulator;  // electrostatic potential accumulator
++
++  // Total dipoles (perm + induced, global frame)
++  double* pTotDipX;
++  double* pTotDipY;
++  double* pTotDipZ;
++  PMEFloat2* pTDipXYSP;                  // SP packed total dipoles (direct kernel)
++  PMEFloat*  pTDipZSP;
++
++  // Fractional total dipoles (for reciprocal grid fill in force mode)
++  PMEFloat* pPGMFracTotDipX;
++  PMEFloat* pPGMFracTotDipY;
++  PMEFloat* pPGMFracTotDipZ;
++
++  // CG solver vectors (interleaved xyz: [x0,y0,z0, x1,y1,z1, ...], size 3*stride)
++  double* pPGMCGx;              // solution (induced dipoles)
++  double* pPGMCGr;              // residual
++  double* pPGMCGp;              // search direction
++  double* pPGMCGz;              // A*p result
++  double* pPGMCGb;              // RHS b = -alpha*E_perm
++  double* pPGMCGScalars;        // small buffer for reductions [rdotr, pdotz, rmax, bnorm, ...]
++
++  // Saved charges for SCF (device-to-device save/restore, no CPU copies)
++  double*   pPGMSavedPermChg;   // saved pPGMPermChg during SCF
++  PMEFloat* pPGMSavedAtomChgSP; // saved pAtomChargeSP during SCF
++
++  // Saved permanent dipoles for SCF
++  double* pPGMSavedPermDipX;
++  double* pPGMSavedPermDipY;
++  double* pPGMSavedPermDipZ;
++
++  // Partial reduction buffer for CG dot products (nblocks doubles)
++  double* pPGMCGPartials;
++  int     pgmCGnblocks;         // number of reduction blocks
++
++  // Preconditioned CG (PCG) inner solver vectors
++  double* pPGMPCGzpc;             // preconditioned residual / inner solution [3*stride]
++  double* pPGMPCGru;              // inner CG residual [3*stride]
++  double* pPGMPCGpu;              // inner CG search direction [3*stride]
++  PMEFloat scfLocalCut2;          // scf_local_cut^2 (for short-range distance check)
++  int      pgmIGVDW;          // pGM VDW model: 0 LJ 12-6, 1 Gaussian VDW
++  int      pgmGVDWRepForm;    // GVDW repulsion: 0 Gaussian, 1 Slater
++  PMEFloat pgmBRepScale;      // GVDW repulsion range factor b
++
++  // BD cache (B-displacement decomposition, 5 elements per pair)
++  // Stores {-B1, -B2, dx, dy, dz} per pair.  Field = nB1*mu + nB2*(r·mu)*r.
++  // 17% less bandwidth than T2 tensor (6 elts), same physics.
++  PMEFloat* pPGMBD_nB1;             // [total_pair_slots]  -B1 damping factor
++  PMEFloat* pPGMBD_nB2;             // [total_pair_slots]  -B2 damping factor
++  PMEFloat* pPGMBD_dx;              // [total_pair_slots]  displacement x (xi-xj)
++  PMEFloat* pPGMBD_dy;              // [total_pair_slots]  displacement y
++  PMEFloat* pPGMBD_dz;              // [total_pair_slots]  displacement z
++  unsigned int* pPGMBD_h2;          // [total_pair_slots]  half2 {-B1,-B2}*4096 (SPFP inexact CG cache)
++  int* pPGMBFactorOffset;         // prefix-sum pair offset per NL entry [nNLEntries+1]
++  int  pgmBFactorTotalPairs;      // total pair slots allocated
++
++  // Short-range preconditioner CSR cache (per-atom, for PCG inner CG SpMV)
++  // Each undirected pair stored twice (once per atom) for gather-only SpMV.
++  int*      pPGMShortPairOffset;    // CSR row pointers [atoms+1]
++  int*      pPGMShortPairAtom;      // partner atom index [totalShortPairs]
++  PMEFloat* pPGMShortPairNB1;      // -B1 coupling [totalShortPairs]
++  PMEFloat* pPGMShortPairNB2;      // -B2 coupling [totalShortPairs]
++  PMEFloat* pPGMShortPairDX;       // displacement x [totalShortPairs]
++  PMEFloat* pPGMShortPairDY;       // displacement y [totalShortPairs]
++  PMEFloat* pPGMShortPairDZ;       // displacement z [totalShortPairs]
++  int*      pPGMShortPairCount;     // temporary per-atom counts [atoms] (build phase)
++  int       pgmShortPairTotalPairs; // total directed pairs in cache
++
++#endif
+ };
+ 
+ #endif // _BASE_CUDA_SIMULATION
+diff --git a/src/pmemd/src/cuda/cuda_info.F90 b/src/pmemd/src/cuda/cuda_info.F90
+index 59a4d78..e6904f5 100644
+--- a/src/pmemd/src/cuda/cuda_info.F90
++++ b/src/pmemd/src/cuda/cuda_info.F90
+@@ -40,6 +40,21 @@ subroutine gpu_write_cuda_info(iout_unit, mytaskid, numtasks, using_pme_potentia
+   integer :: env_var_status
+ 
+   write(iout_unit,'(a)') '|--------------------- INFORMATION ----------------------'
++#ifdef PGM
++  write(iout_unit,'(a)') '| GPU (CUDA) Version of PMEMD.PGM in use: NVIDIA GPU IN USE.'
++  write(iout_unit,'(a)') '|                    Amber24 PMEMD with the pGM patch'
++  write(iout_unit,'(a)') '| '
++  write(iout_unit,'(a)') '| Implementation by:'
++  write(iout_unit,'(a)') '|                    Ross C. Walker     (SDSC)'
++  write(iout_unit,'(a)') '|                    Scott Le Grand     (nVIDIA)'
++  write(iout_unit,'(a)') '| '
++  write(iout_unit,'(a)') '| Version 18 performance extensions by:'
++  write(iout_unit,'(a)') '|                    David Cerutti     (Rutgers)'
++  write(iout_unit,'(a)') '| '
++  write(iout_unit,'(a)') '| pGM GPU implementation by:'
++  write(iout_unit,'(a)') '|                    Zhen Huang         (UC Irvine)'
++  write(iout_unit,'(a)') '| '
++#else
+   write(iout_unit,'(a)') '| GPU (CUDA) Version of PMEMD in use: NVIDIA GPU IN USE.'
+   write(iout_unit,'(a)') '|                    Version 18.0.0'
+   write(iout_unit,'(a)') '| '
+@@ -52,6 +67,7 @@ subroutine gpu_write_cuda_info(iout_unit, mytaskid, numtasks, using_pme_potentia
+   write(iout_unit,'(a)') '| Version 18 performance extensions by:'
+   write(iout_unit,'(a)') '|                    David Cerutti     (Rutgers)'
+   write(iout_unit,'(a)') '| '
++#endif
+   write(iout_unit,'(a)') '| Precision model in use:'
+ #ifdef use_SPFP
+   write(iout_unit,'(a)') '|      [SPFP] - Single Precision Forces, 64-bit Fixed Point'
+diff --git a/src/pmemd/src/cuda/gpu.cpp b/src/pmemd/src/cuda/gpu.cpp
+index c507bc2..9cf0bca 100644
+--- a/src/pmemd/src/cuda/gpu.cpp
++++ b/src/pmemd/src/cuda/gpu.cpp
+@@ -27,7 +27,11 @@
+ #include "gti_cuda.cuh"
+ #endif
+ namespace gppImpl {
++#ifdef PGM
++  gpuContext gpu = NULL;          // shared with pgm_gpu.cpp
++#else
+   static gpuContext gpu = NULL;
++#endif
+ }
+ 
+ using namespace std;
+@@ -744,6 +748,9 @@ extern "C" void gpu_setup_system_(int *atoms, int *imin, double* tol, int* ntf,
+                                   int *ips, int *ntp, int *barostat, int *ntt, int *gbsa,
+                                   int *vrand, int *icnstph, int* icnste, int *hybridgb,
+ 				                  int *ti_mode, double* surften,
++#ifdef PGM
++                                  int *ipgm,
++#endif
+                                   int *ischeme, int *ithermostat, int *ntc)
+ {
+   PRINTMETHOD("gpu_setup_system");
+@@ -762,6 +769,10 @@ extern "C" void gpu_setup_system_(int *atoms, int *imin, double* tol, int* ntf,
+   gpu->sim.icnste  = *icnste;
+   gpu->sim.hybridgb = *hybridgb;
+   gpu->sim.ti_mode = *ti_mode;
++#ifdef PGM
++  gpu->ipgm = *ipgm;
++  gpu->sim.ipgm = *ipgm;
++#endif
+ 
+   // middle-schem parameters
+   gpu->ischeme = *ischeme;
+@@ -4383,6 +4394,12 @@ extern "C" void gpu_refresh_charges_(int cit_nb14[][3], double gbl_one_scee[], d
+     int i, j;
+     for (i = 0; i < gpu->sim.nb14s; i++) {
+       int parm_idx = cit_nb14[i][2] - 1;
++#ifdef PGM
++      if (gpu->ipgm >= 1) {
++        gpu->pbNb141->_pSysData[i].x = 0.0;
++      }
++      else
++#endif
+       gpu->pbNb141->_pSysData[i].x = (parm_idx>=0)? gbl_one_scee[parm_idx] * qterm[abs(cit_nb14[i][0]) - 1] *
+                                      qterm[abs(cit_nb14[i][1]) - 1] : 0.0;
+     }
+@@ -5015,6 +5032,15 @@ extern "C" void gpu_nb14_setup_(int *nb14_cnt, int cit_nb14[][3], double gbl_one
+     if (gpu->ntf < 8) {
+       for (i = 0; i < nb14s; i++) {
+         int parm_idx = cit_nb14[i][2] - 1;
++#ifdef PGM
++        if (gpu->ipgm >= 1) {
++          // pGM treats all 1-4 electrostatic pairs as normal nonbonded pairs
++          // in the PGM direct-space kernel. Zero out the separate 1-4 EEL
++          // term to avoid double-counting.
++          gpu->pbNb141->_pSysData[i].x = 0.0;
++        }
++        else
++#endif
+         if(gpu->iphmd > 0) {
+           gpu->pbNb141->_pSysData[i].x = gbl_one_scee[parm_idx];
+         }
+@@ -6608,6 +6634,25 @@ extern "C" void gpuCopyConstants()
+     SetkCalculatePMENonbondEnergySim(gpu);
+   }
+ #endif
++
++  // PGM kernel translation units have their own cSim copies that are NOT
++  // updated by the standard or GTI paths above.  Update them here so that
++  // gpu_pressure_scale_ → gpuCopyConstants() propagates cell parameter
++  // changes to PGM kernels automatically (same pattern as standard PME).
++#ifdef PGM
++  if (gpu->ntb != 0) {
++    SetkNLRemap_PGMSim(gpu);
++    SetkSelf_PGMSim(gpu);
++    SetkCalculatePMENonbondEnergy_PGMSim(gpu);
++#ifndef use_DPFP
++    SetkCalculatePMENonbondEnergy_PGMERFC(gpu->sim.ew_coeff);
++#endif
++    SetkPMEInterpolation_PGMSim(gpu);
++    SetkLocalToGlobal_PGMSim(gpu);
++    SetkSCF_PGMSim(gpu);
++    SetkChainRule_PGMSim(gpu);
++  }
++#endif
+ }
+ 
+ //---------------------------------------------------------------------------------------------
+diff --git a/src/pmemd/src/cuda/gpu.h b/src/pmemd/src/cuda/gpu.h
+index c3f9fd3..0fbbd02 100644
+--- a/src/pmemd/src/cuda/gpu.h
++++ b/src/pmemd/src/cuda/gpu.h
+@@ -18,7 +18,10 @@ extern "C" void gpu_shutdown_(void);
+ extern "C" void gpu_setup_system_(int *atoms, int *imin, double *tol, int *ntf, int *ntb,
+                                   int *ips, int *ntp, int *barostat, int *ntt, int *gbsa,
+                                   int *vrand, int *icnstph, int* icnste, int *hybridgb,
+-				                  int *ti_mode, double* surften, 
++				                  int *ti_mode, double* surften,
++#ifdef PGM
++                                  int *ipgm,
++#endif
+                                   int *ischeme, int *ithermostat, int *ntc);
+ extern "C" void gpu_setup_softcore_ti_(int ti_lst_repacked[], int ti_sc_lst[],
+                                        int ti_latm_lst_repacked[], int *ti_latm_cnt);
+@@ -327,6 +330,12 @@ extern "C" void kPMEFillChargeGridBuffer(gpuContext gpu);
+ extern "C" void kPMEReduceChargeGridBuffer(gpuContext gpu);
+ extern "C" void kPMEScalarSumRC(gpuContext gpu, PMEDouble vol);
+ extern "C" void kPMEScalarSumRCEnergy(gpuContext gpu, PMEDouble vol);
++// Stream-aware wrappers for PGM CUDA graph capture
++#ifdef GTI
++extern "C" void kPMEClearChargeGridBuffer_s(gpuContext gpu, cudaStream_t s);
++extern "C" void kPMEReduceChargeGridBuffer_s(gpuContext gpu, cudaStream_t s);
++extern "C" void kPMEScalarSumRC_s(gpuContext gpu, PMEDouble vol, cudaStream_t s);
++#endif
+ extern "C" void kPMEC2CScalarSumRC(gpuContext gpu, PMEDouble vol);
+ extern "C" void kPMEGradSum(gpuContext gpu);
+ extern "C" void kPMEForwardFFT(gpuContext gpu);
+@@ -444,6 +453,83 @@ extern "C" void kReduceForces(gpuContext gpu);
+ 
+ // Window into the main library's global gpuContext class instance
+ gpuContext GetGpuContextPtr();
++#ifdef PGM
++// PGM kernel interfaces
++extern "C" void kPGMClearFieldAccumulators(gpuContext gpu);
++extern "C" void kPGMSelfField(gpuContext gpu);
++extern "C" void kPGMClearAndSelfField(gpuContext gpu);
++extern "C" void kPGMSaveAndZeroCharges(gpuContext gpu);
++extern "C" void kPGMRestoreAndCopyTotalDip(gpuContext gpu);
++extern "C" void kPGMSelfEnergy(gpuContext gpu);
++extern "C" void kCalculatePMEDirectField_PGM(gpuContext gpu);
++extern "C" void kCalculatePMEDirectFieldCacheWrite_PGM(gpuContext gpu);
++extern "C" void kCalculatePMEDirectFieldCacheRead_PGM(gpuContext gpu);
++extern "C" void kCalculatePMEDirectForce_PGM(gpuContext gpu);
++#ifdef PGM_DEBUG_PAIR_COUNTS
++extern "C" void kPGMResetPairCounters();
++extern "C" void kPGMReadPairCounters(unsigned long long int* home,
++                                     unsigned long long int* neigh,
++                                     unsigned long long int* nlEntries);
++#endif
++extern "C" void kStdResetPairCounters();
++extern "C" void kStdReadPairCounters(unsigned long long int* home,
++                                     unsigned long long int* neigh,
++                                     unsigned long long int* nlEntries);
++extern "C" void kPMEFillChargeGridBuffer_PGM(gpuContext gpu);
++extern "C" void kPMEGradSum_PGM(gpuContext gpu);
++extern "C" void kPMEGradSumForce_PGM(gpuContext gpu);
++extern "C" void kLocalToGlobal_PGM(gpuContext gpu);
++extern "C" void kPGMChainRuleForce(gpuContext gpu);
++
++// GPU-resident CG solver kernel interfaces
++extern "C" void kPGMInitSCF(gpuContext gpu);
++extern "C" void kPGMCopyDipToBuffers(gpuContext gpu, double* src_dev);
++extern "C" void kPGMComputeAp(gpuContext gpu, double* src_dev, double* dst_dev);
++extern "C" void kPGMInitResidual(gpuContext gpu);
++extern "C" void kPGMDotPZ(gpuContext gpu);
++extern "C" void kPGMCGUpdate(gpuContext gpu);
++extern "C" void kPGMCGUpdateP(gpuContext gpu);
++extern "C" void kPGMStoreInducedDipoles(gpuContext gpu);
++extern "C" void kPGMComputeResidual(gpuContext gpu);
++extern "C" void kPGMFusedCopyDipClearSelf(gpuContext gpu, double* src_dev);
++extern "C" void kPGMFusedComputeApDotPZ(gpuContext gpu, double* src_dev, double* dst_dev);
++extern "C" void kPGMExtrapolateLS(gpuContext gpu, double* dst,
++                                  double* h0, double* h1, double* h2,
++                                  double* h3, double* h4, double* h5,
++                                  int K);
++extern "C" void kPGMComputeEnergy(gpuContext gpu, double coulomb_const);
++extern "C" void kPGMScaleForces(gpuContext gpu, double coulomb_const);
++
++// PGM top-level entry points (matching standard gpu_pme_ene_/gpu_pme_force_ pattern)
++extern "C" void pgm_gpu_pme_ene_(double* ewaldcof, double* vol,
++    pme_pot_ene_rec* pEnergy, double enmr[3], double virial[3],
++    double ekcmt[3], int* nstep, double* dt,
++    double atm_crd[][3], double atm_frc[][3]);
++extern "C" void pgm_gpu_pme_force_(double* ewaldcof, double* vol,
++    double virial[3], double ekcmt[3], int* nstep, double* dt,
++    double atm_crd[][3], double atm_frc[][3]);
++extern "C" void pgm_gpu_upload_prmtop_(double* perm_chg, double* r_gauss,
++    double* pol, double* scf_tol, int* scf_maxiter, int* natom);
++extern "C" void pgm_gpu_get_scf_info_(double* diprms, double* dipiter);
++extern "C" void pgm_gpu_save_dipole_state_();
++extern "C" void pgm_gpu_restore_dipole_state_();
++
++// Sim setup functions
++void SetkSelf_PGMSim(gpuContext gpu);
++void SetkCalculatePMENonbondEnergy_PGMSim(gpuContext gpu);
++void SetkCalculatePMENonbondEnergy_PGMERFC(double ewcoeff);
++void SetkPMEInterpolation_PGMSim(gpuContext gpu);
++void SetkLocalToGlobal_PGMSim(gpuContext gpu);
++void SetkSCF_PGMSim(gpuContext gpu);
++void SetkChainRule_PGMSim(gpuContext gpu);
++
++// GPU NL remap functions
++void SetkNLRemap_PGMSim(gpuContext gpu);
++void kPGMNLRemap(gpuContext gpu);
++void kPGMComputeT2Offsets(gpuContext gpu);
++void kPGMRemapDipHistory(gpuContext gpu, double* dst, const double* src,
++                         const unsigned int* oldLookup);
++#endif
+ #endif
+ 
+ void kCalculateSGLDaverages(gpuContext gpu, PMEDouble dt);
+diff --git a/src/pmemd/src/cuda/gputypes.h b/src/pmemd/src/cuda/gputypes.h
+index 91a1141..6a3eb98 100644
+--- a/src/pmemd/src/cuda/gputypes.h
++++ b/src/pmemd/src/cuda/gputypes.h
+@@ -629,6 +629,12 @@ struct pme_pot_ene_rec {
+   double efield;
+   double nfe;
+   double phmd;
++#ifdef PGM
++  // added by YD
++  double epol;           // polarizable energy, all energy terms involving induced dipoles
++  double diprms;
++  double dipiter;
++#endif
+ };
+ 
+ struct afe_gpu_sc_ene_rec {
+diff --git a/src/pmemd/src/cuda/kPMEInterpolation.cu b/src/pmemd/src/cuda/kPMEInterpolation.cu
+index 98c81ee..6dbfcd0 100644
+--- a/src/pmemd/src/cuda/kPMEInterpolation.cu
++++ b/src/pmemd/src/cuda/kPMEInterpolation.cu
+@@ -622,6 +622,49 @@ extern "C" void kPMEScalarSumRC(gpuContext gpu, PMEDouble vol)
+   LAUNCHERROR("kPMEScalarSumRC");
+ }
+ 
++// Stream-aware wrappers for PGM CUDA graph capture
++//---------------------------------------------------------------------------------------------
++#ifdef GTI
++extern "C" void kPMEClearChargeGridBuffer_s(gpuContext gpu, cudaStream_t s)
++{
++#ifdef use_DPFP
++  cudaMemsetAsync(gpu->sim.plliXYZ_q, 0, gpu->sim.XYZStride * sizeof(long long int), s);
++#else
++  cudaMemsetAsync(gpu->sim.plliXYZ_q, 0, gpu->sim.XYZStride * sizeof(int), s);
++#endif
++  LAUNCHERROR("kPMEClearChargeGridBuffer_s");
++}
++
++extern "C" void kPMEReduceChargeGridBuffer_s(gpuContext gpu, cudaStream_t s)
++{
++  int blocks = (gpu->sim.nfft1 * gpu->sim.nfft2 * gpu->sim.nfft3 + 127) >> 7;
++  int offset = 0;
++  if (gpu->sim.pmeOrder == 4) {
++    kPMEReorderChargeGridBuffer444_kernel<<<256, TRANSPOSE_QMESH_THREADS_PER_BLOCK, 0, s>>>();
++  }
++  else {
++    while (blocks > 0) {
++      int lblocks = min(blocks, 65535);
++      kPMEReduceChargeGridBuffer666_kernel<<<lblocks, 128, 0, s>>>(offset);
++      LAUNCHERROR("kPMEReduceChargeGridBuffer_s");
++      offset += 65535;
++      blocks -= 65535;
++    }
++  }
++}
++
++extern "C" void kPMEScalarSumRC_s(gpuContext gpu, PMEDouble vol, cudaStream_t s)
++{
++  int nblocks = gpu->blocks;
++  int nthreads = gpu->generalThreadsPerBlock;
++
++  // PGM: NVE only (ntp=0), no TI (ti_mode=0) -- always the simple path
++  kPMEScalarSumRC_kernel<<<nblocks, nthreads, 0, s>>>();
++  LAUNCHERROR("kPMEScalarSumRC_s");
++}
++
++#endif  // GTI
++
+ //---------------------------------------------------------------------------------------------
+ // kPMEScalarSumRCEnergy: launch kernels to perform the "scalar sum" and compute the associated
+ //                        energy.
+diff --git a/src/pmemd/src/energy_records.F90 b/src/pmemd/src/energy_records.F90
+index 04a2eee..727bae0 100644
+--- a/src/pmemd/src/energy_records.F90
++++ b/src/pmemd/src/energy_records.F90
+@@ -77,17 +77,28 @@ module energy_records_mod
+     double precision    :: gamd_ppi  ! temp for envronment
+     double precision    :: gamd_bond_ppi ! temp for bonded
+     double precision    :: phmd ! virtual particles in continuous CpHMD
++#ifdef PGM
++    double precision    :: epol   ! polarizable energy, all energy terms that involve induced dipoles
++    double precision    :: diprms
++    double precision    :: dipiter
++#endif
+   end type pme_pot_ene_rec
+ 
++#ifdef PGM
++  integer, parameter    :: pme_pot_ene_rec_size = 30 
++#else
+   integer, parameter    :: pme_pot_ene_rec_size = 27
++#endif
+ 
+   type(pme_pot_ene_rec), parameter      :: null_pme_pot_ene_rec = &
+     pme_pot_ene_rec(0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0, &
+                     0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0, &
+                     0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,0.d0,&
++#ifdef PGM
++                    0.d0,0.d0,0.d0, &
++#endif
+                     0.d0,0.d0)
+                          
+-
+   ! Virials, with breakdown, from pme.  This is intended to be the
+   ! structure for storing virials; it currently is not exported but could be.
+ 
+@@ -103,14 +114,24 @@ module energy_records_mod
+     double precision    :: elec_14(3, 3)
+     double precision    :: ep_frame(3, 3)       ! for extra points...
+     double precision    :: eedvir               ! used in Darden's error est.
++#ifdef PGM
++    double precision    :: vdw_dir(3, 3)
++#endif
+   end type pme_virial_rec
+ 
++#ifdef PGM
++  integer, parameter    :: pme_virial_rec_size = 91
++#else
+   integer, parameter    :: pme_virial_rec_size = 82
++#endif
+ 
+   type(pme_virial_rec), parameter      :: null_pme_virial_rec = &
+     pme_virial_rec(9*0.d0, 9*0.d0, 9*0.d0, &
+                    9*0.d0, 9*0.d0, 9*0.d0, &
+                    9*0.d0, 9*0.d0, 9*0.d0, &
++#ifdef PGM
++                   9*0.d0, &
++#endif
+                    0.d0)
+ 
+ !we need to be able to write out softcore energies for afe. this seemed 
+diff --git a/src/pmemd/src/extra_pnts_nb14.F90 b/src/pmemd/src/extra_pnts_nb14.F90
+index becfc68..66d754a 100644
+--- a/src/pmemd/src/extra_pnts_nb14.F90
++++ b/src/pmemd/src/extra_pnts_nb14.F90
+@@ -383,6 +383,9 @@ subroutine nb14_setup(num_ints, num_reals, use_atm_map)
+ #ifdef CUDA
+   use mdin_ctrl_dat_mod
+   use charmm_mod, only : charmm_active
++#ifdef PGM
++  use pgm_gvdw_mod, only : pgm_gvdw_gpu_nb14_setup
++#endif
+ #ifdef GTI
+   use ti_mod
+   use reaf_mod
+@@ -582,6 +585,11 @@ subroutine nb14_setup(num_ints, num_reals, use_atm_map)
+                         atm_iac, typ_ico, gbl_cn1, gbl_cn2, gbl_cn6, gbl_cn7, gbl_cn8, C4Pairwise, gbl_cn1, gbl_cn2) ! C4PairwiseCUDA
+   end if
+ #endif 
++#ifdef PGM
++  ! pGM with Gaussian VDW: 1-4 VDW is computed by the pGM code (no-op for igvdw = 0)
++  if (ipgm .ge. 1) call pgm_gvdw_gpu_nb14_setup(cit_nb14_cnt, cit_nb14, ntypes, atm_iac, typ_ico, &
++                                                gbl_cn1, gbl_cn2)
++#endif
+ 
+ #endif
+ 
+diff --git a/src/pmemd/src/extra_pnts_nb14.i b/src/pmemd/src/extra_pnts_nb14.i
+index d742d29..01e16a0 100644
+--- a/src/pmemd/src/extra_pnts_nb14.i
++++ b/src/pmemd/src/extra_pnts_nb14.i
+@@ -8,6 +8,11 @@
+ !PHMD
+   use mdin_ctrl_dat_mod, only : iphmd, gti_add_sc
+ !PHMD
++#ifdef PGM
++  use mdin_ctrl_dat_mod, only : ipgm
++  use pol_gauss_mdin_dat_mod, only : igvdw
++  use pgm_gvdw_mod, only : pgm_gvdw_pair, gvdw_rgauss
++#endif
+   implicit none
+ 
+ ! Formal arguments:
+@@ -111,6 +116,21 @@
+     f6 = cn2(ic) * r6
+     f12 = cn1(ic) * (r6 * r6)
+     df = (g + scnb0 * (TWELVE * f12 - SIX * f6)) * r2inv
++#ifdef PGM
++    if (ipgm .ge. 1) then
++      ! pGM: 1-4 electrostatics are regular pairs in the pGM direct/reciprocal
++      ! sums, and 1-4 VDW is not scaled (scnb0 = 1 is set in prmtop_dat).
++      g = 0.d0
++      if (igvdw .eq. 1) then
++        ! Gaussian VDW: f12 carries the pair energy, f6 = 0
++        call pgm_gvdw_pair(r2, gvdw_rgauss(i) + gvdw_rgauss(j), cn1(ic), cn2(ic), f12, df)
++        f6 = 0.d0
++        df = scnb0 * df
++      else
++        df = scnb0 * (TWELVE * f12 - SIX * f6) * r2inv
++      end if
++    end if
++#endif
+ 
+     if (ti_mode .ne. 0) then
+       ti_region = 0
+diff --git a/src/pmemd/src/file_io.F90 b/src/pmemd/src/file_io.F90
+index 28ea4fa..545ceee 100644
+--- a/src/pmemd/src/file_io.F90
++++ b/src/pmemd/src/file_io.F90
+@@ -1,4 +1,7 @@
+ #include "copyright.i"
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: file_io_mod
+@@ -140,7 +143,12 @@ subroutine echoin(in,iout)
+ 
+ ! Local variables:
+ 
++#ifdef PGM
++! This should be similar to sander.
++  character(256)        :: aa
++#else
+   character(80)         :: aa
++#endif
+   character(14)         :: bgflg
+   character(14)         :: enflg
+   integer               :: i
+@@ -157,7 +165,12 @@ subroutine echoin(in,iout)
+       do 10 i = 1, 999999
+         read(in, 500, end = 20) aa
+         if (aa(1:14) .eq. enflg) inter = 0
++#ifdef PGM
++! This should be similar to sander.
++        if (inter .eq. 1) write(iout, 500) aa(1:max(79,len_trim(aa)))
++#else
+         if (inter .eq. 1) write(iout, 500) aa(1:79)
++#endif
+         if (aa(1:14) .eq. bgflg) then
+           inter = 1
+           if (intlin .eq. 0) then
+@@ -180,7 +193,12 @@ subroutine echoin(in,iout)
+       do 30 i = 1, 999999
+         read(in, 500, end = 40) aa
+         if (aa(1:14) .eq. bgflg) inter = 1
++#ifdef PGM
++! This should be similar to sander.
++        if (inter .eq. 0) write(iout, 500) aa(1:max(79,len_trim(aa)))
++#else
+         if (inter .eq. 0) write(iout, 500) aa(1:79)
++#endif
+         if (aa(1:14) .eq. enflg) inter = 0
+    30 continue
+ 
+diff --git a/src/pmemd/src/master_setup.F90 b/src/pmemd/src/master_setup.F90
+index 81d4db3..963623d 100644
+--- a/src/pmemd/src/master_setup.F90
++++ b/src/pmemd/src/master_setup.F90
+@@ -239,6 +239,14 @@ subroutine master_setup(num_ints, num_reals, new_stack_limit, terminal_flag)
+   end if
+ #endif
+ 
++#ifdef PGM
++  ! Read the pol_gauss namelist
++  if (ipgm .ge. 1) then
++    call POL_GAUSS_read_mdin(mdin, ipgm)  ! error check is moved inside
++    call write_pgm_citation(mdout)
++  end if
++#endif
++
+ #ifdef CUDA
+   !RCW: Call to set device is mostly redundant now due to'
+   !     removal of -gpu command line argument. But leave for now.
+@@ -1259,6 +1267,10 @@ subroutine printdefines()
+   write(mdout, '(a)') '| EMIL'
+ #endif
+ 
++#ifdef PGM
++  write(mdout, '(a)') '| PGM'
++#endif
++
+   write(mdout, *)
+ 
+   return
+diff --git a/src/pmemd/src/mdin_ctrl_dat.F90 b/src/pmemd/src/mdin_ctrl_dat.F90
+index cf545a2..e7d546c 100644
+--- a/src/pmemd/src/mdin_ctrl_dat.F90
++++ b/src/pmemd/src/mdin_ctrl_dat.F90
+@@ -70,7 +70,8 @@ use file_io_dat_mod
+                                 gti_resv_velmode, & ! Mode for scaling velocities of dummy atoms
+                                 gti_resv_mapmode, & ! Mode for determining how dummy atoms are mapped to reservoir structures
+                                 asm, & !ASM
+-                                ntwd ! decomp
++                                ntwd, & ! decomp
++                                ipgm    ! pGM (polarizable Gaussian multipole)
+ 
+   integer, dimension(3) :: gti_resv_anch
+   integer, dimension(5)::  rmsd_ti
+@@ -131,11 +132,12 @@ use file_io_dat_mod
+              gbion, &       !174
+              ischeme, ithermostat, & !176
+              gti_resv_velmode, gti_resv_mapmode, &  !178
+-             ntwd !179
++             ntwd, & !179
++             ipgm !180 pGM
+ 
+   ! This variable must be set to the total number of integers in the
+   ! mdin_ctrl_int common block.
+-  integer, parameter    :: mdin_ctrl_int_cnt = 187 !! add 8 for the two extra arrays
++  integer, parameter    :: mdin_ctrl_int_cnt = 188 !! add 8 for the two extra arrays; +1 for pGM ipgm
+   save  :: / mdin_ctrl_int /
+ 
+ 
+@@ -441,7 +443,11 @@ use file_io_dat_mod
+                         ischeme, ithermostat, therm_par, & !middle_scheme
+                         rmsd_strength, rmsd_mask, rmsd_ti, rmsd_type, &
+                         gti_resv_velmode, gti_resv_mapmode, &
++#ifdef PGM
++                        vel_scale_t, asm, ipgm
++#else
+                         vel_scale_t, asm
++#endif
+ 
+ 
+ contains
+@@ -1021,6 +1027,8 @@ subroutine init_mdin_ctrl_dat(remd_method, rremd_type)
+ 
+   infe = 0   ! added by FENG PAN
+ 
++  ipgm = -1   ! pGM off unless requested
++
+ 
+ ! ASM
+   asm = 0
+@@ -3255,6 +3263,15 @@ subroutine validate_mdin_ctrl_dat(remd_method, rremd_type)
+    end if
+ #endif
+ 
++#ifdef PGM
++  if (ipgm > 0) then
++    if (ips .ne. 0) then
++      write(mdout, '(a,a)') error_hdr, 'IPS is not implemented for pGM.'
++      inerr = 1
++    end if
++  end if
++#endif
++
+ ! Field any errors and bag out.
+ 
+   if (inerr .eq. 1) then
+diff --git a/src/pmemd/src/mdin_ewald_dat.F90 b/src/pmemd/src/mdin_ewald_dat.F90
+index 86d0b23..7ba65a0 100644
+--- a/src/pmemd/src/mdin_ewald_dat.F90
++++ b/src/pmemd/src/mdin_ewald_dat.F90
+@@ -470,6 +470,10 @@ subroutine init_mdin_ewald_dat(ew_box_alpha, ew_box_beta, ew_box_gamma, &
+     end if
+   end if
+ 
++#ifdef PGM
++  block_fft=0   ! PGM force block_fft=0 because slab makes dipole iteration more efficient for MPI
++#endif
++
+   ! Hammer block_fft to allowable values if there is a problem with processor
+   ! count...
+ 
+@@ -704,6 +708,9 @@ subroutine validate_mdin_ewald_dat(ew_box_alpha, ew_box_beta, ew_box_gamma, &
+      chngmask = 0
+   end if
+ 
++#ifdef PGM
++  if (ipgm .le. 0) then
++#endif
+   if (indmeth .ne. 3) then
+     write(mdout, '(a,a)') error_hdr, 'indmeth is only used if ipol != 0!'
+     inerr = 1
+@@ -739,6 +746,10 @@ subroutine validate_mdin_ewald_dat(ew_box_alpha, ew_box_beta, ew_box_gamma, &
+     inerr = 1
+   end if
+ 
++#ifdef PGM
++  end if
++#endif
++
+   if(igb .ne. 0 .or. use_pme .ne. 0 .or. ips .ne. 0) then
+     call float_legal_range('a', ew_box(1), boxlo, boxhi, inerr)
+     call float_legal_range('b', ew_box(2), boxlo, boxhi, inerr)
+@@ -771,11 +782,23 @@ subroutine validate_mdin_ewald_dat(ew_box_alpha, ew_box_beta, ew_box_gamma, &
+   ! Trap things in the ewald namelist that the CUDA implementation does not
+   ! support.
+ 
++#ifdef PGM
++  if (ipgm .gt. 0) then
++    if (order .ne. 5 .and. order .ne. 6) then
++      write(mdout, '(a)') 'CUDA (GPU): the pGM implementation supports PME interpolation '
++      write(mdout, '(a)') '            orders 5 and 6 only.'
++      inerr = 1
++    end if
++  else
++#endif
+   if (order .ne. 4 .and. order .ne. 6) then
+     write(mdout, '(a)') 'CUDA (GPU): Implementation does not support interpolation orders '
+     write(mdout, '(a)') '            other than 4 or 6.'
+     inerr = 1
+   end if
++#ifdef PGM
++  end if
++#endif
+ #endif
+ 
+ ! Field any errors and bug out.
+diff --git a/src/pmemd/src/nb_exclusions.F90 b/src/pmemd/src/nb_exclusions.F90
+index 45e629b..2b6ef51 100644
+--- a/src/pmemd/src/nb_exclusions.F90
++++ b/src/pmemd/src/nb_exclusions.F90
+@@ -11,6 +11,10 @@
+ module nb_exclusions_mod
+ 
+   use gbl_datatypes_mod
++#ifdef PGM
++! pGM support is added by YD
++  use mdin_ctrl_dat_mod, only : ipgm
++#endif
+ 
+   implicit none
+   type(listdata_rec), allocatable, save :: atm_nb_maskdata(:)
+@@ -321,6 +325,9 @@ subroutine make_nb_adjust_pairlst_midpoint(nb_adjust_pairlst, counts)
+   double precision      :: x1j,x2j,x3j
+   integer               :: jn
+ 
++#ifdef PGM
++  if (ipgm .ge. 1) return    ! PGM does not need nb_exclusion()
++#endif
+   half_box_x = pbc_box(1)/2
+   half_box_y = pbc_box(2)/2
+   half_box_z = pbc_box(3)/2
+@@ -470,6 +477,9 @@ subroutine make_nb_adjust_pairlst(atm_cnt, use_atm_map, &
+   ! claimed to insure that we keep the coordinates updated).
+ #endif /* MPI */
+ 
++#ifdef PGM
++  if (ipgm .ge. 1) return    ! PGM does not need nb_adjust()
++#endif
+ #ifdef MPI
+   do atm_lst_idx = 1, my_atm_cnt
+     atm_i = my_atm_lst(atm_lst_idx)
+@@ -574,6 +584,13 @@ subroutine nb_adjust_midpoint(atm_cnt, &
+   double precision, parameter   :: half = 1.d0/2.d0
+   double precision, parameter   :: third = 1.d0/3.d0
+ 
++#ifdef PGM
++  if (ipgm .ge. 1) then    ! PGM does not need nb_exclusion()
++    ene = 0.0d0
++    virial(1:3, 1:3) = 0.0d0
++    return
++  endif
++#endif
+   ene_stk = 0.d0
+   ew_coeff_stk = ew_coeff
+   eedtbdns_stk = eedtbdns
+@@ -761,6 +778,13 @@ subroutine nb_adjust(atm_cnt, &
+   double precision, parameter   :: half = 1.d0/2.d0
+   double precision, parameter   :: third = 1.d0/3.d0
+ 
++#ifdef PGM
++  if (ipgm .ge. 1) then    ! PGM does not need nb_exclusion()
++    ene = 0.0d0
++    virial(1:3, 1:3) = 0.0d0
++    return
++  endif
++#endif
+ #ifdef MPI
+   if (my_atm_cnt .eq. 0) return
+ #endif
+diff --git a/src/pmemd/src/nb_pairlist.F90 b/src/pmemd/src/nb_pairlist.F90
+index bd943a0..2499ca8 100644
+--- a/src/pmemd/src/nb_pairlist.F90
++++ b/src/pmemd/src/nb_pairlist.F90
+@@ -1,5 +1,8 @@
+ #include "copyright.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ #include "include_precision.i"
+ !*******************************************************************************
+ !
+@@ -23,6 +26,12 @@ module nb_pairlist_mod
+   integer, save                         :: proc_ipairs_maxsize
+   double precision, save                :: gbl_saved_box(3)
+   integer, save                         :: ipairs_maxsize
++#ifdef PGM
++  integer, save                         :: list_tot
++  integer, save                         :: list_ee_tot
++  integer, save                         :: list_full_tot
++  integer, save                         :: list_short_tot
++#endif
+   ! Pairlist definitions for TI
+   integer, parameter    :: nb_list_null = 0
+   integer, parameter    :: nb_list_common = 1
+@@ -595,6 +604,12 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                        ico, fraction, tranvec, atm_maskdata, atm_mask, &
+                        atm_img_map, excl_img_flags, &
+                        img_iac, igroup, ntypes, ibelly, &
++#ifdef PGM
++                       ipgm, scf_local_cut, &
++#ifdef MPI
++                       my_short_img_cnt, my_short_img_lst, my_used_img_mask, &
++#endif
++#endif
+                        es_cutoff, vdw_cutoff, skinnb, verbose, ifail)
+ 
+   use cit_mod
+@@ -687,6 +702,16 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+   integer               :: total_pairs  ! DBG
+   integer               :: img_j_ee_eval(atm_cnt)
+   integer               :: img_j_full_eval(atm_cnt)
++#ifdef PGM   /* to be used to estimate the short-range pairs */
++  integer               :: ipgm
++  double precision      :: scf_local_cut
++  double precision      :: scf_local_cut_sq
++#ifdef MPI
++  integer               :: my_short_img_cnt
++  integer               :: my_short_img_lst(*)
++  integer(byte)         :: my_used_img_mask(*)
++#endif
++#endif /* PGM */
+ 
+ ! "bkt" refers to a bucket or cell in the flat cit table.
+ ! "bkts" refers to the bucket mapping tables.
+@@ -697,6 +722,12 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+ #endif /* MPI */
+   num_packed = 0        ! For "regular" pairlist
+   total_pairs = 0       ! DBG
++#ifdef PGM
++  list_ee_tot = 0
++  list_full_tot = 0
++  list_short_tot = 0
++  scf_local_cut_sq = (scf_local_cut + skinnb) * (scf_local_cut + skinnb)
++#endif /* PGM */
+ 
+   dont_skip_belly_pairs = ibelly .eq. 0 .and. ti_mode .eq. 0
+   ntypes_stk = ntypes
+@@ -709,6 +740,16 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+   es_cut_sq = (es_cutoff + skinnb) * (es_cutoff + skinnb)
+   cutoffs_equal = (es_cutoff .eq. vdw_cutoff)
+   cutlist_sq = (vdw_cutoff + skinnb) * (vdw_cutoff + skinnb)
++#ifdef PGM
++! To ensure es_cut_sq and cutlist_sq >= scf_local_cut_sq
++! even if user provides non-sensical es_cutoff or vdw_cutoff.
++  if (es_cut_sq .lt. scf_local_cut_sq) then
++     es_cut_sq = scf_local_cut_sq
++  end if
++  if (cutlist_sq .lt. scf_local_cut_sq) then
++     cutlist_sq = scf_local_cut_sq
++  end if
++#endif /* PGM */
+ 
+   ! Set up the bucket and translation index mapping arrays.  We really only need
+   ! to do this each time if the cit table dimensions are changing, but there
+@@ -818,7 +859,31 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                         used_img_lst(used_img_cnt) = img_j
+                       end if
+ #endif /* MPI */
++#ifdef PGM  /* pGM electrostatics does not have excluded interactions */
++                    else if (ipgm .ge. 1) then   ! excl_img_flag
++                      ee_eval_cnt = ee_eval_cnt + 1
++                      img_j_ee_eval(ee_eval_cnt) = img_j
++#ifdef MPI
++                      if (used_img_map(img_j) .eq. 0) then
++                        used_img_map(img_j) = 1
++                        used_img_cnt = used_img_cnt + 1
++                        used_img_lst(used_img_cnt) = img_j
++                      end if
++#endif /* MPI */
++#endif
+                     end if  ! excl_img_flag
++#ifdef PGM 
++                    if (ipgm .ge. 1 .and. dx * dx + dy * dy + dz * dz .lt. scf_local_cut_sq) then
++                      list_short_tot = list_short_tot + 1
++#ifdef MPI
++                      if (my_used_img_mask(img_j) .eq. 0) then
++                        my_used_img_mask(img_j) = 1
++                        my_short_img_cnt = my_short_img_cnt + 1
++                        my_short_img_lst(my_short_img_cnt) = img_j
++                      end if
++#endif
++                    end if
++#endif /* PGM */
+                   end if
+                 end do
+                 if (cur_bkt .eq. i_bkt) exit z_loop1 ! Done with cit buckets
+@@ -868,7 +933,32 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                         used_img_lst(used_img_cnt) = img_j
+                       end if
+ #endif /* MPI */
++#ifdef PGM  /* pGM electrostatics does not have excluded interactions */
++                    else if (ipgm .ge. 1) then   ! excl_img_flag
++                      enc_img = ior(img_j, ishft(cur_tran, 27))
++                      ee_eval_cnt = ee_eval_cnt + 1
++                      img_j_ee_eval(ee_eval_cnt) = enc_img
++#ifdef MPI
++                      if (used_img_map(img_j) .eq. 0) then
++                        used_img_map(img_j) = 1
++                        used_img_cnt = used_img_cnt + 1
++                        used_img_lst(used_img_cnt) = img_j
++                      end if
++#endif /* MPI */
++#endif
+                     end if  ! excl_img_flags
++#ifdef PGM 
++                    if (ipgm .ge. 1 .and. dx * dx + dy * dy + dz * dz .lt. scf_local_cut_sq) then
++                      list_short_tot = list_short_tot + 1
++#ifdef MPI
++                      if (my_used_img_mask(img_j) .eq. 0) then
++                        my_used_img_mask(img_j) = 1
++                        my_short_img_cnt = my_short_img_cnt + 1
++                        my_short_img_lst(my_short_img_cnt) = img_j
++                      end if
++#endif
++                    end if
++#endif /* PGM */
+                   end if
+                 end do
+                 if (cur_bkt .eq. i_bkt) exit z_loop2 ! Done with cit buckets
+@@ -914,7 +1004,31 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                         used_img_lst(used_img_cnt) = img_j
+                       end if
+ #endif /* MPI */
++#ifdef PGM  /* pGM electrostatics does not have excluded interactions */
++                    else if (ipgm .ge. 1) then   ! excl_img_flag
++                      ee_eval_cnt = ee_eval_cnt + 1
++                      img_j_ee_eval(ee_eval_cnt) = img_j
++#ifdef MPI
++                      if (used_img_map(img_j) .eq. 0) then
++                        used_img_map(img_j) = 1
++                        used_img_cnt = used_img_cnt + 1
++                        used_img_lst(used_img_cnt) = img_j
++                      end if
++#endif /* MPI */
++#endif /* PGM */
++                    end if
++#ifdef PGM 
++                    if (ipgm .ge. 1 .and. dx * dx + dy * dy + dz * dz .lt. scf_local_cut_sq) then
++                      list_short_tot = list_short_tot + 1
++#ifdef MPI
++                      if (my_used_img_mask(img_j) .eq. 0) then
++                        my_used_img_mask(img_j) = 1
++                        my_short_img_cnt = my_short_img_cnt + 1
++                        my_short_img_lst(my_short_img_cnt) = img_j
++                      end if
++#endif
+                     end if
++#endif /* PGM */
+                   end if
+                 end do
+                 if (cur_bkt .eq. i_bkt) exit z_loop3 ! Done with cit buckets
+@@ -976,7 +1090,32 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                         end if
+ #endif /* MPI */
+                       end if
++#ifdef PGM  /* pGM electrostatics does not have excluded interactions */
++                    else if (ipgm .ge. 1) then   ! excl_img_flag
++                      ee_eval_cnt = ee_eval_cnt + 1
++                      img_j_ee_eval(ee_eval_cnt) = &
++                          ior(img_j,ishft(cur_tran,27))
++#ifdef MPI
++                      if (used_img_map(img_j) .eq. 0) then
++                        used_img_map(img_j) = 1
++                        used_img_cnt = used_img_cnt + 1
++                        used_img_lst(used_img_cnt) = img_j
++                      end if
++#endif /* MPI */
++#endif /* PGM */
+                     end if
++#ifdef PGM 
++                    if (ipgm .ge. 1 .and. dx * dx + dy * dy + dz * dz .lt. scf_local_cut_sq) then
++                      list_short_tot = list_short_tot + 1
++#ifdef MPI
++                      if (my_used_img_mask(img_j) .eq. 0) then
++                        my_used_img_mask(img_j) = 1
++                        my_short_img_cnt = my_short_img_cnt + 1
++                        my_short_img_lst(my_short_img_cnt) = img_j
++                      end if
++#endif
++                    end if
++#endif /* PGM */
+                   end if
+                 end do
+ 
+@@ -1005,6 +1144,10 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+                                             num_packed)
+       end if
+ 
++#ifdef PGM
++      list_ee_tot = list_ee_tot + ee_eval_cnt
++      list_full_tot = list_full_tot + full_eval_cnt
++#endif
+       ! Clear excluded j images flags:
+ 
+       do i = atm_mask_idx + 1, atm_mask_idx + atm_maskdata(atm_i)%cnt
+@@ -1026,6 +1169,18 @@ subroutine get_nb_list(atm_cnt, flat_cit, img_crd, img_atm_map, &
+ ! write(0, *) 'DBG: avg packing = ', &
+ !             dble(total_pairs)/dble(num_packed)
+ 
++#ifdef PGM
++  list_tot = num_packed
++  if (verbose .gt. 0) then
++  if (master) then
++     write(mdout, '(a,i10)') '| TOTAL SIZE OF EE EVAL ONLY LIST = ', list_ee_tot
++     write(mdout, '(a,i10)') '| TOTAL SIZE OF EE+VDW EVAL  LIST = ', list_full_tot
++     write(mdout, '(a,i10)') '| TOTAL SIZE OF NONBOND      LIST = ', total_pairs
++     write(mdout, '(a,i10)') '| TOTAL SIZE OF num_packed   LIST = ', num_packed
++  end if
++  end if
++#endif
++
+   if (verbose .gt. 0) then
+     if (master) write(mdout, *) 'listtot = ', num_packed
+   end if
+diff --git a/src/pmemd/src/pme_alltasks_setup.F90 b/src/pmemd/src/pme_alltasks_setup.F90
+index 70eed68..464be32 100644
+--- a/src/pmemd/src/pme_alltasks_setup.F90
++++ b/src/pmemd/src/pme_alltasks_setup.F90
+@@ -1,5 +1,8 @@
+ #include "copyright.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: pme_alltasks_setup_mod
+@@ -66,6 +69,10 @@ subroutine pme_alltasks_setup(num_ints, num_reals)
+   use nmr_calls_mod
+ #endif
+   use ti_mod
++#ifdef PGM
++  use pme_slab_recip_PGM_mod
++  use pme_blk_recip_PGM_mod
++#endif /* PGM */
+ 
+   implicit none
+ 
+@@ -120,6 +127,9 @@ subroutine pme_alltasks_setup(num_ints, num_reals)
+   ! Need new molecule list structures to support no_intermolecular_bonds option.
+ 
+   if ((ntp .gt. 0 .and. imin .eq. 0) .or. &
++#ifdef PGM
++      (ipgm .eq. 1 .or. ipol .eq. 5) .or. &
++#endif
+       (emil_do_calc .gt. 0)          .or. &
+       (master .and. iwrap .ne. 0)) then
+     call setup_molecule_lists(num_ints, num_reals, natom, nspm, atm_nsp, &
+@@ -158,10 +168,28 @@ if(.not. usemidpoint) then
+   call pme_recip_dat_setup(num_ints, num_reals)
+ 
+   if (block_fft .eq. 0) then
++#ifdef PGM
++! pGM needs a few extra
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++      call pme_slab_recip_setup_PGM(num_ints, num_reals)
++    else
++#endif
+     call pme_slab_recip_setup(num_ints, num_reals)
++#ifdef PGM
++    end if
++#endif
+   else
++#ifdef PGM
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++    call pme_blk_recip_setup_PGM(frc_ene_task_cnt, gbl_frc_ene_task_lst, &
++                             num_ints, num_reals)
++    else
++#endif
+     call pme_blk_recip_setup(frc_ene_task_cnt, gbl_frc_ene_task_lst, &
+                              num_ints, num_reals)
++#ifdef PGM
++    end if
++#endif
+   end if
+ 
+   ! Set up the pseudo-residue fragment data now; it will also be needed when
+@@ -210,6 +238,9 @@ endif
+   ! Need new molecule list structures to support no_intermolecular_bonds option.
+   if ( (ntp .gt. 0 .and. imin .eq. 0) .or. &
+                        (iwrap .ne. 0) .or. &
++#ifdef PGM
++       (ipgm .eq. 1 .or. ipol .eq. 5) .or. &
++#endif
+                 (emil_do_calc .gt. 0) .or. &
+                 (mcwat .gt. 0)) then
+     call setup_molecule_lists(num_ints, num_reals, natom, nspm, atm_nsp, &
+@@ -217,6 +248,15 @@ endif
+                               no_intermolecular_bonds)
+   end if
+ 
++#ifdef PGM
++! mol-virials need further work. This works for rigid water only, but not for
++! rigid bonds. For rigid bonds, instead of using molecular bondaries, the
++! bonding indices should be used. YD
++! nspm, atm_nsp are needed to calculate mol-virials
++!  if (ipgm .ge. 1 .or. ipol .eq. 5) then
++!    call pGM_keep_nsp(nspm, atm_nsp)
++!  end if
++#endif
+   ! Old molecule lists no longer valid...
+   if  ( emil_do_calc .eq. 0 ) then !...but still useful for emil calc.
+      num_ints = num_ints - size(atm_nsp)
+@@ -237,7 +277,16 @@ endif
+ 
+   if(igb .ne. 0 .or. use_pme .ne. 0 .or. ips .ne. 0) then
+     call pme_recip_dat_setup(num_ints, num_reals)
++#ifdef PGM
++! pGM needs a few extra
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++      call pme_slab_recip_setup_PGM(num_ints, num_reals)
++    else
++#endif
+     call pme_slab_recip_setup(num_ints, num_reals)
++#ifdef PGM
++    end if
++#endif
+   end if
+ 
+   call bonds_setup(num_ints, num_reals, use_atm_map)
+diff --git a/src/pmemd/src/pme_blk_recip.F90 b/src/pmemd/src/pme_blk_recip.F90
+index 81058d7..a62a3b0 100644
+--- a/src/pmemd/src/pme_blk_recip.F90
++++ b/src/pmemd/src/pme_blk_recip.F90
+@@ -1,5 +1,8 @@
+ #include "copyright.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: pme_blk_recip_mod
+@@ -1882,3 +1885,10 @@ end subroutine get_grid_weights_nonorthog
+ #endif /* MPI */
+ 
+ end module pme_blk_recip_mod
++
++#ifdef PGM
++#define __PGM__
++#include "pGM/pme_blk_recip_PGM.i"
++#undef __PGM__
++#endif
++
+diff --git a/src/pmemd/src/pme_direct.F90 b/src/pmemd/src/pme_direct.F90
+index b06ee92..4c0d8e8 100644
+--- a/src/pmemd/src/pme_direct.F90
++++ b/src/pmemd/src/pme_direct.F90
+@@ -10,6 +10,9 @@
+ !              
+ !*******************************************************************************
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ module pme_direct_mod
+ 
+   use gbl_datatypes_mod
+@@ -53,18 +56,25 @@ subroutine init_pme_direct_dat(num_ints, num_reals)
+   use mdin_ewald_dat_mod
+   use prmtop_dat_mod
+   use parallel_dat_mod
++#ifdef PGM
++  use pgm_interface_data_mod, only : betamax
++  use pol_gauss_mdin_dat_mod
++#endif
+ 
+   implicit none
+ 
+ ! Formal arguments:
+ 
+-  ! num_ints and num_reals are used to return allocation counts. Don't zero.
++  ! num_ints and num_reals are used to return allocation counts. Do not zero.
+ 
+   integer, intent(in out)       :: num_ints, num_reals
+ 
+ ! Local variables:
+ 
+   double precision      :: dxdr
++#ifdef PGM
++  double precision      :: beta
++#endif
+   integer               :: i
+ 
+ ! Setup dxdr map from r to x in table lookup of eed
+@@ -75,7 +85,16 @@ subroutine init_pme_direct_dat(num_ints, num_reals)
+ ! between nonbond updates; i.e. no excess motion; this is enforced by
+ ! es_cutoff.
+ 
++#ifdef PGM
++  if (ipgm .ge. 1 .or. ipol .eq. 5) then
++  beta = max(betamax, dxdr)
++  mxeedtab = int(beta * eedtbdns * es_cutoff * 1.2d0)
++  else
++#endif
+   mxeedtab = int(dxdr * eedtbdns * es_cutoff * 1.5d0)
++#ifdef PGM
++  end if
++#endif
+ 
+   call alloc_pme_direct_mem(num_ints, num_reals)
+ 
+@@ -556,7 +575,17 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+   use prmtop_dat_mod
+   use timers_mod
+   use nbips_mod
++  ! --- DEGAUSS Force Field (Copyright (C) 2025 Zhen Huang, Xiongwu Wu, and Ray Luo, GNU GPL v2+) ---
+   use ti_mod
++#ifdef PGM
++  use pol_gauss_mdin_dat_mod
++  use pme_slab_recip_PGM_mod
++  use pme_blk_recip_PGM_mod
++  use pgm_interface_data_mod
++#ifdef MPI
++  use pol_gauss_multipoles_mod, only : pGM_add_perm_dip_pairs
++#endif
++#endif
+   implicit none
+ 
+ ! Formal arguments:
+@@ -600,10 +629,18 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+   end if
+ 
+ #ifdef MPI
++#ifdef PGM
++  if (ipgm .eq. 1 .or. ipol .eq. 5) then
++  call pGM_init_used_img_map(gbl_used_img_map, gbl_used_img_cnt, gbl_used_img_lst)
++  else
++#endif
+   call init_used_img_map(gbl_used_img_map, gbl_used_img_cnt, gbl_used_img_lst)
+   if( ips > 0 ) then
+     call init_used_img_ips_map(gbl_used_img_ips_map, gbl_used_img_ips_cnt, gbl_used_img_ips_lst)
+   endif
++#ifdef PGM
++  end if
++#endif
+ #endif /* MPI */
+ 
+   call update_pme_time(cit_setup_timer)
+@@ -658,6 +695,12 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+                      typ_ico, fraction, gbl_tranvec, atm_maskdata, &
+                      atm_mask, gbl_atm_img_map, gbl_excl_img_flags, &
+                      gbl_img_iac, atm_igroup, ntypes, ibelly, &
++#ifdef PGM
++                     ipgm, scf_local_cut, &
++#ifdef MPI
++                     my_short_img_cnt, my_short_img_lst, my_used_img_mask, &
++#endif
++#endif /* PGM */
+                      es_cutoff, vdw_cutoff, skinnb, verbose, ifail)
+     else
+       call get_nb_list_gp(atm_cnt, crd_idx_tbl, gbl_img_crd, gbl_img_atm_map, &
+@@ -695,6 +738,26 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+ 
+ #ifdef MPI
+   if (block_fft .eq. 0) then
++#ifdef PGM
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++    if (is_orthog .ne. 0) then
++      call claim_slab_recip_imgs_PGM(atm_cnt, fraction, pbc_box, crd_idx_tbl, &
++                                 gbl_img_crd, gbl_img_qterm, gbl_img_iac, &
++                                 gbl_mapped_img_cnt, gbl_mapped_img_lst, &
++                                 gbl_img_atm_map, gbl_used_img_map, &
++                                 gbl_used_img_cnt, gbl_used_img_lst)
++    else
++      call claim_slab_recip_imgs_nonorthog_PGM(atm_cnt, fraction, crd_idx_tbl, &
++                                           gbl_img_crd, gbl_img_qterm, &
++                                           gbl_img_iac, &
++                                           gbl_mapped_img_cnt, &
++                                           gbl_mapped_img_lst, &
++                                           gbl_img_atm_map, &
++                                           gbl_used_img_map, &
++                                           gbl_used_img_cnt, gbl_used_img_lst)
++    end if
++    else
++#endif /* PGM */
+     if (is_orthog .ne. 0) then
+       call claim_slab_recip_imgs(atm_cnt, fraction, pbc_box, crd_idx_tbl, &
+                                  gbl_img_crd, gbl_img_qterm, gbl_img_iac, &
+@@ -711,7 +774,29 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+                                            gbl_used_img_map, &
+                                            gbl_used_img_cnt, gbl_used_img_lst)
+     end if
++#ifdef PGM
++    end if
++#endif /* PGM */
+   else
++#ifdef PGM
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++    if (is_orthog .ne. 0) then
++      call claim_blk_recip_imgs_PGM(atm_cnt, fraction, pbc_box, crd_idx_tbl, &
++                                gbl_img_crd, gbl_img_qterm, gbl_img_iac, &
++                                gbl_mapped_img_cnt, gbl_mapped_img_lst, &
++                                gbl_img_atm_map, gbl_used_img_map, &
++                                gbl_used_img_cnt, gbl_used_img_lst)
++    else
++      call claim_blk_recip_imgs_nonorthog_PGM(atm_cnt, fraction, crd_idx_tbl, &
++                                          gbl_img_crd, gbl_img_qterm, &
++                                          gbl_img_iac, gbl_mapped_img_cnt, &    
++                                          gbl_mapped_img_lst, &
++                                          gbl_img_atm_map, &
++                                          gbl_used_img_map, &
++                                          gbl_used_img_cnt, gbl_used_img_lst)
++    end if
++    else
++#endif /* PGM */
+     if (is_orthog .ne. 0) then
+       call claim_blk_recip_imgs(atm_cnt, fraction, pbc_box, crd_idx_tbl, &
+                                 gbl_img_crd, gbl_img_qterm, gbl_img_iac, &
+@@ -727,7 +812,32 @@ subroutine pme_list(atm_cnt, crd, atm_maskdata, atm_mask)
+                                           gbl_used_img_map, &
+                                           gbl_used_img_cnt, gbl_used_img_lst)
+     end if
++#ifdef PGM
++    end if
++#endif /* PGM */
++
++#ifdef PGM
++  if (ipgm .ge. 1 .or. ipol .eq. 5) then
++! coordinates of both atoms of a bond are needed to transform permanent dipoles
++! from internal to global frame.
++! and to calculate the forces between bonded perm dipoles.
++#ifdef MPI
++    gbl_used_img_cnt_phi = gbl_used_img_cnt   ! Here, records the number of non-zero phi terms
++#endif
++    call pGM_add_perm_dip_pairs(gbl_used_img_cnt, gbl_used_img_lst, gbl_used_img_map, &
++                                gbl_img_atm_map, gbl_atm_img_map)
++    call pGM_append_long_range_img(gbl_used_img_cnt, gbl_used_img_lst)
++! NOTE: need_virials is not visible in this routine.
++! Copied need_virials to need_virials_pgm in runmd()
++!    if ((ntp .gt. 0 .and. barostat .ne. 2) .or. csurften .gt. 0) then
++    if (need_virials_pgm) then
++! pGM uses direct molecular pairwise virials, needs relative atom crds
++! For some reason, I am unable to make this work. YD.
++! use full allgathervec().
++      call pGM_add_my_used_mols(gbl_used_img_cnt, gbl_used_img_lst, gbl_used_img_map)
++    end if
+   end if
++#endif /* PGM */
+ 
+   log_used_img_cnt = dble(gbl_used_img_cnt)
+ 
+@@ -1375,5 +1485,18 @@ end subroutine atom_sorting
+ #include "get_nb_energy_lj1264.i"
+ #include "get_nb_energy_plj1264.i" ! New2022
+ #include "get_nb_energy_lj1264plj1264.i" ! New2022
++#ifdef PGM
++#define FIELD_ONLY
++#define SAVE_BFACT
++#include "pGM/get_nb_energy_PGM.i"     /* pGM is implemented for this only */
++#undef SAVE_BFACT
++#include "pGM/get_nb_energy_PGM.i"     /* pGM is implemented for this only */
++
++#undef FIELD_ONLY
++#define SAVE_BFACT
++#include "pGM/get_nb_energy_PGM.i"     /* pGM is implemented for this only */
++#undef SAVE_BFACT
++#include "pGM/get_nb_energy_PGM.i"     /* pGM is implemented for this only */
++#endif /* PGM */
+ 
+ end module pme_direct_mod
+diff --git a/src/pmemd/src/pme_force.F90 b/src/pmemd/src/pme_force.F90
+index d900618..3fdcc94 100644
+--- a/src/pmemd/src/pme_force.F90
++++ b/src/pmemd/src/pme_force.F90
+@@ -1,6 +1,9 @@
+ #include "copyright.i"
+ #include "dbg_arrays.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: pme_force_mod
+@@ -232,6 +235,13 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+   use pme_recip_dat_mod
+   use pme_blk_recip_mod
+   use pme_slab_recip_mod
++#ifdef PGM
++  use pme_blk_recip_PGM_mod
++  use pme_slab_recip_PGM_mod
++  use nb_pairlist_mod, only : list_tot, list_short_tot
++  use pgm_interface_data_mod, only : diprms, dipiter, my_full_img_cnt, my_full_img_lst, &
++     my_used_img_mask, gbl_used_img_cnt_phi
++#endif /* PGM */
+   use loadbal_mod
+   use img_mod
+   use inpcrd_dat_mod
+@@ -338,6 +348,10 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+   double precision              :: bias_frc(3,atm_cnt), temp_frc(3,atm_cnt)
+ 
+   double precision              :: temp_holding
++#ifdef PGM
++  double precision              :: pGM_net_frcs(3)
++  double precision              :: pGM_epvirial(9)
++#endif
+ 
+   call zero_time()
+   call zero_pme_time()
+@@ -396,6 +410,31 @@ if (iskip_ff .ne. 1) then
+ 
+     end if
+ 
++#ifdef PGM
++    if (ipgm .ge. 1) then
++      ! GPU PGM: one-time init via pGM_NonBond_eval (returns immediately after init),
++      ! then all per-step work via pgm_gpu_pme_ene/force
++      call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                            gbl_ipairs, gbl_tranvec, new_list, &
++                            need_pot_enes, need_virials, &
++                            pot_ene%epol, pot_ene%elec_dir, &
++                            pot_ene%elec_recip, pot_ene%elec_self, &
++                            pot_ene%vdw_dir, pot_ene%hbond, &
++                            vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                            vir%elec_recip, vir%elec_recip_self, &
++                            pot_ene%diprms, pot_ene%dipiter)
++      if (need_pot_enes) then
++        call pgm_gpu_pme_ene(ew_coeff, uc_volume, pot_ene, enmr, virial, &
++                             ekcmt, nstep, dt, crd, frc)
++        call pgm_gpu_get_scf_info(pot_ene%diprms, pot_ene%dipiter)
++        pot_ene%epol = 0.d0
++      else
++        call pgm_gpu_pme_force(ew_coeff, uc_volume, virial, ekcmt, &
++                               nstep, dt, crd, frc)
++      end if
++    else
++#endif /* PGM */
++
+ #ifdef GTI
+ 
+     !! MPI part of GTI routines
+@@ -445,6 +484,10 @@ if (iskip_ff .ne. 1) then
+ 
+ #endif /* GTI  */
+ 
++#ifdef PGM
++    end if  ! ipgm .ge. 1
++#endif /* PGM */
++
+     call update_time(nonbond_time)
+     if (need_virials) then
+       vir%molecular(1,1) = virial(1)
+@@ -732,6 +775,11 @@ end if
+ 
+   net_frcs(:) = 0.d0
+   molvir_netfrc_corr(:,:) = 0.d0
++#ifdef PGM
++  if (ipgm .eq. 1 .or. ipol .eq. 5) then
++    pGM_net_frcs(:) = 0.d0
++  end if
++#endif
+ 
+ ! If calling an External library
+ if (iextpot .gt. 0) then
+@@ -862,6 +910,9 @@ if (iskip_ff .ne. 1) then
+ 
+   if (use_pme .ne. 0 .and. onstep) then
+ 
++#ifdef PGM
++    if (ipgm .le. 0 .and. ipol .ne. 5) then  ! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++#endif
+     ! Self energy:
+ 
+     ! The small amount of time used here gets lumped with the recip stuff...
+@@ -987,6 +1038,10 @@ if (iskip_ff .ne. 1) then
+       end if
+     end if ! usemidpoint
+ 
++#ifdef PGM
++    end if
++    ! vdw_correction is done here, including pGM
++#endif
+ 
+     ! Long range dispersion contributions:
+ 
+@@ -1008,6 +1063,9 @@ if (iskip_ff .ne. 1) then
+   ! Direct part of ewald plus vdw, hbond, force and energy calculations:
+ 
+   call update_pme_time(pme_misc_timer)
++#ifdef PGM
++  if (ipgm .le. 0 .and. ipol .ne. 5) then  ! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++#endif
+   if (ips .gt. 0) then
+     call get_nb_ips_energy(img_frc, gbl_img_crd, gbl_img_qterm, gbl_eed_cub, &
+                            gbl_ipairs, gbl_tranvec, need_pot_enes, need_virials, &
+@@ -1072,6 +1130,48 @@ if (iskip_ff .ne. 1) then
+                          vir%eedvir, vir%elec_direct)
+     end if
+   end if
++#ifdef PGM
++  else
++
++! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++! pGM counts all pairs. there is no elec_nb_adjust.
++! NOTE: all virial terms from pGM are molecular virials
++
++#if defined(CUDA) && !defined(MPI)
++      ! GPU PGM: one-time init via pGM_NonBond_eval (returns immediately after init),
++      ! then all per-step work via pgm_gpu_pme_ene/force
++      call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                            gbl_ipairs, gbl_tranvec, new_list, &
++                            need_pot_enes, need_virials, &
++                            pot_ene%epol, pot_ene%elec_dir, &
++                            pot_ene%elec_recip, pot_ene%elec_self, &
++                            pot_ene%vdw_dir, pot_ene%hbond, &
++                            vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                            vir%elec_recip, vir%elec_recip_self, &
++                            pot_ene%diprms, pot_ene%dipiter)
++      if (need_pot_enes) then
++        call pgm_gpu_pme_ene(ew_coeff, uc_volume, pot_ene, enmr, virial, &
++                             ekcmt, nstep, dt, crd, frc)
++        call pgm_gpu_get_scf_info(pot_ene%diprms, pot_ene%dipiter)
++        pot_ene%epol = 0.d0
++      else
++        call pgm_gpu_pme_force(ew_coeff, uc_volume, virial, ekcmt, &
++                               nstep, dt, crd, frc)
++      end if
++#else
++      ! CPU PGM path
++      call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                            gbl_ipairs, gbl_tranvec, new_list, &
++                            need_pot_enes, need_virials, &
++                            pot_ene%epol, pot_ene%elec_dir, &
++                            pot_ene%elec_recip, pot_ene%elec_self, &
++                            pot_ene%vdw_dir, pot_ene%hbond, &
++                            vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                            vir%elec_recip, vir%elec_recip_self, &
++                            pot_ene%diprms, pot_ene%dipiter)
++#endif
++  endif
++#endif
+ 
+   if (usemidpoint) then
+ #ifdef _OPENMP_
+@@ -1101,6 +1201,10 @@ if (iskip_ff .ne. 1) then
+ 
+   call update_pme_time(pme_misc_timer)
+ 
++#ifdef PGM
++! NOTE: pGM does not treat 1-4 electrostatic terms differently than any other electrostatic terms
++! pGM sets 1-4 eel to 0, still need 1-4 vdw. The changes are in get_nb14_energy()
++#endif
+   ! Calculate 1-4 electrostatic energies, forces:
+   if (usemidpoint) then
+     if (need_virials) then
+@@ -1143,6 +1247,10 @@ if (iskip_ff .ne. 1) then
+ 
+   ! Adjust energies, forces for masked out pairs:
+ 
++#ifdef PGM
++  if (ipgm .le. 0 .and. ipol .ne. 5) then  ! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++                                           ! pGM electrostatic counts all pairs
++#endif
+   if (use_pme .ne. 0) then
+     if (usemidpoint) then
+       call nb_adjust_midpoint(proc_num_atms+proc_ghost_num_atms, proc_atm_qterm, &
+@@ -1155,8 +1263,17 @@ if (iskip_ff .ne. 1) then
+     end if
+   end if
+ 
++#ifdef PGM
++  endif
++#endif
+   call update_pme_time(adjust_masked_timer)
+ 
++#ifdef PGM
++! NOTE: pGM has an extra energy term: epol, that's not counted into elec_tot
++! elec_tot in pGM counts only the additive interactions that do not involve the induced dipoles,
++! Right now, to be consistent with sanfer-pgm, all elec terms are summed in epol
++! instead in pGM_interface, should be separated later.
++#endif
+   ! Get COM-relative coordinates.
+   ! Calculate total nonbonded energy components.
+ 
+@@ -1235,6 +1352,9 @@ if (iskip_ff .ne. 1) then
+                   pot_ene%imp + &
+                   pot_ene%angle_ub + &
+                   pot_ene%efield + &
++#ifdef PGM
++                  pot_ene%epol + &
++#endif
+                   pot_ene%cmap
+ 
+   if (.not. usemidpoint) then
+@@ -1259,7 +1379,14 @@ if (iskip_ff .ne. 1) then
+     if (new_list) call get_img_frc_distribution(atm_cnt)
+ 
+     if (ti_mode .eq. 0) then
++! force distribution for pGM is done later, after molecular virial correction
++#ifdef PGM
++    if (ipgm .lt. 1 .and. ipol .ne. 5) then
++#endif
+       call distribute_img_frcs(atm_cnt, img_frc, nb_frc)
++#ifdef PGM
++    end if
++#endif
+     else
+       call distribute_img_ti_frcs(atm_cnt, ti_img_frc, ti_nb_frc)
+     end if
+@@ -1272,6 +1399,10 @@ if (iskip_ff .ne. 1) then
+   ! If using extra points and a frame (checked internal to subroutine),
+   ! transfer force and torque from the extra points to the parent atom:
+ 
++#ifdef PGM
++  ! extra points for pGM are done later
++  if (ipgm .ne. 1 .and. ipol .ne. 5) then
++#endif
+   if (.not. usemidpoint) then
+     if (numextra .gt. 0 .and. frameon .ne. 0) then
+       if (ti_mode .eq. 0) then
+@@ -1300,6 +1431,9 @@ if (iskip_ff .ne. 1) then
+       end if
+     end if
+   end if
++#ifdef PGM
++  end if
++#endif
+   ! If the net force correction is in use, here we determine the net forces by
+   ! looking at the sum of all nonbonded forces.  This should give the same
+   ! result as just looking at the reciprocal forces, but it is more
+@@ -1312,6 +1446,11 @@ if (iskip_ff .ne. 1) then
+           net_frcs(:) = net_frcs(:) + nb_frc(:, i)
+         end do
+       else
++#ifdef PGM
++! net_frcs() is used much later, can be moved after the molecular virial corretions
++! this should work since pGM calculates molecular vririals, not atomic virials, and does not
++! need the correction
++#endif
+         do atm_lst_idx = 1, my_atm_cnt
+           i = my_atm_lst(atm_lst_idx)
+           net_frcs(:) = net_frcs(:) + nb_frc(:, i)
+@@ -1396,6 +1535,9 @@ if (iskip_ff .ne. 1) then
+       vir%elec_recip_vdw_corr(:,:) + &
+       vir%elec_recip_self(:,:) + &
+       vir%elec_14(:,:) + &
++#ifdef PGM
++      vir%vdw_dir(:,:) + &
++#endif
+       vir%ep_frame(:,:)
+ 
+     !add the ips contribution to virials
+@@ -1414,13 +1556,39 @@ if (iskip_ff .ne. 1) then
+     end if
+   end if
+ 
++#ifdef PGM
++  if (ipgm .eq. 1 .or. ipol .eq. 5) then
++    if (usemidpoint) then
++      call get_ekcom_midpoint(gbl_mol_cnt, gbl_mol_mass_inv, ekcmt, proc_atm_vel, &
++        proc_atm_mass)
++    else
++      call get_ekcom(my_mol_cnt, gbl_mol_mass_inv, ekcmt, atm_vel, &
++        atm_mass, gbl_my_mol_lst)
++    end if
++
++  ! pGM img force distribution is done here after molecular virial corrections
++    call distribute_img_frcs(atm_cnt, img_frc, nb_frc)
++  ! pGM_net_frcs() includes both pGM and non-pGM parts because nb_frc() contains
++  ! all force terms in pGM.
++    do atm_lst_idx = 1, my_atm_cnt
++      i = my_atm_lst(atm_lst_idx)
++      pGM_net_frcs(:) = pGM_net_frcs(:) + nb_frc(:, i)
++    end do
++  end if
++#endif
+   call update_time(nonbond_time)
+   call update_pme_time(pme_misc_timer)
+ 
+   ! Add a bunch of values (energies, virials, etc.) together as needed.
+ 
++#ifdef PGM
++  ! pGM_net_frcs needs to be reduced separately.
++  call dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
++    need_pot_enes, need_virials, pGM_net_frcs)
++#else
+   call dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+     need_pot_enes, need_virials)
++#endif
+ 
+   if (ti_mode .ne. 0 ) then
+     call ti_dist_enes_virs_netfrcs(onstep, need_virials)
+@@ -1453,12 +1621,26 @@ endif ! not usemidpoint
+           proc_atm_frc(:, i) = proc_atm_frc(:, i) - net_frcs(:)
+         end do
+       else
++#ifdef PGM
++        if (ipgm .lt. 1 .and. ipol .ne. 5) then
++#endif
+         net_frcs(:) = net_frcs(:) / dble(atm_cnt - numextra)
+ 
+         do atm_lst_idx = 1, my_atm_cnt
+           i = my_atm_lst(atm_lst_idx)
+           frc(:, i) = frc(:, i) + nb_frc(:, i) - net_frcs(:)
+         end do
++#ifdef PGM
++        else
++      ! pGM_net_frcs is used to remove the net forces only, not in the molecular virial correction
++      ! pGM_net_frcs(:) = pGM_net_frcs(:) / dble(atm_cnt - numextra)
++        pGM_net_frcs(:) = pGM_net_frcs(:) / dble(atm_cnt)
++        do atm_lst_idx = 1, my_atm_cnt
++          i = my_atm_lst(atm_lst_idx)
++          frc(:, i) = frc(:, i) + nb_frc(:, i) - pGM_net_frcs(:)
++        end do
++        end if
++#endif
+       end if
+     else
+       ti_net_frcs(1,:) = ti_net_frcs(1,:)/dble(ti_atm_cnt(1)-ti_numextra_pts(1))
+@@ -1478,7 +1660,12 @@ endif ! not usemidpoint
+       end do
+     end if
+ 
++#ifndef PGM
+     if (numextra .gt. 0 .and. frameon .ne. 0) &
++#else
++    if (numextra .gt. 0 .and. frameon .ne. 0 &
++       .and. ipgm .ne. 1 .and. ipol .ne. 5) &
++#endif
+       call zero_extra_pnts_vec(frc, ep_frames, gbl_frame_cnt)
+ 
+     ! Correct the molecular virial for netfrc:
+@@ -1517,6 +1704,17 @@ endif ! not usemidpoint
+ 
+   end if
+ 
++#ifdef PGM
++  if (ipgm .eq. 1 .or. ipol .eq. 5) then
++    pGM_epvirial = 0.0d0
++    ! pGM calculates molecular virial inside force loop. The ep corrections
++    ! to virial is no longer needed.
++    ! call orient_frc(crd, nb_frc, vir%ep_frame, ep_frames, ep_lcl_crd, gbl_frame_cnt)
++    if (numextra .gt. 0 .and. frameon .ne. 0) &
++      call orient_frc(crd, frc, pGM_epvirial, ep_frames, ep_lcl_crd, gbl_frame_cnt)
++  end if
++#endif
++
+   ! Calculate vir_vs_ene in master.
+ 
+   if (master) then
+@@ -1534,7 +1732,16 @@ endif ! not usemidpoint
+       ! energies are not being calculated this step...
+ 
+       if (pot_ene%elec_tot .ne. 0.0d0) then
++#ifndef PGM
+         vir_vs_ene = abs(vir_vs_ene + pot_ene%elec_tot)/abs(pot_ene%elec_tot)
++#else
++        if (ipgm .ge. 1 .or. ipol .eq. 5) then
++          vir_vs_ene = abs(vir_vs_ene + pot_ene%elec_tot + pot_ene%epol)/ &
++                       abs(pot_ene%elec_tot + pot_ene%epol)
++        else
++          vir_vs_ene = abs(vir_vs_ene + pot_ene%elec_tot)/abs(pot_ene%elec_tot)
++        end if
++#endif
+       else
+         vir_vs_ene = 0.0d0
+       end if
+@@ -2413,6 +2620,10 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+     if (iphmd .eq. 3) then
+       call runphmd(crd,frc,atm_iac,typ_ico,atm_numex,gbl_natex,belly_atm_cnt)
+     end if
++#ifdef PGM
++    ! pGM self energy is calculated in pGM part
++    if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+     if (usemidpoint) then
+       !!!?? Need to verify if the following version is ok or not
+       if (master) then
+@@ -2425,6 +2636,9 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+           params_may_change)
+       end if
+     end if
++#ifdef PGM
++    end if  ! ipgm .eq. 0 .and. ipol .ne. 5
++#endif
+ 
+ 
+     ! Reciprocal energy:
+@@ -2455,6 +2669,9 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+     else ! not usemidpoint below
+       if (i_do_recip) then
+         if (ti_mode .eq. 0) then
++#ifdef PGM
++        if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+           call update_pme_time(pme_misc_timer)
+           call update_loadbal_timer(elapsed_100usec_atmuser)
+           if (block_fft .eq. 0) then
+@@ -2466,10 +2683,16 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+           end if
+           call update_loadbal_timer(elapsed_100usec_recipfrc)
+           if (nrespa .gt. 1) call respa_scale(atm_cnt, img_frc, nrespa)
++#ifdef PGM
++        end if ! ipgm .eq. 0 .and. ipol .ne. 5
++#endif
+         else
+           call update_pme_time(pme_misc_timer)
+           call update_loadbal_timer(elapsed_100usec_atmuser)
+           ti_mask_piece = 2
++#ifdef PGM
++        if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+           if (block_fft .eq. 0) then
+             call do_slab_pmesh_kspace(img_frc, pot_ene%elec_recip, ti_vir(1,:,:), need_pot_enes, need_virials)
+ 
+@@ -2533,6 +2756,9 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+           if (nrespa .gt. 1) then
+             call ti_respa_scale(atm_cnt, ti_img_frc, nrespa)
+           end if
++#ifdef PGM
++        end if ! ipgm .eq. 0 .and. ipol .ne. 5
++#endif
+         end if
+       end if
+     end if ! usemidpoint
+@@ -2787,6 +3013,9 @@ subroutine pme_force_midpoint(atm_cnt, crd, frc, &
+                   pot_ene%imp + &
+                   pot_ene%angle_ub + &
+                   pot_ene%efield + &
++#ifdef PGM
++                  pot_ene%epol + &
++#endif
+                   pot_ene%cmap
+ 
+   if (.not. usemidpoint) then
+@@ -3299,6 +3528,12 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+   use ene_frc_splines_mod
+   use nb_exclusions_mod
+   use pme_direct_mod
++#ifdef PGM
++  use pme_slab_recip_PGM_mod
++!    use pol_gauss_multipoles_mod, only : pGM_MPOLE_local_to_global
++!    use pme_slab_recip_PGM_mod
++!    use pol_gauss_induced, only : diprms, dipiter
++#endif /* PGM */
+   use pme_slab_recip_mod
+   use loadbal_mod
+   use img_mod
+@@ -3374,6 +3609,8 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+     type(afe_gpu_sc_ene_rec)      :: sc_pot_ene
+ #endif
+ 
++  ! SGaMD-TI Local Variables
++
+   ! GaMD Local Variables
+   logical,save                  :: need_virials_bk
+   type(pme_pot_ene_rec)         :: pot_ene2
+@@ -3381,6 +3618,7 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+   double precision, allocatable :: nb_frc_gamd(:,:)
+   double precision, allocatable :: nb_frc_tmp(:,:)
+   double precision              :: net_frc_ti(3)
++
+   double precision              :: enmr2(3)
+   double precision              :: virial2(3)            ! Only used for MD
+   double precision              :: ekcmt2(3)             ! Only used for MD
+@@ -3389,6 +3627,10 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+   double precision              :: frc2(3,atm_cnt)
+   integer ,save                 ::ti_mode_bk
++#ifdef PGM
++  double precision              :: pGM_net_frcs(3)
++  double precision              :: pGM_epvirial(3,3)
++#endif
+ 
+   call zero_time()
+   call zero_pme_time()
+@@ -3396,6 +3638,16 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+   need_virials_bk=need_virials
+ 
++#ifdef PGM
++    if (ipgm .eq. 1 .or. ipol .eq. 5) then
++! convert covalent dipoles to global cartesian frame, needs to be done every time step
++! this needs to be done early, before imaging and imaging update
++! It is now done in pGM_interface.F90 to ensure consistency.
++!      call pGM_MPOLE_local_to_global(crd)
++      pGM_net_frcs(:) = 0.d0
++    end if
++#endif
++
+   if (ti_mode .ne. 0) then
+     call ti_zero_arrays
+ 
+@@ -3450,9 +3702,36 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+         end if
+       end if
+ 
++#ifdef PGM
++      if (ipgm .ge. 1) then
++        ! GPU PGM path: one-time init via pGM_NonBond_eval, then per-step PGM GPU pipeline
++        call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                              gbl_ipairs, gbl_tranvec, new_list, &
++                              need_pot_enes, need_virials, &
++                              pot_ene%epol, pot_ene%elec_dir, &
++                              pot_ene%elec_recip, pot_ene%elec_self, &
++                              pot_ene%vdw_dir, pot_ene%hbond, &
++                              vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                              vir%elec_recip, vir%elec_recip_self, &
++                              pot_ene%diprms, pot_ene%dipiter)
++        if (need_pot_enes) then
++          call pgm_gpu_pme_ene(ew_coeff, uc_volume, pot_ene, enmr, virial, &
++                               ekcmt, nstep, dt, crd, frc)
++          call pgm_gpu_get_scf_info(pot_ene%diprms, pot_ene%dipiter)
++          pot_ene%epol = 0.d0
++        else
++          call pgm_gpu_pme_force(ew_coeff, uc_volume, virial, ekcmt, &
++                                 nstep, dt, crd, frc)
++        end if
++      else
++#endif /* PGM */
++
+ #ifdef GTI
++      !!! GaMD: only calculate energies for cMD and GaMD steps with igamd>0 or igamd0>0
+       if (igamd.gt.0 .or. ntcmd.gt.0 .or. nteb.gt.0) then
+           if(igamd.eq.13.or.igamd.eq.12.or.igamd.eq.19.or.igamd0.eq.13.or.igamd0.eq.12.or.igamd0.eq.19)then
++        !!! igamd = 12-28
++        !! igamd = 13, 12, 19
+           ti_mode=2
+           ! need_virials=.false.
+           call gti_build_nl_list_gamd(ti_mode, lj1264, plj1264) ! C4PairwiseCUDA
+@@ -3891,6 +4170,10 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+ #endif /* GTI  */
+ 
++#ifdef PGM
++    end if  ! ipgm .ge. 1
++#endif /* PGM */
++
+     else !(use_pme .ne. 0)
+       call ipsupdate(ntb)
+       if (need_pot_enes) then ! DO NOT TOUCH THIS, SEE RUNMD.F90 TO SET need_pot_enes
+@@ -3898,7 +4181,9 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+           call gpu_calculate_amd_dihedral_energy_weight()
+         end if
+         if (igamd.eq.2 .or. igamd.eq.3 .or. igamd.eq.5.or.igamd.eq.19) then
++          ! if(ti_mode.eq.0)then        ! same as for GaMD-TI
+           call gpu_calculate_gamd_dihedral_energy_weight()
++          ! endif
+         end if
+         call gpu_ips_ene(uc_volume, pot_ene, enmr, virial, ekcmt)
+       else
+@@ -4368,19 +4653,34 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+       ! The small amount of time used here gets lumped with the recip stuff...
+ 
++#ifdef PGM
++      if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+       call self(pot_ene%elec_self, ew_coeff, uc_volume, vir%elec_recip_self, &
+                 params_may_change)
+ 
+       ! Reciprocal energy:
+ 
+       call update_pme_time(pme_misc_timer)
++#ifdef PGM
++      end if
++#endif
+       ! Only the slab fft implementation is used in uniprocessor runs...
+       if (ti_mode .eq. 0) then
++#ifdef PGM
++        if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+         call do_slab_pmesh_kspace(img_frc, pot_ene%elec_recip, vir%elec_recip, &
+                                   need_pot_enes, need_virials)
++#ifdef PGM
++        end if
++#endif
+         if (nrespa .gt. 1) call respa_scale(atm_cnt, img_frc, nrespa)
+       else
+         ti_mask_piece = 2
++#ifdef PGM
++        if (ipgm .eq. 0 .and. ipol .ne. 5) then
++#endif
+ #ifdef TIDECOMP
+         decomp_region = 1
+         if(ti_mode .eq. 3) decomp_region = 0
+@@ -4434,6 +4734,10 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+         if (nrespa .gt. 1) then
+           call ti_respa_scale(atm_cnt, ti_img_frc, nrespa)
+         end if
++#ifdef PGM
++        end if
++        ! vdw_correction is done here, including pGM
++#endif
+       end if
+       ! Long range dispersion contributions:
+ 
+@@ -4450,6 +4754,9 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+     call update_pme_time(pme_misc_timer)
+ 
++#ifdef PGM
++    if (ipgm .le. 0 .and. ipol .ne. 5) then  ! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++#endif
+     if (ips .ne. 0) then
+       call get_nb_ips_energy(img_frc, gbl_img_crd, gbl_img_qterm,  gbl_eed_cub, &
+                              gbl_ipairs, gbl_tranvec, need_pot_enes, need_virials, &
+@@ -4487,6 +4794,48 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+       call get_efield_energy(img_frc, crd, gbl_img_qterm, gbl_img_atm_map, need_pot_enes, &
+                              pot_ene%efield, atm_cnt, nstep)
+     end if
++#ifdef PGM
++    else
++! pGM code wraps all non-bonded terms in pGM_NonBond_eval().
++! pGM counts all pairs. there is no elec_nb_adjust.
++! NOTE: all virial terms from pGM are molecular virials
++! calculated forces are stored, sorted, in img_frc.
++
++#if defined(CUDA) && !defined(MPI)
++      ! GPU PGM: one-time init via pGM_NonBond_eval (returns immediately after init),
++      ! then all per-step work via pgm_gpu_pme_ene/force
++      call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                            gbl_ipairs, gbl_tranvec, new_list, &
++                            need_pot_enes, need_virials, &
++                            pot_ene%epol, pot_ene%elec_dir, &
++                            pot_ene%elec_recip, pot_ene%elec_self, &
++                            pot_ene%vdw_dir, pot_ene%hbond, &
++                            vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                            vir%elec_recip, vir%elec_recip_self, &
++                            pot_ene%diprms, pot_ene%dipiter)
++      if (need_pot_enes) then
++        call pgm_gpu_pme_ene(ew_coeff, uc_volume, pot_ene, enmr, virial, &
++                             ekcmt, nstep, dt, crd, frc)
++        call pgm_gpu_get_scf_info(pot_ene%diprms, pot_ene%dipiter)
++        pot_ene%epol = 0.d0
++      else
++        call pgm_gpu_pme_force(ew_coeff, uc_volume, virial, ekcmt, &
++                               nstep, dt, crd, frc)
++      end if
++#else
++      ! CPU PGM path
++      call pGM_NonBond_eval(atm_cnt, img_frc, crd, gbl_img_crd, gbl_eed_cub, &
++                            gbl_ipairs, gbl_tranvec, new_list, &
++                            need_pot_enes, need_virials, &
++                            pot_ene%epol, pot_ene%elec_dir, &
++                            pot_ene%elec_recip, pot_ene%elec_self, &
++                            pot_ene%vdw_dir, pot_ene%hbond, &
++                            vir%eedvir, vir%elec_direct, vir%vdw_dir, &
++                            vir%elec_recip, vir%elec_recip_self, &
++                            pot_ene%diprms, pot_ene%dipiter)
++#endif
++    endif
++#endif
+ 
+     call update_pme_time(dir_frc_sum_timer)
+ 
+@@ -4501,16 +4850,31 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+         frc(3, i) = frc(3, i) + img_frc(3, j)
+       end do
+     else
++#ifdef PGM
++      if (ipgm .lt. 1 .and. ipol .ne. 5) then
++#endif
+       do i = 1, atm_cnt
+         j = atm_img_map(i)
+         frc(1, i) = img_frc(1, j)
+         frc(2, i) = img_frc(2, j)
+         frc(3, i) = img_frc(3, j)
+       end do
++#ifdef PGM
++      else
++! Since pGM calculates molecular virials, the virial correction below is applied to forces other than
++! those from pGM and transfer of image forces to frc() should be done after that step. Unfortunately,
++! this means an additional zero-array step, just in case frc() has not been zeroed before.
++        frc(1:3, 1:atm_cnt) = 0.d0
++      end if
++#endif
+     end if
+ 
+     call update_pme_time(pme_misc_timer)
+ 
++#ifdef PGM
++! NOTE: pGM does not treat 1-4 electrostatic terms differently than any other electrostatic terms
++! pGM sets 1-4 eel to 0, still need 1-4 vdw. The changes are in get_nb14_energy()
++#endif
+     ! Calculate 1-4 electrostatic energies, forces:
+ 
+     if (charmm_active) then
+@@ -4541,11 +4905,17 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+     ! Adjust energies, forces for masked out pairs:
+ 
++#ifdef PGM
++    if (ipgm .le. 0 .and. ipol .ne. 5) then   ! pGM electrostatic counts all pairs
++#endif
+     if (use_pme .ne. 0) then
+       call nb_adjust(atm_cnt, atm_qterm, crd, gbl_nb_adjust_pairlst, &
+                      gbl_eed_cub, frc, pot_ene%elec_nb_adjust, vir%elec_nb_adjust)
+     end if
+ 
++#ifdef PGM
++    endif
++#endif
+     call update_pme_time(adjust_masked_timer)
+ 
+     if (ti_mode .ne. 0) then
+@@ -4587,6 +4957,12 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+     pot_ene%vdw_tot = pot_ene%vdw_dir + &
+                       pot_ene%vdw_recip
+ 
++#ifdef PGM
++! NOTE: pGM should have an extra energy term: epol, that should not be counted into elec_tot
++! elec_tot in pGM should count only the additive interactions that do not involve the induced dipoles,
++! right now, elec_tot includes both polarization and non-polarization energies, to be consistent
++! with sander
++#endif
+     pot_ene%elec_tot = pot_ene%elec_dir + &
+                        pot_ene%elec_recip + &
+                        pot_ene%elec_nb_adjust + &
+@@ -4660,11 +5036,21 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+     if (need_virials) then
+       call get_atm_rel_crd(my_mol_cnt, gbl_mol_com, crd, atm_rel_crd)
+       if (ti_mode .eq. 0) then
++#ifdef PGM
++        if (ipgm .eq. 1 .or. ipol .eq. 5) then    ! virials from pGM are all molecular virials
++                                                  ! pGM_force from pGM does not need the correction
++        ! NOTE: frc() here only has local forces for pGM
++        ! pGM forces are added later.
+         do i = 1, atm_cnt
+           vir%molecular(:,1) = vir%molecular(:,1) + frc(:,i) * atm_rel_crd(1,i)
+           vir%molecular(:,2) = vir%molecular(:,2) + frc(:,i) * atm_rel_crd(2,i)
+           vir%molecular(:,3) = vir%molecular(:,3) + frc(:,i) * atm_rel_crd(3,i)
+         end do
++        else
++#endif
++#ifdef PGM
++        end if
++#endif
+       else
+         do i = 1, atm_cnt
+           vir%molecular(:,1) = vir%molecular(:,1) + &
+@@ -4681,6 +5067,39 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+       call get_ekcom(my_mol_cnt, gbl_mol_mass_inv, ekcmt, atm_vel, atm_mass)
+     end if
+ 
++#ifdef PGM
++#ifndef CUDA
++    if (ipgm .ge. 1 .or. ipol .eq. 5) then
++      pGM_net_frcs(1:3) = 0.0d0
++      if (netfrc .gt. 0 .and. onstep .and. ti_mode .eq. 0) then
++        pGM_net_frcs(1) = sum(img_frc(1, 1:atm_cnt))
++        pGM_net_frcs(2) = sum(img_frc(2, 1:atm_cnt))
++        pGM_net_frcs(3) = sum(img_frc(3, 1:atm_cnt))
++! At this point, we should use atm_cnt, not atm_cnt - numextra because the sum
++! and subsequent corrections were over the range of 1:atm_cnt
++!        PGM_net_frcs(:) = PGM_net_frcs(:) / dble(atm_cnt - numextra)
++        PGM_net_frcs(:) = PGM_net_frcs(:) / dble(atm_cnt)
++      end if
++      do i = 1, atm_cnt
++        j = atm_img_map(i)
++        frc(:, i) = frc(:, i) - pGM_net_frcs(:) + img_frc(:, j)
++      end do
++      if (ti_mode .eq. 0) then
++!         call orient_frc(crd, frc, vir%ep_frame, ep_frames, ep_lcl_crd, gbl_frame_cnt)
++! pGM calculates molecular virials, not "atomic virials". pGM_epvirial here is a
++! place holder.
++         pGM_epvirial = 0.0d0
++         call orient_frc(crd, frc, pGM_epvirial, ep_frames, ep_lcl_crd, gbl_frame_cnt)
++! After this point, we can use atm_cnt - numextra because extra point forces are
++! zeroed.
++      end if
++! to match sander output for barostat=2, redundant for others, fortunately ekcmt is zeroed
++! inside get_ekcom.
++      if (ntp > 0) &
++        call get_ekcom(my_mol_cnt, gbl_mol_mass_inv, ekcmt, atm_vel, atm_mass)
++    end if
++#endif
++#endif
+     call update_time(nonbond_time)
+     call update_pme_time(pme_misc_timer)
+ 
+@@ -4715,6 +5134,9 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+                     pot_ene%imp + &
+                     pot_ene%angle_ub + &
+                     pot_ene%efield + &
++#ifdef PGM
++                    pot_ene%epol + &
++#endif
+                     pot_ene%cmap
+ 
+     if (iamd .gt. 1) then
+@@ -4744,6 +5166,9 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+                         vir%elec_recip_vdw_corr(:,:) + &
+                         vir%elec_recip_self(:,:) + &
+                         vir%elec_14(:,:) + &
++#ifdef PGM
++                        vir%vdw_dir(:,:) + &
++#endif
+                         vir%ep_frame(:,:)
+ 
+       if ( ips .gt. 0 ) then
+@@ -4773,7 +5198,16 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ 
+     if (ti_mode .eq. 0) then
+       if (pot_ene%elec_tot .ne. 0.0d0) then
++#ifdef PGM
++        if (ipgm .eq. 1 .or. ipol .eq. 5) then
++          vir_vs_ene = abs(vir_vs_ene + pot_ene%elec_tot + pot_ene%epol)/ &
++                       abs(pot_ene%elec_tot + pot_ene%epol)
++        else
++#endif
+         vir_vs_ene = abs(vir_vs_ene + pot_ene%elec_tot)/abs(pot_ene%elec_tot)
++#ifdef PGM
++        end if
++#endif
+       else
+         vir_vs_ene = 0.0d0
+       end if
+@@ -4946,8 +5380,13 @@ subroutine pme_force(atm_cnt, crd, frc, img_atm_map, atm_img_map, &
+ !              the ekcmt array, and the pme_ene_vir common block.
+ !*******************************************************************************
+ 
++#ifdef PGM
++subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
++                                  need_pot_enes, need_virials, pGM_net_frcs)
++#else
+ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+                                   need_pot_enes, need_virials)
++#endif
+ 
+   use mdin_ctrl_dat_mod
+   use mdin_ewald_dat_mod
+@@ -4963,6 +5402,9 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+   double precision      :: net_frcs(3)
+   logical, intent(in)   :: need_pot_enes
+   logical, intent(in)   :: need_virials
++#ifdef PGM
++  double precision, optional:: pGM_net_frcs(3)
++#endif
+ 
+ ! Local variables:
+ 
+@@ -4972,15 +5414,28 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+     type(pme_virial_rec)        :: vir
+     double precision            :: ekcmt(3)
+     double precision            :: molvir_netfrc_corr(3,3)
++#ifndef PGM
+     double precision            :: net_frcs(3)
++#else
++    double precision            :: net_frcs(6)
++#endif
+   end type pme_dat
+ 
++#ifndef PGM
+   integer, parameter            :: pme_dat_size = &
+                                    pme_pot_ene_rec_size + &
+                                    pme_virial_rec_size + 3 + 9 + 3
+ 
+   integer, parameter            :: pme_dat_no_pot_ene_size = &
+                                    pme_virial_rec_size + 3 + 9 + 3
++#else
++  integer, parameter            :: pme_dat_size = &
++                                   pme_pot_ene_rec_size + &
++                                   pme_virial_rec_size + 3 + 9 + 6
++
++  integer, parameter            :: pme_dat_no_pot_ene_size = &
++                                   pme_virial_rec_size + 3 + 9 + 6
++#endif
+ 
+   type(pme_dat), save           :: dat_in               ! used by all tasks
+   type(pme_dat), save           :: dat_out              ! used by master
+@@ -5001,7 +5456,16 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+     dat_in%vir                     = vir
+     dat_in%ekcmt(:)                = ekcmt(:)
+     dat_in%molvir_netfrc_corr(:,:) = molvir_netfrc_corr(:,:)
++#ifndef PGM
+     dat_in%net_frcs(:)             = net_frcs(:)
++#else
++    dat_in%net_frcs(1:3)           = net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      dat_in%net_frcs(4:6)         = pGM_net_frcs(1:3)
++    else
++      dat_in%net_frcs(4:6)         = 0.d0
++    end if
++#endif
+ 
+     buf_size = pme_dat_size
+ 
+@@ -5015,7 +5479,14 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+       ekcmt(:) = dat_out%ekcmt(:)
+     end if
+     molvir_netfrc_corr(:,:) = dat_out%molvir_netfrc_corr(:,:)
++#ifndef PGM
+     net_frcs(:)             = dat_out%net_frcs(:)
++#else
++    net_frcs(1:3)           = dat_out%net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      pGM_net_frcs(1:3)     = dat_out%net_frcs(4:6)
++    end if
++#endif
+ 
+   else if (need_virials) then
+ 
+@@ -5025,7 +5496,16 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+     dat_in%vir                     = vir
+     dat_in%ekcmt(:)                = ekcmt(:)
+     dat_in%molvir_netfrc_corr(:,:) = molvir_netfrc_corr(:,:)
++#ifndef PGM
+     dat_in%net_frcs(:)             = net_frcs(:)
++#else
++    dat_in%net_frcs(1:3)           = net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      dat_in%net_frcs(4:6)         = pGM_net_frcs(1:3)
++    else
++      dat_in%net_frcs(4:6)         = 0.d0
++    end if
++#endif
+ 
+     buf_size = pme_dat_no_pot_ene_size
+ 
+@@ -5037,21 +5517,45 @@ subroutine dist_enes_virs_netfrcs(pot_ene, vir, ekcmt, net_frcs, &
+     vir                     = dat_out%vir
+     ekcmt(:)                = dat_out%ekcmt(:)
+     molvir_netfrc_corr(:,:) = dat_out%molvir_netfrc_corr(:,:)
++#ifndef PGM
+     net_frcs(:)             = dat_out%net_frcs(:)
++#else
++    net_frcs(1:3)           = dat_out%net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      pGM_net_frcs(1:3)     = dat_out%net_frcs(4:6)
++    end if
++#endif
+ 
+   else if (netfrc .ne. 0) then
+ 
+     ! We just need net frc info!
+ 
++#ifndef PGM
+     dat_in%net_frcs(:) = net_frcs(:)
+     buf_size = 3
++#else
++    dat_in%net_frcs(1:3)           = net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      dat_in%net_frcs(4:6)         = pGM_net_frcs(1:3)
++    else
++      dat_in%net_frcs(4:6)         = 0.d0
++    end if
++    buf_size = 6
++#endif
+ 
+     call mpi_allreduce(dat_in%net_frcs(1), &
+                        dat_out%net_frcs(1), &
+                        buf_size, mpi_double_precision, &
+                        mpi_sum, pmemd_comm, err_code_mpi)
+ 
++#ifndef PGM
+     net_frcs(:) = dat_out%net_frcs(:)
++#else
++    net_frcs(1:3)           = dat_out%net_frcs(1:3)
++    if (present(pGM_net_frcs)) then
++      pGM_net_frcs(1:3)     = dat_out%net_frcs(4:6)
++    end if
++#endif
+ 
+   end if
+ 
+diff --git a/src/pmemd/src/pme_slab_recip.F90 b/src/pmemd/src/pme_slab_recip.F90
+index af2938d..369f246 100644
+--- a/src/pmemd/src/pme_slab_recip.F90
++++ b/src/pmemd/src/pme_slab_recip.F90
+@@ -1,5 +1,8 @@
+ #include "copyright.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: pme_slab_recip_mod
+@@ -1698,3 +1701,8 @@ subroutine get_grid_weights_nonorthog(img_cnt, crd, img_atm_map, ifracts, &
+ end subroutine get_grid_weights_nonorthog
+ 
+ end module pme_slab_recip_mod
++#ifdef PGM
++#define __PGM__
++#include "pGM/pme_slab_recip_PGM.i"
++#undef __PGM__
++#endif
+diff --git a/src/pmemd/src/pmemd.F90 b/src/pmemd/src/pmemd.F90
+index 7e9a979..89b1ccf 100644
+--- a/src/pmemd/src/pmemd.F90
++++ b/src/pmemd/src/pmemd.F90
+@@ -393,6 +393,13 @@ if(.not. usemidpoint) then
+ ! PHMD
+   call phmd_bcast(err_code_mpi)
+ 
++#ifdef PGM
++! pGM
++  if (ipgm .ge. 1 .or. ipol .eq. 5) then
++    call bcast_pGM_parameter
++  end if
++#endif
++
+   ! bcast constant Redox potential stuff
+   if (icnste .gt. 0 .and. .not. cpein_specified) call cnste_bcast(num_ints, num_reals)
+ 
+@@ -473,8 +480,13 @@ endif
+ 
+ #ifdef GTI  /* cheat the gpu code as if this is a non-TI calc. */
+ 
++#ifdef PGM
++    call gpu_setup_system(natom, imin, tol, ntf, ntb, ips, ntp, barostat, ntt, gbsa, &
++        vrand, icnstph, icnste, hybridgb, 0, surften, ipgm, ischeme, ithermostat, ntc)
++#else
+     call gpu_setup_system(natom, imin, tol, ntf, ntb, ips, ntp, barostat, ntt, gbsa, &
+         vrand, icnstph, icnste, hybridgb, 0, surften, ischeme, ithermostat, ntc)
++#endif
+     call gti_init_md_parameters(vlimit)
+     
+     if (ti_mode .ne. 0) then
+@@ -494,8 +506,8 @@ endif
+                     gti_cut, gti_add_sc, gti_ele_gauss, gti_ele_sc, &
+                     gti_auto_alpha, gti_vdw_sc, gti_vdw_cap)
+          endif
+-
+         else
++
+           call gti_init_ti_parameters(ti_latm_lst, ti_lst, ti_sc_lst, &
+             ti_sc_bat_lst, ctrlVar)
+         endif
+@@ -508,9 +520,14 @@ endif
+ 
+     if (reaf_mode .ge. 0) call gti_init_reaf_parameters(reaf_mode, reaf_tau, gti_add_re, reaf_atom_list)
+ 
++#else
++#ifdef PGM
++  call gpu_setup_system(natom, imin, tol, ntf, ntb, ips, ntp, barostat, ntt, gbsa, &
++                        vrand, icnstph, icnste, hybridgb, ti_mode, surften, ipgm, ischeme, ithermostat, ntc)
+ #else
+   call gpu_setup_system(natom, imin, tol, ntf, ntb, ips, ntp, barostat, ntt, gbsa, &
+                         vrand, icnstph, icnste, hybridgb, ti_mode, surften, ischeme, ithermostat, ntc)
++#endif
+   if (icfe .ne. 0) then
+     call gpu_setup_softcore_ti(ti_lst_repacked, ti_sc_lst, ti_latm_lst_repacked, &
+                                ti_latm_cnt(1))
+diff --git a/src/pmemd/src/prmtop_dat.F90 b/src/pmemd/src/prmtop_dat.F90
+index 807d554..a4f0f02 100644
+--- a/src/pmemd/src/prmtop_dat.F90
++++ b/src/pmemd/src/prmtop_dat.F90
+@@ -654,6 +654,9 @@ subroutine init_amber_prmtop_dat
+ #ifndef NOXRAY
+   use xray_globals_module, only : xray_active, bulk_solvent_model
+ #endif
++#ifdef PGM
++  use mdin_ctrl_dat_mod, only : ipgm
++#endif
+   
+   implicit none
+ 
+@@ -902,6 +905,12 @@ endif ! usemidpoint
+     ! call vdinv(nptra,gbl_one_scnb,gbl_one_scnb)
+     do i = 1, nptra
+       if (gbl_one_scnb(i) /= 0.0d0) then
++#ifdef PGM
++        if (ipgm .ge. 1 .and. gbl_one_scnb(i) .ne. 1.0d0) then
++          write (mdout,'(a)') '| Note: 1-4 VDW scale factors for pGM are set to 1.0'
++          gbl_one_scnb(i) = 1.0d0
++        endif
++#endif
+         gbl_one_scnb(i) = 1.0d0/gbl_one_scnb(i)
+       !else it gets left at 0.0d0.
+       end if
+@@ -911,10 +920,21 @@ endif ! usemidpoint
+     write (mdout,'(a)') ''
+     write (mdout,'(a)') '| Note: 1-4 VDW scale factors were NOT found in the &
+                         &topology file.'
++#ifdef PGM
++    if (ipgm .ge. 1) then
++      write (mdout,'(a)') '| Note: 1-4 VDW scale factors for pGM are set to 1.0'
++      do i=1,nptra
++        gbl_one_scnb(i)=1.0d0
++      end do
++    else
++#endif
+     write (mdout,'(a)') '|       Using default value of 2.0.'
+     do i=1,nptra
+       gbl_one_scnb(i)=1.0d0/2.0d0
+     end do
++#ifdef PGM
++    end if
++#endif
+   end if !if errcode==0
+   ! End read variable SCEE and SCNB values.
+   
+@@ -1443,6 +1463,12 @@ if(.not. usemidpoint) &
+   end if
+  
+ ! Polarizabilities would need to be read here if they are supported.
++#ifdef PGM
++  if (ipgm .ge. 1) then
++    call POL_GAUSS_readparm(prmtop, natom)
++    call pGM_keep_nsp(nspm, atm_nsp)
++  end if
++#endif
+ 
+ ! Fix up the typ-ico array for more efficient processing of vdw and 10_12
+ ! interactions.  Basically, if the ico array entry is 0, then vdw processing
+diff --git a/src/pmemd/src/runfiles.F90 b/src/pmemd/src/runfiles.F90
+index bb62023..faf6624 100644
+--- a/src/pmemd/src/runfiles.F90
++++ b/src/pmemd/src/runfiles.F90
+@@ -1,4 +1,7 @@
+ #include "copyright.i"
++#ifdef PGM
++! pGM support added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: runfiles_mod
+@@ -748,7 +751,16 @@ subroutine prntmd(nstep, total_nstlim, time, si, fac, iout7, rms, mdloop)
+     temp = ti_temp
+   end if
+ 
++#ifdef PGM
++  if (ipgm .ge. 1 .or. ipol .eq. 5) then
++     si(si_elect_ene) = si(si_elect_ene) + si(si_epol_ene)
++     epol = 0.0d0
++  else
++     epol = si(si_epol_ene)
++  end if
++#else
+   epol        = 0.d0
++#endif
+   aveper      = 0.d0
+   aveind      = 0.d0
+   avetot      = 0.d0
+diff --git a/src/pmemd/src/runmd.F90 b/src/pmemd/src/runmd.F90
+index 5193314..ad0c259 100644
+--- a/src/pmemd/src/runmd.F90
++++ b/src/pmemd/src/runmd.F90
+@@ -1,6 +1,9 @@
+ #include "copyright.i"
+ #include "dbg_arrays.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module: runmd_mod
+@@ -138,6 +141,10 @@ subroutine runmd(atm_cnt, crd, mass, frc, vel, last_vel)
+   use asm_mod, only : asm_define, asm_calc
+ #endif
+ ! END_ASM
++#ifdef PGM
++  use pgm_interface_data_mod, only : need_virials_pgm
++  use pol_gauss_mdin_dat_mod, only : densitycontrol
++#endif
+ 
+ ! used by middle-scheme
+   use md_scheme
+@@ -401,12 +408,32 @@ subroutine runmd(atm_cnt, crd, mass, frc, vel, last_vel)
+ 
+ 
+   rndfp = rndfp - dble(ndfmin) + dble(num_noshake)
++#ifdef PGM
++#ifdef MPI
++  if (master) &
++#endif
++  write (mdout,'(a,f8.0,a,i6,a,f8.0)') "|  NDFMIN = ", rndfp, &
++    "     NUM_NOSHAKE = ", num_noshake, "     CORRECTED RNDFP = ", rndfp
++#endif
+ 
+   rndf = rndfp + rndfs  ! total degrees of freedom in system
++#ifdef PGM
++#ifdef MPI
++  if (master) &
++#endif
++  write (mdout,'(a,f8.0)') "|  TOTAL # of degrees of freedom (RNDF) = ", rndf
++#endif
+ 
+ ! Correct the total degrees of freedom for extra points (lone pairs):
+ 
+   rndf = rndf - 3.d0 * dble(numextra)
++#ifdef PGM
++#ifdef MPI
++  if (master) &
++#endif
++  write (mdout,'(a,a,f8.0)') "|  TOTAL # of degrees of freedom (RNDF) after ", &
++  "extra-points correction = ", rndf
++#endif
+ 
+ ! BUGBUG - NOTE that rndfp, rndfs are uncorrected in an extra points context!
+   !  initialization
+@@ -618,6 +645,9 @@ DBG_ARRAYS_TIME_STEP(nstep)
+ 
+   need_pot_enes = .true.        ! maybe not, but most simple for step 0
+   need_virials = (ntp .gt. 0 .and. barostat .ne. 2) .or. csurften .gt. 0
++#ifdef PGM
++  need_virials_pgm = need_virials
++#endif
+ 
+ ! irest = 0:  General startup if not continuing a previous run:
+   if (irest .eq. 0 ) then
+@@ -718,10 +748,15 @@ DBG_ARRAYS_TIME_STEP(nstep)
+       if((igamd.ge.110.and.igamd.le.120).or.(igamd0.ge.110.and.igamd0.le.120))then
+       si(si_dvdl)=ppi_inter_ene
+       endif
++#ifdef PGM
++      if (ipgm .ge. 1 .or. ipol .eq. 5) then
++! pGM counts both epol and electric in elect.
++         si(si_elect_ene) = pme_pot_ene%epol + si(si_elect_ene)
++      end if
++#endif
+ 
+       ! Total virial will be printed in mden regardless of ntp value.
+       si(si_tot_virial) = virial(1) + virial(2) + virial(3)
+-
+     else if (using_gb_potential) then
+ #ifdef CUDA
+       call gpu_upload_crd(crd)
+@@ -1712,6 +1747,12 @@ DBG_ARRAYS_TIME_STEP(nstep)
+         endif
+         ! Total virial will be printed in mden regardless of ntp value.
+         si(si_tot_virial) = virial(1) + virial(2) + virial(3)
++#ifdef PGM
++        if (ipgm .ge. 1 .or. ipol .eq. 5) then
++! pGM counts both epol and electric in elect.
++          si(si_elect_ene) = pme_pot_ene%epol + si(si_elect_ene)
++        end if
++#endif
+         if (iphmd .eq. 3) then
+           call updatephmd(dtx,atm_qterm,total_nstep+1,si(si_kin_ene))
+         end if
+@@ -2911,6 +2952,9 @@ DBG_ARRAYS_TIME_STEP(nstep)
+               rmu(2) = (1.d0 - dtcp * (pres0y - press_tan_ave))**one_third
+               rmu(3) = (1.d0 - dtcp * (pres0z - press_tan_ave))**one_third
+ 
++#ifdef MPI
++#endif  
++
+             else if (csurften.eq.2) then ! For surface tension in the y direction
+               pres0x = pres0y - gamma_ten_int * ten_conv / pbc_box(2)
+               pres0z = pres0x
+@@ -2919,6 +2963,9 @@ DBG_ARRAYS_TIME_STEP(nstep)
+               rmu(2) = (1.d0 - dtcp * (pres0y - press(2)))**one_third
+               rmu(3) = (1.d0 - dtcp * (pres0z - press_tan_ave))**one_third
+ 
++#ifdef MPI
++#endif  
++
+               !else if (csurften.eq.3) then ! For surface tension in the z direction
+             else
+               pres0x = pres0z - gamma_ten_int * ten_conv / pbc_box(3)
+@@ -2927,12 +2974,17 @@ DBG_ARRAYS_TIME_STEP(nstep)
+               rmu(1) = (1.d0 - dtcp * (pres0x - press_tan_ave))**one_third
+               rmu(2) = (1.d0 - dtcp * (pres0y - press_tan_ave))**one_third
+               rmu(3) = (1.d0 - dtcp * (pres0z - press(3)))**one_third
++              
++#ifdef MPI
++#endif  
+ 
+             end if
+           end if
+           !Add semiisotropic pressure scaling in any direction with csurften=0 here
+         else if (ntp .eq. 4) then
+           rmu(:)=1.0
++          ! Check if box is truncated octahedron
++                ! Do something
+           if (mod(total_nstep+1, mcbarint) .eq. 0) then
+              temp=target_n-(total_nstep*1.0)/(mcbarint*1.0)
+              if (temp<1) temp=1.0
+@@ -2941,6 +2993,15 @@ DBG_ARRAYS_TIME_STEP(nstep)
+              rmu(3)=1.0+1.0/temp*(target_c-pbc_box(3))/pbc_box(3)
+           endif
+         end if
++#ifdef PGM
++        ! targeted density simulation for pGM (could be useful for parameterization of
++        ! non-bonded terms)
++        if (densitycontrol .gt. 0.0d0 .and. ti_mode .eq. 0) then
++          rmu(1) = (1.d0 - (densitycontrol - si(si_density)) * dt / taup)**one_third
++          rmu(2) = rmu(1)
++          rmu(3) = rmu(1)
++        end if
++#endif
+ 
+ #ifdef GBTimer
+         call get_wall_time(wall_s, wall_u)
+diff --git a/src/pmemd/src/runmin.F90 b/src/pmemd/src/runmin.F90
+index 4ef2352..993de55 100644
+--- a/src/pmemd/src/runmin.F90
++++ b/src/pmemd/src/runmin.F90
+@@ -305,6 +305,13 @@ subroutine runmin_master(atm_cnt, crd, frc, igraph)
+     si(si_dihedral_imp_ene) = pme_pot_ene%imp
+     si(si_cmap_ene) = pme_pot_ene%cmap
+ 
++#ifdef PGM
++      if (ipgm .ge. 1 .or. ipol .eq. 5) then
++! pGM counts everything electric in epol.
++!         si(si_epol_ene) = pme_pot_ene%epol
++         si(si_elect_ene) = pme_pot_ene%epol + si(si_elect_ene)
++      end if
++#endif
+   else if (using_gb_potential) then
+ #ifdef CUDA
+     call gpu_upload_crd(crd)
+diff --git a/src/pmemd/src/state_info.F90 b/src/pmemd/src/state_info.F90
+index 414cc32..98fd931 100644
+--- a/src/pmemd/src/state_info.F90
++++ b/src/pmemd/src/state_info.F90
+@@ -1,5 +1,8 @@
+ #include "copyright.i"
+ 
++#ifdef PGM
++! pGM support is added by YD
++#endif
+ !*******************************************************************************
+ !
+ ! Module:  state_info_mod
+@@ -52,6 +55,11 @@ module state_info_mod
+   integer, parameter    :: si_gamd_ppi   = 31
+   integer, parameter    :: si_gamd_ppi2   = 32
+   integer, parameter    :: si_phmd_ene    = 33
++#ifdef PGM
++  integer, parameter    :: si_epol_ene   = 34
++  integer, parameter    :: si_cnt = 35         ! update as needed
++#else
+   integer, parameter    :: si_cnt = 34         ! update as needed
++#endif
+ 
+ end module state_info_mod
