@@ -71,7 +71,8 @@ amber/test/run_tests.sh $AMBERHOME/bin    # AMBER patch
 tests/xplat/run_xplat.sh all              # AMBER vs OpenMM vs GROMACS
 ```
 
-`tests/xplat/run_xplat.sh` compares single points of the same coordinates for two systems:
+`tests/xplat/run_xplat.sh` compares single points of the same coordinates for two systems (output of a full
+run: `tests/xplat/reference_output.txt`):
 
 * a liquid of 2,6-dimethylphenol (DMP), 8550 atoms;
 * 512 pGM waters.

@@ -1,0 +1,18 @@
+# tests/xplat/run_xplat.sh all, 2026-11-06: AMBER24 + pGM patch (pmemd.pgm, pmemd.pgm.cuda), OpenMM 8.6.1 + plugin,
+# GROMACS 2026.4 + patch, all built from this repository; RTX PRO 6000 Blackwell, CUDA 12.8 (GPU runs).
+== dmp
+AMBER CUDA DPFP: EPtot ref -101706.8613 test -101706.8613 diff +0.0000 rel 0.0e+00; forces rel rms 1.1e-07 max 7.6e-06 kcal/mol/A
+AMBER CUDA SPFP: EPtot ref -101706.8613 test -101706.8589 diff +0.0024 rel 2.4e-08; forces rel rms 1.5e-05 max 7.4e-03 kcal/mol/A
+OpenMM CPU double: EPtot amber -101706.8613 openmm -101706.8390 diff +0.0223 rel 2.2e-07; forces rel rms 1.2e-06 max 2.2e-04 kcal/mol/A
+OpenMM CUDA double: EPtot amber -101706.8613 openmm -101706.8396 diff +0.0217 rel 2.1e-07; forces rel rms 1.3e-06 max 1.0e-04 kcal/mol/A
+OpenMM CUDA mixed: EPtot amber -101706.8613 openmm -101706.8513 diff +0.0100 rel 9.8e-08; forces rel rms 6.2e-05 max 6.5e-03 kcal/mol/A
+GROMACS gmx_d: EPtot amber -101706.8613 gmx -101706.8393 diff +0.0220 rel 2.2e-07; forces rel rms 1.9e-06 max 1.9e-04 kcal/mol/A
+GROMACS gmx: EPtot amber -101706.8613 gmx -101706.8595 diff +0.0018 rel 1.8e-08; forces rel rms 6.2e-05 max 6.6e-03 kcal/mol/A
+== w512
+AMBER CUDA DPFP: EPtot ref -505467.0448 test -505467.0448 diff +0.0000 rel 0.0e+00; forces rel rms 6.6e-08 max 7.6e-06 kcal/mol/A
+AMBER CUDA SPFP: EPtot ref -505467.0448 test -505467.0410 diff +0.0038 rel 7.5e-09; forces rel rms 4.6e-06 max 1.9e-03 kcal/mol/A
+OpenMM CPU double: EPtot amber -505467.0448 openmm -505467.0492 diff -0.0044 rel -8.8e-09; forces rel rms 8.2e-07 max 2.4e-04 kcal/mol/A
+OpenMM CUDA double: EPtot amber -505467.0448 openmm -505467.0489 diff -0.0041 rel -8.0e-09; forces rel rms 1.1e-06 max 1.1e-04 kcal/mol/A
+OpenMM CUDA mixed: EPtot amber -505467.0448 openmm -505467.0931 diff -0.0483 rel -9.6e-08; forces rel rms 6.3e-05 max 1.7e-02 kcal/mol/A
+GROMACS gmx_d: EPtot amber -505467.0448 gmx -505467.0488 diff -0.0040 rel -7.8e-09; forces rel rms 3.1e-06 max 2.1e-03 kcal/mol/A
+GROMACS gmx: EPtot amber -505467.0448 gmx -505467.0770 diff -0.0322 rel -6.4e-08; forces rel rms 1.4e-05 max 6.0e-03 kcal/mol/A
