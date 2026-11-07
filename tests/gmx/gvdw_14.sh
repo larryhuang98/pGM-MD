@@ -2,16 +2,16 @@
 # GVDW with 1-4 pairs: a pGM organic molecule (Amber test qm7b_7203, 20 atoms, dihedrals) converted with
 # the prmtop's LJ and with --gvdw slater/gauss, alone in a 4 nm box (rvdw 1.2 nm covers every
 # intramolecular pair).  The GROMACS energies are compared with OpenMM (pgm_prmtop, NoCutoff) by
-# gvdw_14_compare.py: LJ (SR) + LJ-14, the bonded terms, and LJ-14 unchanged by --gvdw.
+# gvdw_14_compare.py: LJ (SR) + LJ-14, the bonded terms, and with GVDW the 1-4 pairs in the GVDW (no LJ-14).
 #   gvdw_14.sh [double|cuda]      (run in an empty work directory)
 set -e
 V=${1:-double}
 D=$(cd "$(dirname "$0")" && pwd)
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
-P=$HOME/miniconda3/envs/SE3nv/bin/python
-SRC=$HOME/ambers/amber_new/test/nmode
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
+export CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
+P=$PY
+SRC=${QM7B_DIR:-$AMBERHOME/test/nmode}   # qm7b_7203.prmtop/.inpcrd of the AMBER test suite
 cp $SRC/qm7b_7203.prmtop $SRC/qm7b_7203.inpcrd .
 for m in lj slater gauss; do
     opt=$([ $m = lj ] && echo "" || echo "--gvdw $m")
@@ -49,4 +49,4 @@ MDP
     $G mdrun -s $m.tpr -deffnm $m -nb cpu -ntmpi 1 -ntomp 4 > mdrun_$m.log 2>&1 || { tail -20 mdrun_$m.log; exit 1; }
     printf "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n\n" | $G energy -f $m.edr -dp -o e_$m.xvg > /dev/null 2>&1
 done
-grep -c "^ *[0-9]" <(sed -n '/\[ pairs \]/,/\[ angles \]/p' slater.top) | sed 's/^/1-4 pairs: /'
+grep -c "^ *[0-9]" <(sed -n '/\[ pairs \]/,/\[ angles \]/p' lj.top) | sed 's/^/1-4 pairs (LJ conversion): /'

@@ -6,11 +6,11 @@
 set -e
 V=${1:-double}
 D=$(cd "$(dirname "$0")" && pwd)
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
-P=$HOME/miniconda3/envs/SE3nv/bin/python
-W=$D/../../runs/gmx_w512
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
+export CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
+P=$PY
+W=$PGM_DATA/gmx_w512
 $G genconf -f $W/w512.g96 -nbox 2 2 2 -o w4096.g96 > genconf.log 2>&1
 sed "s/^\(WAT *\)512/\14096/" $W/w512.top > w4096.top
 sed -e "s/^fourier-n\(.\) .*/fourier-n\1 = 72/" $W/sp.mdp > sp.mdp
@@ -33,7 +33,7 @@ done
 $P $D/dd_compare.py sp1 sp2 sp4 sp8 p811 p222 p321 || true
 
 # GVDW (Slater, overrides of an O-H pair per water, dispersion tail) on the replicated GVDW box
-GV=$D/../../runs/gmx_gvdw_$V
+GV=${GVDW_DIR:-../gmx_gvdw_$V}   # the GVDW single points of gvdw_sp.sh
 if [ -f $GV/extra.top ]; then
     $G genconf -f $GV/slater.g96 -nbox 2 2 2 -o g4096.g96 > genconf_g.log 2>&1
     awk '/\[ molecules \]/{m=1} m && $2 ~ /^[0-9]+$/ {$2 = $2 * 8} {print}' $GV/extra.top > g4096.top

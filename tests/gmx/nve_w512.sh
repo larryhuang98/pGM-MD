@@ -1,13 +1,12 @@
 #!/bin/bash
 # water512 NVE with GROMACS coulombtype = pGM; prints drift and fluctuation of the conserved energy.
 # MDRUN_EXTRA: more mdrun options, e.g. "-pin on" (unpinned OpenMP threads wander across NUMA nodes: ~30% slower)
-#   nve_w512.sh [cuda|double] [ntomp] [mdp]     (run in runs/gmx_w512)
+#   nve_w512.sh [cuda|double] [ntomp] [mdp]     (run in a copy of tests/data/gmx_w512: sp.mdp, w512.g96, w512.top)
 set -e
 V=${1:-cuda}
 D=$(cd "$(dirname "$0")" && pwd)
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
 export CUDA_VISIBLE_DEVICES=
 M=${3:-$D/nve.mdp}
 N=nve_$V

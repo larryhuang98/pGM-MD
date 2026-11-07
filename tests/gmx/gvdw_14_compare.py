@@ -1,10 +1,10 @@
 """Compare the GROMACS single points of gvdw_14.sh with OpenMM (pgm_prmtop, NoCutoff, same coordinates).
-
-    python gvdw_14_compare.py WORKDIR        (pgm-omm environment)
-
-Checks, for the LJ, Slater-GVDW and Gauss-GVDW conversions of qm7b_7203: LJ (SR) + LJ-14 against
-OpenMM's van der Waals group, bonds/angles/dihedrals against OpenMM's bonded forces, and that LJ-14 is
-the same in all three conversions.  Exits with the number of failures.
+    python gvdw_14_compare.py WORKDIR        (Python with OpenMM and the plugin)
+Checks, for the LJ, Slater-GVDW and Gauss-GVDW conversions of qm7b_7203: LJ (SR) + LJ-14 against OpenMM's
+NonbondedForce (LJ); with GVDW, LJ (SR) (which then includes the 1-4 pairs, nrexcl = 2) against OpenMM's
+GVDWForce (1-4 pairs as exceptions with the full GVDW) and no LJ-14 (pmemd-pgm igvdw = 1: the 1-4 pairs get
+the full GVDW and no Lennard-Jones); bonds/angles/dihedrals against OpenMM's bonded forces.  Exits with the
+number of failures.
 """
 import os
 import sys
@@ -48,7 +48,6 @@ def check(name, a, b, tol):
 
 
 prmtop = os.path.join(wd, "qm7b_7203.prmtop")
-lj14 = {}
 for m in ("lj", "slater", "gauss"):
     eg = gmx_energies(os.path.join(wd, f"e_{m}.xvg"))
     x = gro_positions(os.path.join(wd, m + "_box.gro"))
@@ -79,13 +78,11 @@ for m in ("lj", "slater", "gauss"):
     check(f"{m}: dihedrals", dih, e(["PeriodicTorsionForce"]), 1e-5)
     if m == "lj":
         check(f"{m}: LJ (SR) + LJ-14", eg["LJ (SR)"] + eg["LJ-14"], e(["NonbondedForce"]), 1e-5)
-    else:   # GVDW: same coordinates and parameters, so to round-off; 1-4 LJ: the NonbondedForce left over
+    else:   # GVDW, 1-4 pairs included on both sides: same coordinates and parameters, so to round-off
         check(f"{m}: GVDW = LJ (SR)", eg["LJ (SR)"], e(["GVDWForce"]), 1e-10 * abs(eg["LJ (SR)"]))
-        check(f"{m}: LJ-14", eg["LJ-14"], e(["NonbondedForce"]), 1e-5)
+        check(f"{m}: no LJ-14", eg.get("LJ-14", 0.0), 0.0, 1e-12)
+        check(f"{m}: no OpenMM Lennard-Jones", e(["NonbondedForce"]), 0.0, 1e-12)
     check(f"{m}: Coulomb-14 is zero", eg.get("Coulomb-14", 0.0), 0.0, 1e-12)
-    lj14[m] = eg.get("LJ-14", 0.0)
     del ctx
-check("LJ-14 slater = lj", lj14["slater"], lj14["lj"], 1e-9)
-check("LJ-14 gauss = lj", lj14["gauss"], lj14["lj"], 1e-9)
 print(f"{len(fails)} failures" if fails else "ALL PASSED")
 sys.exit(len(fails))

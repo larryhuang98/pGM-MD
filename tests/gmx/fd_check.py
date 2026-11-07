@@ -3,10 +3,11 @@ random unit direction (all atoms move), single points with tol 1e-10.
     python fd.py GMX MODE H        (MODE cpu | gpu)"""
 import os, subprocess, sys
 import numpy as np
-sys.path.insert(0, os.path.expanduser("~/project/pgm-native/tests/gmx"))
-exec(open(os.path.expanduser("~/project/pgm-native/tests/gmx/dd_compare.py")).read().split("ref = sys.argv[1]")[0].split("args = sys.argv[1:]")[0])
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+exec(open(os.path.join(HERE, "dd_compare.py")).read().split("ref = sys.argv[1]")[0].split("args = sys.argv[1:]")[0])
 G, mode, h = sys.argv[1], sys.argv[2], float(sys.argv[3])
-R = os.path.expanduser("~/project/pgm-native/runs/gmx_gpu4k")
+R = os.path.join(HERE, "..", "data", "gmx_w4096")
 env = dict(os.environ, GMX_PGM_QUIET="1")
 if mode == "gpu": env["GMX_PGM_GPU"] = "1"
 else: env.pop("GMX_PGM_GPU", None)

@@ -1,0 +1,80 @@
+;
+;   File w512.top  was generated
+;   By user: larry (1004)
+;   On host:gpu-0-3 
+;   At date:Mon. November  1 20:22:50 2026 
+;
+;   This is a standalone topology file
+;
+;   Created by:
+;   ParmEd:       prmtop_to_gmx.py, VERSION0+untagged.62906.g12cc2a2.dirty 
+;   Executable:   prmtop_to_gmx.py
+;   Library dir:  /home8/larry/apps/gromacs/gmx_plumed/share/gromacs/top
+;   Command line:
+;     /home8/larry/project/pgm-native/gromacs/tools/prmtop_to_gmx.py /home8/larry/project/pGM-JAX/examples/water512/pgm3p25_512.prmtop /home8/larry/project/pGM-JAX/examples/water512/pgm3p25_512.rst7 w512
+;
+
+[ defaults ]
+; nbfunc        comb-rule       gen-pairs       fudgeLJ fudgeQQ
+1               2               yes             1            0           
+
+[ atomtypes ]
+; name    at.num    mass    charge ptype  sigma      epsilon
+OW             8  16.000000  0.00000000  A     0.31507524       0.635968
+HW             1   1.008000  0.00000000  A              0              0
+
+
+[ moleculetype ]
+; Name            nrexcl
+WAT          3
+
+[ atoms ]
+;   nr       type  resnr residue  atom   cgnr    charge       mass  typeB    chargeB      massB
+; residue    1 WAT rtp WAT q 0.0
+    1         OW      1    WAT      O      1 -2.04056220  16.000000   ; qtot -2.040562
+    2         HW      1    WAT     H1      2 1.02028110   1.008000   ; qtot -1.020281
+    3         HW      1    WAT     H2      3 1.02028110   1.008000   ; qtot 0.000000
+
+#ifdef FLEXIBLE
+
+[ bonds ]
+;    ai     aj funct         c0         c1         c2         c3
+      1      2     1   0.09572 462750.400000
+      1      3     1   0.09572 462750.400000
+      2      3     1   0.15136 462750.400000
+
+
+#else
+
+[ settles ]
+; i     funct   doh     dhh
+1     1   0.09572000   0.15136000
+
+#endif
+
+[ exclusions ]
+1  2  3
+2  1  3
+3  1  2
+
+
+[ pgm_atoms ]
+;   atom funct   radius(nm)       alpha(nm^3)
+      1     1   6.05150752e-02   1.11765163e-03
+      2     1   5.36231183e-02   3.29630770e-04
+      3     1   5.36231183e-02   3.29630770e-04
+
+[ pgm_dipoles ]
+;     ai     aj funct  strength(e nm)  p_ai += c unit(r_aj - r_ai)
+       1      2     1  -1.91201350e-02
+       1      3     1  -1.91201350e-02
+       2      1     1   8.58770326e-03
+       3      1     1   8.58770326e-03
+
+[ system ]
+; Name
+Generic title
+
+[ molecules ]
+; Compound       #mols
+WAT                512

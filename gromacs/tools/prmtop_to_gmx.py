@@ -17,7 +17,7 @@ settles for rigid water).  Then, for every [ moleculetype ], this script:
   type from the prmtop's ACOEF / BCOEF, as pmemd-pgm igvdw = 1 reads them.  The 1-4 pairs get the full
   GVDW, as in pmemd-pgm: nrexcl = 2 and no [ pairs ], so only 1-2 and 1-3 pairs are excluded.
 
-Needs ParmEd (e.g. the SE3nv environment on rayl8).
+Needs ParmEd.
 """
 
 import math

@@ -5,9 +5,9 @@
 set -e
 V=${1:-double}
 D=$(cd "$(dirname "$0")" && pwd)
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
+export CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
 python3 - <<PY
 s = open("slater.top").read()
 i = s.index("[ system ]")

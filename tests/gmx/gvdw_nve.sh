@@ -3,9 +3,9 @@
 # Run after gvdw_sp.sh in the same directory.   gvdw_nve.sh [cuda|double] [nsteps]
 set -e
 V=${1:-cuda}
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES=
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
+export CUDA_VISIBLE_DEVICES=
 sed -e "s/^nsteps = 0/nsteps = ${2:-4000}/" -e "s/^verlet-buffer-tolerance = -1/verlet-buffer-tolerance = 0.0001/" \
     -e "/^rlist/d" -e "s/^pgm-dipole-tol = 1e-6/pgm-dipole-tol = 1e-5/" -e "s/^pgm-predictor = 0/pgm-predictor = 2/" \
     -e "s/^continuation = yes/continuation = no\ngen-vel = yes\ngen-temp = 298\ngen-seed = 11\ndt = 0.001\nnstenergy = 10\nnstcalcenergy = 10\nnstlog = 1000/" \

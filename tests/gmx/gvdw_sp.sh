@@ -1,19 +1,18 @@
 #!/bin/bash
 # GVDW single points of the GVDW manuscript's 512-water box with GROMACS (pGM + GVDW, rvdw 1.0 nm, no tail),
 # both repulsion forms; the dump (GMX_PGM_DUMP) has the GVDW energy, virial and forces.
-#   gvdw_sp.sh [cuda|double]      (run in an empty work directory; needs runs/gvdw_box.txt)
+#   gvdw_sp.sh [cuda|double]      (run in an empty work directory; needs PGM_GVDW_DATA)
 set -e
 V=${1:-double}
 D=$(cd "$(dirname "$0")" && pwd)
-R=$D/../../runs
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
-P=$HOME/miniconda3/envs/SE3nv/bin/python
-GD=$HOME/pgm-gvdw-data
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
+export CUDA_VISIBLE_DEVICES= GMX_PGM_QUIET=1
+P=$PY
+GD=${PGM_GVDW_DATA:?set PGM_GVDW_DATA (see tests/env.sh)}
 for form in slater gauss; do
     [ -f $form.top ] || $P $D/../../gromacs/tools/prmtop_to_gmx.py $GD/topology/rayl_512_v2.prmtop $GD/inputs/lj/inpcrd.restrt $form --gvdw $form > conv_$form.log 2>&1
-    $P $D/boxtxt_to_g96.py $R/gvdw_box.txt $form.gro $form.g96 > /dev/null
+    $P $D/boxtxt_to_g96.py $PGM_DATA/gvdw_box.txt $form.gro $form.g96 > /dev/null
     rf=$([ $form = slater ] && echo 1 || echo 0)
     cat > $form.mdp <<MDP
 integrator = md

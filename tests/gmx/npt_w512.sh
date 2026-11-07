@@ -1,13 +1,12 @@
 #!/bin/bash
 # water512 NPT with GROMACS coulombtype = pGM; density, potential energy and pressure averages.
 # MDRUN_EXTRA: more mdrun options, e.g. "-pin on" (unpinned OpenMP threads wander across NUMA nodes: ~30% slower)
-#   npt_w512.sh [cuda|double] [ntomp] [skip_ps]     (run in runs/gmx_w512)
+#   npt_w512.sh [cuda|double] [ntomp] [skip_ps]     (run in a copy of tests/data/gmx_w512: sp.mdp, w512.g96, w512.top)
 set -e
 V=${1:-cuda}
 D=$(cd "$(dirname "$0")" && pwd)
-G=$HOME/project/gromacs-pgm/install-$V/bin/gmx
-[ "$V" = double ] && G=${G}_d
-export LD_LIBRARY_PATH=/home8/apps/gcc/11.3.0/lib64:$LD_LIBRARY_PATH
+. "$(cd "$(dirname "$0")" && pwd)/../env.sh"
+G=$(gmx_bin $V)
 export CUDA_VISIBLE_DEVICES=
 N=npt_$V
 $G grompp -f $D/npt.mdp -c w512.g96 -p w512.top -o $N.tpr -po mdout_$N.mdp -maxwarn 2 > grompp_$N.log 2>&1 \
