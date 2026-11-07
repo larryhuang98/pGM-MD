@@ -2,7 +2,7 @@
  * pGM electrostatics for GROMACS, phase G1: scalar CPU implementation (pair kernels, splines, CG and
  * forces in double precision; the PME grid and FFT in GROMACS's `real`).
  *
- * The model and the formulas are those of docs/spec.md of pgm-native and of its reference engine
+ * The model and the formulas are those of docs/spec.md of pgm-md and of its reference engine
  * core/pgm_core.cpp (checked against pGM-JAX); this file ports that engine to the GROMACS data
  * structures: direct-space pairs from the nbnxm cluster pair lists, the PME FFT from gmx_parallel_3dfft,
  * parameters from the PgmAtom / PgmCovalentDipole interaction lists.
@@ -62,10 +62,10 @@
 #    include <unistd.h>
 #endif
 
-#include "gvdw_kernel.h" // pgm-native core/, copied next to this file: the GVDW pair
+#include "gvdw_kernel.h" // pgm-md core/, copied next to this file: the GVDW pair
 #include "pgm_math.h"    // and the shared numerics (erf kernels, B-spline moduli, minimum image)
 #if GMX_GPU_CUDA
-#    include "pgm_cuda.h" // pgm-native core/cuda: the pGM engine on the GPU (GMX_PGM_GPU=1)
+#    include "pgm_cuda.h" // pgm-md core/cuda: the pGM engine on the GPU (GMX_PGM_GPU=1)
 #endif
 
 namespace gmx
@@ -192,7 +192,7 @@ private:
 namespace
 {
 
-// the numerics shared with pgm_core and the OpenMM plugin (pgm-native core/pgm_math.h)
+// the numerics shared with pgm_core and the OpenMM plugin (pgm-md core/pgm_math.h)
 using pgmcore::bsplineModuli;
 using pgmcore::ewaldCoefficient;
 constexpr double c_sqrtPi = pgmcore::SQRT_PI;

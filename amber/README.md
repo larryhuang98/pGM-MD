@@ -14,8 +14,7 @@ Blackwell GPUs (sm_100, sm_120, e.g. RTX 5090).
 ## Install
 
 ```bash
-git clone https://github.com/XXXX/pgm-amber.git
-cd pgm-amber
+cd pgm-md/amber
 ./install.sh --amber-src /path/to/pmemd24_src            # patch only
 ./install.sh --amber-src /path/to/pmemd24_src \
              --build --build-dir /path/to/pmemd24_src/build   # patch and build

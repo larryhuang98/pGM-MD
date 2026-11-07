@@ -2,11 +2,11 @@
 
 This is the model the native engines must reproduce. It is read off the two existing codes:
 
-* **pGM-JAX** (`~/project/pGM-JAX`, master ab9c213): `pgm_jax/md/forcefield.py` (MD energy, solver,
+* **pGM-JAX** (master ab9c213): `pgm_jax/md/forcefield.py` (MD energy, solver,
   forces), `md/kernels.py` (radial kernels), `md/pme.py` (smooth PME of charges + dipoles),
   `densities.py`, `vdw.py`, `de.py`, `md/topology.py` (vdW exclusions), `protein/pmemd.py`
   (prmtop sections and the pmemd differences, checked term by term).
-* **pmemd-pgm** (`~/ambers/pgm-larry`, branch pgm-cuda-larry-merge-master, 83ede07):
+* **pmemd-pgm** (branch pgm-cuda-larry-merge-master, 83ede07):
   `src/pmemd/src/pGM_*.F90` and `src/pmemd/src/cuda/*_PGM.*`.
 
 pGM-JAX reproduces pmemd-pgm to its print precision (1e-4 kcal/mol, forces 2e-5 kcal/mol/A) once the

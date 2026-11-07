@@ -1,7 +1,7 @@
 ;
 ;   File w512.top  was generated
-;   By user: larry (1004)
-;   On host:gpu-0-3 
+;   By user: (removed)
+;   On host: (removed)
 ;   At date:Mon. November  1 20:22:50 2026 
 ;
 ;   This is a standalone topology file
@@ -9,9 +9,9 @@
 ;   Created by:
 ;   ParmEd:       prmtop_to_gmx.py, VERSION0+untagged.62906.g12cc2a2.dirty 
 ;   Executable:   prmtop_to_gmx.py
-;   Library dir:  /home8/larry/apps/gromacs/gmx_plumed/share/gromacs/top
+;   Library dir:  (GROMACS share/top)
 ;   Command line:
-;     /home8/larry/project/pgm-native/gromacs/tools/prmtop_to_gmx.py /home8/larry/project/pGM-JAX/examples/water512/pgm3p25_512.prmtop /home8/larry/project/pGM-JAX/examples/water512/pgm3p25_512.rst7 w512
+;     pgm-md/gromacs/tools/prmtop_to_gmx.py tests/data/water512/pgm3p25_512.prmtop tests/data/water512/pgm3p25_512.rst7 w512
 ;
 
 [ defaults ]

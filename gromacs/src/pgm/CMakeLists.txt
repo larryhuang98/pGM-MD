@@ -1,8 +1,8 @@
-# pGM electrostatics (coulombtype = pGM), see pgm-native/docs/gromacs_design.md
+# pGM electrostatics (coulombtype = pGM), see pgm-md docs/gromacs_design.md
 gmx_add_libgromacs_sources(
     pgm.cpp
     )
-# The GPU engine (pgm-native core/cuda, copied here by g1_install.sh; GMX_PGM_GPU=1 at run time) is its
+# The GPU engine (pgm-md core/cuda, copied here by g1_install.sh; GMX_PGM_GPU=1 at run time) is its
 # own static library: its CG vectors, energies and strain are double precision, which libgromacs's
 # CUDA flags (-Xptxas -warn-double-usage -Werror) forbid.  libgromacs links it (g3_gpu.py).
 if (GMX_GPU_CUDA)

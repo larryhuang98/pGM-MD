@@ -1,7 +1,7 @@
 ;
 ;   File w4096.top  was generated
-;   By user: larry (1004)
-;   On host:rayl8 
+;   By user: (removed)
+;   On host: (removed)
 ;   At date:Tue. November  2 15:55:59 2026 
 ;
 ;   This is a standalone topology file
@@ -9,7 +9,7 @@
 ;   Created by:
 ;   ParmEd:       prmtop_to_gmx.py, VERSION0+untagged.62906.g12cc2a2.dirty 
 ;   Executable:   prmtop_to_gmx.py
-;   Library dir:  /home8/larry/apps/gromacs/gmx_plumed/share/gromacs/top
+;   Library dir:  (GROMACS share/top)
 ;   Command line:
 ;     ../../gromacs/tools/prmtop_to_gmx.py w4096.prmtop w4096.rst7 w4096
 ;

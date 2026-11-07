@@ -1,0 +1,17 @@
+The GROMACS pGM patch (this directory: the module src/pgm, the patch stages in patches/, the scripts and
+tools) modifies and extends GROMACS, which is distributed under the GNU Lesser General Public License,
+version 2.1 or (at your option) any later version. This patch is distributed under the same license:
+
+    This program is free software; you can redistribute it and/or modify it under the terms of the GNU
+    Lesser General Public License as published by the Free Software Foundation; either version 2.1 of the
+    License, or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+    the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General
+    Public License for more details.
+
+The full text of the license is in the file COPYING of the GROMACS source distribution and at
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html.
+
+install.sh also copies core/pgm_math.h, core/pgm_constants.h, core/gvdw_kernel.h and core/cuda/pgm_cuda.*
+(MIT, see ../LICENSE) into the GROMACS tree; the MIT license is compatible with the LGPL.

@@ -1,6 +1,8 @@
 # pGM in GROMACS 2026.4: design and plan
 
-Source: `~/project/gromacs-pgm` (git clone of v2026.4, branch `pgm`); build `build_gmx.sh` /
+(Design and development notes. Paths under `runs/` refer to the development work directories, which are
+not part of the repository.)  Install: `gromacs/install.sh` on a GROMACS v2026.4 tree; build `gromacs/build.sh`
+(originally `build_gmx.sh` /
 `rebuild.sh` (CUDA 12.8, sm_89 + sm_120, AVX2_256, own FFTW, internal BLAS/LAPACK).
 The model is docs/spec.md; the references are pGM-JAX, the OpenMM plugin and `core/pgm_core.cpp`.
 
@@ -93,7 +95,7 @@ bash    gromacs/patches/g1_install.sh $SRC                                  # sr
 ```
 
 All stages are idempotent string replacements that fail loudly if upstream code moved.  Builds on
-rayl8: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
+Development cluster: `build_gmx.sh cuda` (mixed precision, CUDA, AVX2_256) and
 `build_gmx.sh double -DGMX_DOUBLE=ON -DGMX_GPU=OFF` (`gmx_d`), incremental `rebuild.sh cuda|double`.
 
 ### G1 (done): CPU reference in mdrun

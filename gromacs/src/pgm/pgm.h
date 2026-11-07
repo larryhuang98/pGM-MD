@@ -2,7 +2,7 @@
  * pGM electrostatics for GROMACS (coulombtype = pGM).
  *
  * Gaussian charges, covalent permanent dipoles p_i = sum c unit(r_j - r_i) and Gaussian induced dipoles,
- * with smooth PME of point charges and point dipoles (docs/spec.md of pgm-native).  The direct-space
+ * with smooth PME of point charges and point dipoles (docs/spec.md of pgm-md).  The direct-space
  * sum runs over the nbnxm cluster pair lists, which keep all pairs within the cut-off, excluded pairs
  * included (pGM electrostatics have no exclusions; the nbnxm kernels compute Lennard-Jones only).
  *

@@ -1,5 +1,8 @@
 # OpenMM pGM plugin
 
+(Design and development notes. Paths under `runs/` refer to the development work directories, which are
+not part of the repository; the test scripts are in `tests/`.)
+
 A native OpenMM force, `PGMForce`, for pGM electrostatics (docs/spec.md): Gaussian charges, covalent
 permanent dipoles and Gaussian induced dipoles, every pair interacting (no exclusions), smooth PME for
 periodic systems; and `GVDWForce`, the Gaussian-density van der Waals of Huang, Luo and Duan
@@ -15,20 +18,17 @@ stays in OpenMM's NonbondedForce (with the topology's exclusions).
 | XML serialization | `serialization/`: proxies for both forces (`XmlSerializer`, System files), registered when the library loads |
 | GVDW, CUDA / OpenCL | `kernels/gvdwPair.cc` (the pair, shared), `gvdwNonbonded.cc` (combination-rule pairs in OpenMM's nonbonded tile kernel, exception pairs excluded), `gvdwExceptions.cc` (exceptions with parameters, BondedUtilities); dispersion correction on the host |
 
-## Build (rayl8 cluster)
+## Build
 
 ```bash
-~/project/pgm-native/build_omm_login.sh          # login node, gcc 11 (or build_omm.sh on a compute node)
+OPENMM_DIR=$CONDA_PREFIX openmm/build.sh      # in a conda environment with openmm (8.x), cmake, swig, a C++17 compiler
 ```
 
-The conda OpenMM needs glibc 2.27; on the login node (glibc 2.17) run it through conda's glibc 2.28
-sysroot: `runs/glibc228.sh python script.py` (Reference, CPU and pocl OpenCL; no GPU there; it limits
-OpenMM's and pocl's thread pools, since the node's per-user thread limit is reached quickly with several
-Contexts on 160 cores).
-
 Installs `libOpenMMPGM.so`, the platform plugins `libOpenMMPGM{Reference,CUDA,OpenCL}.so` and the
-Python modules `openmmpgm` (the force) and `pgm_prmtop` (a pmemd-pgm prmtop reader) into the
-`pgm-omm` conda environment (`~/miniconda3/envs/pgm-omm`, OpenMM 8.6.1).
+Python modules `openmmpgm` (the force) and `pgm_prmtop` (a pmemd-pgm prmtop reader) into the OpenMM
+installation (developed and tested with OpenMM 8.6.1 from conda-forge, CUDA 12.8, gcc 11).  The CUDA
+platform needs the CUDA toolkit (nvcc) at build time; set `-DCMAKE_CUDA_ARCHITECTURES=...` (passed to
+build.sh) if the default 80;89;120 does not include the GPU.
 
 ## Use
 
@@ -169,7 +169,7 @@ OpenMM compute the forces again (`setForcesValid(false)`).  `PGM_OPENMM_DEFER=1`
 steps without energies (the list check one evaluation later): 1 percent, not the default.
 
 Larger boxes (the 4096 box replicated with `md_nve.py --replicate`, the grid scaled, the other settings
-as above; pmemd.pgm.cuda from /home8/larry/pgm-exp/gpubench out_s*_040_9_*, the same settings), ns/day:
+as above; pmemd.pgm.cuda of the GPU benchmarks, the same settings), ns/day:
 
 | waters (atoms) | grid | OpenMM engine | OpenMM Common | GROMACS G3 nstlist 10 / 40 | pmemd.pgm.cuda |
 |---|---|---|---|---|---|
@@ -177,7 +177,7 @@ as above; pmemd.pgm.cuda from /home8/larry/pgm-exp/gpubench out_s*_040_9_*, the 
 | 32768 (98304) | 112^3 | 24.0 | 20.4 | 18.0 / 23.3 | 21.4 |
 | 110592 (331776) | 168^3 | 7.5 | | 5.2 / 6.7 | 6.8 |
 
-The pmemd.pgm.cuda column is the old build (`~/ambers/pgm-larry-install`, `scf_solv_opt=3`: the solver
+The pmemd.pgm.cuda column is the old build (`scf_solv_opt=3`: the solver
 before the optimizations of the pGM paper, which reports them 1.5-2.2 times faster).  The optimized pmemd:
 167 ns/day on an RTX 5090 (4096 waters, tol 1e-4, NVE; paper), 165 on this RTX PRO 6000 at tol 1e-3 with a
 thermostat.  A comparison at the same settings on the same GPU (the current build, `build24_c128`) is still
@@ -209,7 +209,7 @@ is invalidated when another thread uses the legacy stream: this ended some runs 
 runs without graphs.
 
 The conda environment's NVRTC 13.4 emits PTX the 13.3 driver rejects (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`,
-for OpenMM's own kernels too): `LD_PRELOAD` an NVRTC 13.0 (`~/project/ext/nvrtc13.0`, conda-forge
+for OpenMM's own kernels too): `LD_PRELOAD` an NVRTC 13.0 (conda-forge
 cuda-nvrtc 13.0) until the driver is updated.
 
 `tests/test_gvdw_api.py` (53 checks, random triclinic 48-atom systems against an independent Python sum):

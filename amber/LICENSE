@@ -1,0 +1,4 @@
+The AMBER pGM patch (this directory) adds source files to, and modifies, PMEMD of AMBER24. It is useful
+only with a licensed AMBER24 source tree (https://ambermd.org); using, building and redistributing the
+patched PMEMD is subject to the AMBER license. The pGM source files of this directory carry the copyright
+notices in src/pmemd/src/pGM/copyright_pgm.i and src/pmemd/src/cuda/copyright_PGM.i.
