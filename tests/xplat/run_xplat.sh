@@ -20,11 +20,11 @@ for s in dmp w512; do
         top=pgm3p25_512.prmtop; crd=pgm3p25_512.rst7; cut=9; beta=0.35; grid=36; order=6
     fi
     echo "== $s"
-    $AMBER_BIN/pmemd.pgm -O -i $H/${s}_sp.in -o sp0.out -p $top -c $crd -frc sp0.frc -x sp0.nc -r sp0.rst -inf sp0.inf
+    $AMBER_BIN/pmemd.pgm -O -i $H/${s}_sp.in -o sp0.out -p $top -c $crd -frc sp0.frc -x sp0.nc -r sp0.rst -inf sp0.inf > sp0.log 2>&1
     if [ $MODE = all ]; then
         for p in DPFP SPFP; do
             $AMBER_BIN/pmemd.pgm.cuda_$p -AllowSmallBox -O -i $H/${s}_sp.in -o sp_$p.out -p $top -c $crd -frc sp_$p.frc \
-                -x sp_$p.nc -r sp_$p.rst -inf sp_$p.inf
+                -x sp_$p.nc -r sp_$p.rst -inf sp_$p.inf > sp_$p.log 2>&1
             $PY $H/amber_vs_amber.py sp0.out sp0.frc sp_$p.out sp_$p.frc "AMBER CUDA $p"
         done
     fi

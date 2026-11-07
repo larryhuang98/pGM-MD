@@ -158,14 +158,19 @@ def gvdw_from_topology(s):
 def _gvdw_14(text):
     """GVDW for the 1-4 pairs, as pmemd-pgm with igvdw = 1 (full GVDW for the nb14 pairs, no Lennard-Jones):
     nrexcl = 2 in every [ moleculetype ], so that only 1-2 and 1-3 pairs are excluded and the 1-4 pairs enter
-    the nonbonded GVDW, and no [ pairs ] (they would add a 1-4 Lennard-Jones)."""
-    if re.search(r"(?m)^\[ exclusions \]", text):
-        raise NotImplementedError("explicit [ exclusions ] with GVDW 1-4 pairs")
+    the nonbonded GVDW, and no [ pairs ] (they would add a 1-4 Lennard-Jones).  A molecule type without 1-4 pairs
+    (e.g. a rigid water with explicit [ exclusions ]) is left as it is."""
     out = []
     for blk in re.split(r"(?m)^(?=\[ moleculetype \])", text):
         if not blk.startswith("[ moleculetype ]"):
             out.append(blk)
             continue
+        has_pairs = re.search(r"(?m)^\[ pairs \]\s*\n(\s*;.*\n)*\s*\d", blk) is not None
+        if not has_pairs:
+            out.append(blk)
+            continue
+        if re.search(r"(?m)^\[ exclusions \]", blk):
+            raise NotImplementedError("explicit [ exclusions ] in a molecule type with GVDW 1-4 pairs")
         lines, inside, seen = [], None, False
         for ln in blk.splitlines(keepends=True):
             t = ln.split(";")[0].strip()
