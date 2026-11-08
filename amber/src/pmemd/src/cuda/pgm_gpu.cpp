@@ -52,7 +52,7 @@ extern "C" void kPGMXLUpdate(gpuContext gpu, double* dst, const double* mu, doub
 // n_{k+1} = 2n_k - n_{k-1} + kappa*(mu - n_k) + alpha*sum_j c_j n_{k-j}.   env PGM_XL_W = w (default 0.727)
 static double pgm_xl_w = 0.727;
 #include <vector>
-// ---- CLAUDE 2026-10-08: mode 8 'cpuls' = exact port of the CPU predictor (pGM_induced.F90 extrap_ind_dipole,
+// ---- 2026-10-08: mode 8 'cpuls' = exact port of the CPU predictor (pGM_induced.F90 extrap_ind_dipole,
 //      dipole_scf_init=3, dipole_scf_init_order=3, dipole_scf_init_step=2).  Records live on the device so they can be
 //      remapped across neighbor-list rebuilds with kPGMRemapDipHistory; the tiny least-squares math runs on the host.
 static const int CPULS_STEP = 2, CPULS_ORDER = 3;
@@ -150,7 +150,7 @@ extern "C" void cpuls_dev_comb(double* dst, const double* R0, const double* R1, 
 extern "C" void cpuls_dev_sub(double* d, const double* a, const double* b, int n3);
 extern "C" int  cpuls_dev_scratch_size();
 extern "C" double cpuls_dev_power(const double* r, const double* x, double* xprev, const double* pol, int n3, double* part, int skip);
-// CLAUDE: env PGM_POWER=N -> every N steps print mean per-step dH = -sum r.dP/alpha (kcal/mol) and its ns^-1 rate at 1 fs
+// env PGM_POWER=N -> every N steps print mean per-step dH = -sum r.dP/alpha (kcal/mol) and its ns^-1 rate at 1 fs
 static int pgm_power_every = -1; static bool pgm_power_skip = true; static GpuBuffer<double>* pgm_power_xprev = NULL;
 static GpuBuffer<double>* pgm_power_part = NULL; static double pgm_power_sum = 0.0, pgm_power_sum_all = 0.0; static long pgm_power_n = 0, pgm_power_n_all = 0;
 static int cpuls_device = 0;
@@ -283,8 +283,8 @@ static void pgm_pred_init() {
     else if (!strcmp(e, "mu5")) pgm_pred_mode = 5;
     else if (!strcmp(e, "delta8")) pgm_pred_mode = 6;   // b + LS quartic over 8 Delta points
     else if (!strcmp(e, "xl")) pgm_pred_mode = 7;        // extended-Lagrangian 0-SCF (2 sweeps/step, no CG)
-    else if (!strcmp(e, "cpuls")) pgm_pred_mode = 8;     // CLAUDE: exact CPU field-anchored LS predictor (order 3, step 2), host math
-    else if (!strcmp(e, "cpulsd")) { pgm_pred_mode = 8; cpuls_device = 1; }  // CLAUDE: same, device math (production path)
+    else if (!strcmp(e, "cpuls")) pgm_pred_mode = 8;     // exact CPU field-anchored LS predictor (order 3, step 2), host math
+    else if (!strcmp(e, "cpulsd")) { pgm_pred_mode = 8; cpuls_device = 1; }  // same, device math (production path)
   }
   { const char* w = getenv("PGM_XL_W"); if (w) pgm_xl_w = atof(w); if (pgm_pred_mode == 7) fprintf(stderr, "PGM XL: w = %.3f kappa %.2f alpha %.3f\n", pgm_xl_w, pgm_xl_kappa, pgm_xl_alpha);
   }
@@ -1686,7 +1686,7 @@ static void pgm_gpu_pme_pipeline(bool need_energy)
     // p = zpc + beta * p
     kPGMPCGUpdateP(gpu);
   }
-  // CLAUDE 2026-10-08: final peek after PCG convergence, as in CPU pGM_pkcg (ind_dip += scf_sor_coefficient * rv).
+  // 2026-10-08: final peek after PCG convergence, as in CPU pGM_pkcg (ind_dip += scf_sor_coefficient * rv).
   // Weight from env PGM_PCG_PEEK: a number, or "cpu" = use scf_sor_coefficient from &pol_gauss. Absent/0 = original GPU behaviour.
   { static double pcg_peek = -1.0;
     if (pcg_peek < 0.0) { const char* e = getenv("PGM_PCG_PEEK"); pcg_peek = 0.0;

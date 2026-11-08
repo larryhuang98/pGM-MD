@@ -1,4 +1,4 @@
-// kCPULS_PGM.cu — CLAUDE 2026-10-08
+// kCPULS_PGM.cu (2026-10-08)
 // Device kernels for the GPU port of the CPU pGM induced-dipole predictor
 // (pGM_induced.F90: extrap_ind_dipole / least_square_extrap, dipole_scf_init=3, step 2).
 // Raw-pointer kernels only (no cSim), so this file compiles on its own with nvcc.
