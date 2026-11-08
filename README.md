@@ -106,10 +106,10 @@ The pGM formulation:
 Methods and implementation of pGM in molecular dynamics:
 
 * Z. Huang, S. Zhao, P. Cieplak, Y. Duan, R. Luo, H. Wei, Optimal scheme to achieve energy conservation in
-  induced dipole models, *J. Chem. Theory Comput.* **19**, 5047–5057 (2023)
+  induced dipole models, *J. Chem. Theory Comput.* **19**, 5047–5057 (2023), doi:10.1021/acs.jctc.3c00226
 * Z. Huang, Y. Wu, Y. Duan, R. Luo, Performance tuning of polarizable Gaussian multipole model in molecular
   dynamics simulations, *J. Chem. Theory Comput.* **21**, 847–858 (2025), doi:10.1021/acs.jctc.4c01368
 * Z. Huang, X. Wu, R. Luo, Isotropic periodic sum for polarizable Gaussian multipole model,
-  *J. Chem. Theory Comput.* **21**, 4040 (2025)
+  *J. Chem. Theory Comput.* **21**, 4040–4050 (2025), doi:10.1021/acs.jctc.5c00123
 * Z. Huang, R. Luo, Y. Duan, A density-consistent, finite van der Waals potential from Gaussian atomic
-  densities, *J. Phys. Chem. Lett.* (2026)
+  densities, *J. Phys. Chem. Lett.* (2026), doi:10.1021/acs.jpclett.6c02430
