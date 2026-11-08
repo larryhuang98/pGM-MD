@@ -95,10 +95,22 @@ The double-precision differences come from the reciprocal-space difference descr
 ## Citation
 
 If you use this code, please cite the paper that describes the GPU implementation and the
-cross-implementation comparison (Huang, Z. et al., in preparation; the reference will be added here). Please
-also cite the pGM formulation:
+cross-implementation comparison (Huang, Z. et al., in preparation; the reference will be added here).
+
+The pGM formulation:
 
 * H. Wei, R. Qi, J. Wang, P. Cieplak, Y. Duan, R. Luo, *J. Chem. Phys.* **153**, 114116 (2020),
   doi:10.1063/5.0019560
 * H. Wei, P. Cieplak, Y. Duan, R. Luo, *J. Chem. Phys.* **156**, 114114 (2022), doi:10.1063/5.0082548
-* Z. Huang, Y. Wu, Y. Duan, R. Luo, *J. Chem. Theory Comput.* **21**, 847–858 (2025), doi:10.1021/acs.jctc.4c01368
+
+The algorithms implemented here (energy-conserving induction, solver and predictor tuning, isotropic periodic
+sum, Gaussian van der Waals):
+
+* Z. Huang, S. Zhao, P. Cieplak, Y. Duan, R. Luo, H. Wei, Optimal scheme to achieve energy conservation in
+  induced dipole models, *J. Chem. Theory Comput.* **19**, 5047–5057 (2023)
+* Z. Huang, Y. Wu, Y. Duan, R. Luo, Performance tuning of polarizable Gaussian multipole model in molecular
+  dynamics simulations, *J. Chem. Theory Comput.* **21**, 847–858 (2025), doi:10.1021/acs.jctc.4c01368
+* Z. Huang, X. Wu, R. Luo, Isotropic periodic sum for polarizable Gaussian multipole model,
+  *J. Chem. Theory Comput.* **21**, 4040 (2025)
+* Z. Huang, R. Luo, Y. Duan, A density-consistent, finite van der Waals potential from Gaussian atomic
+  densities, *J. Phys. Chem. Lett.* (2026)
