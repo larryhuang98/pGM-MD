@@ -103,8 +103,7 @@ The pGM formulation:
   doi:10.1063/5.0019560
 * H. Wei, P. Cieplak, Y. Duan, R. Luo, *J. Chem. Phys.* **156**, 114114 (2022), doi:10.1063/5.0082548
 
-The algorithms implemented here (energy-conserving induction, solver and predictor tuning, isotropic periodic
-sum, Gaussian van der Waals):
+Methods and implementation of pGM in molecular dynamics:
 
 * Z. Huang, S. Zhao, P. Cieplak, Y. Duan, R. Luo, H. Wei, Optimal scheme to achieve energy conservation in
   induced dipole models, *J. Chem. Theory Comput.* **19**, 5047–5057 (2023)
