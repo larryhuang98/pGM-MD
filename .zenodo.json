@@ -1,0 +1,22 @@
+{
+  "title": "pGM-MD: polarizable Gaussian multipole electrostatics for AMBER, OpenMM and GROMACS",
+  "upload_type": "software",
+  "description": "<p>Implementations of the polarizable Gaussian multipole (pGM) model for three molecular dynamics programs: a patch for AMBER24 PMEMD (CPU and CUDA, SPFP and DPFP), an OpenMM 8 plugin (Reference, CPU, OpenCL and CUDA platforms) and a patch for GROMACS 2026.4 (CPU with domain decomposition, pGM terms on the GPU), with a shared C++ reference implementation and CUDA engine, topology converters, Gaussian van der Waals, and tests that compare the three programs at identical coordinates.</p>",
+  "creators": [
+    {"name": "Huang, Zhen", "affiliation": "University of California, Irvine"},
+    {"name": "Lee, Tai-Sung", "affiliation": "Rutgers University"},
+    {"name": "Duan, Yong", "affiliation": "University of California, Davis"},
+    {"name": "Luo, Ray", "affiliation": "University of California, Irvine"}
+  ],
+  "license": "MIT",
+  "keywords": ["molecular dynamics", "polarizable force field", "polarizable Gaussian multipole", "AMBER", "OpenMM", "GROMACS", "CUDA", "particle mesh Ewald"],
+  "notes": "core/, openmm/ and tests/ are MIT-licensed; the GROMACS patch (gromacs/) is LGPL-2.1; the AMBER patch (amber/) applies to AMBER24 and the patched PMEMD is subject to the AMBER license.",
+  "references": [
+    "Wei, H.; Qi, R.; Wang, J.; Cieplak, P.; Duan, Y.; Luo, R. J. Chem. Phys. 2020, 153, 114116. doi:10.1063/5.0019560",
+    "Wei, H.; Cieplak, P.; Duan, Y.; Luo, R. J. Chem. Phys. 2022, 156, 114114. doi:10.1063/5.0082548",
+    "Huang, Z.; Zhao, S.; Cieplak, P.; Duan, Y.; Luo, R.; Wei, H. J. Chem. Theory Comput. 2023, 19, 5047-5057. doi:10.1021/acs.jctc.3c00226",
+    "Huang, Z.; Wu, Y.; Duan, Y.; Luo, R. J. Chem. Theory Comput. 2025, 21, 847-858. doi:10.1021/acs.jctc.4c01368",
+    "Huang, Z.; Wu, X.; Luo, R. J. Chem. Theory Comput. 2025, 21, 4040-4050. doi:10.1021/acs.jctc.5c00123",
+    "Huang, Z.; Luo, R.; Duan, Y. J. Phys. Chem. Lett. 2026. doi:10.1021/acs.jpclett.6c02430"
+  ]
+}

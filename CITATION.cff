@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with the papers listed in README.md."
+title: "pGM-MD: polarizable Gaussian multipole electrostatics for AMBER, OpenMM and GROMACS"
+type: software
+authors:
+  - family-names: Huang
+    given-names: Zhen
+    affiliation: "University of California, Irvine"
+  - family-names: Lee
+    given-names: Tai-Sung
+    affiliation: "Rutgers University"
+  - family-names: Duan
+    given-names: Yong
+    affiliation: "University of California, Davis"
+  - family-names: Luo
+    given-names: Ray
+    affiliation: "University of California, Irvine"
+license: MIT
+repository-code: "https://github.com/larryhuang98/pGM-MD"
+keywords:
+  - molecular dynamics
+  - polarizable force field
+  - AMBER
+  - OpenMM
+  - GROMACS
+  - CUDA
