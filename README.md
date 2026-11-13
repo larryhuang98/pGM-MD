@@ -83,14 +83,17 @@ The reference is the AMBER CPU code, run in double precision with τ = 10⁻¹�
 |---|---|---|---|
 | AMBER CUDA, DPFP | 0.0000 | 0.0000 | 10⁻⁷ |
 | OpenMM CPU and CUDA, double precision; GROMACS CPU, double precision | +0.022 | −0.004 | 1–3 × 10⁻⁶ |
-| AMBER CUDA SPFP; OpenMM CUDA mixed; GROMACS CUDA mixed | ≤ 0.01 | ≤ 0.05 | 10⁻⁵ |
+| AMBER CUDA SPFP; OpenMM CUDA mixed; GROMACS CUDA mixed | ≤ 0.01 | ≤ 0.05 | 0.5–6 × 10⁻⁵ |
 
 The double-precision differences come from the reciprocal-space difference described above.
 
 ## Recommended settings (AMBER CUDA)
 
 * **Thermostatted NVT and NPT simulations.** Use the SPFP build with a 2 fs time step and τ = 10⁻⁴.
-* **NVE simulations that need tight energy conservation.** Use the DPFP build with a 1 fs time step.
+* **NVE simulations that need tight energy conservation.** Use the DPFP build with a 1 fs time step and a
+  tolerance tight enough for the system: τ = 10⁻⁴ conserved energy for the regression water and τ = 10⁻⁵ was
+  needed for pGM water. For other systems, check the tolerance with a short NVE run and the on-the-fly
+  estimate of the induction contribution to the drift.
 
 ## Citation
 
