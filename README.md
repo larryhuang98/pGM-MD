@@ -1,5 +1,7 @@
 # pGM-MD: polarizable Gaussian multipole electrostatics for AMBER, OpenMM and GROMACS
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24201966.svg)](https://doi.org/10.5281/zenodo.24201966)
+
 This repository holds the implementations of the polarizable Gaussian multipole (pGM) model for three
 molecular dynamics programs. pGM uses Gaussian charges, covalent permanent dipoles and induced Gaussian
 dipoles. Every pair interacts, with no exclusions or scaled 1-4 terms, and periodic systems use particle
@@ -99,6 +101,11 @@ The double-precision differences come from the reciprocal-space difference descr
 
 If you use this code, please cite the paper that describes the GPU implementation and the
 cross-implementation comparison (Huang, Z. et al., in preparation; the reference will be added here).
+
+The software itself (version 1.0.0, used in that paper):
+
+* Z. Huang, T.-S. Lee, Y. Duan, R. Luo, pGM-MD: polarizable Gaussian multipole electrostatics for AMBER,
+  OpenMM and GROMACS, version 1.0.0, Zenodo (2026), doi:10.5281/zenodo.24201966
 
 The pGM formulation:
 
