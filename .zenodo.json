@@ -1,7 +1,7 @@
 {
-  "title": "pGM-MD: polarizable Gaussian multipole electrostatics for AMBER, OpenMM and GROMACS",
+  "title": "pGM-MD: polarizable Gaussian Multipole electrostatics for AMBER, OpenMM and GROMACS",
   "upload_type": "software",
-  "description": "<p>Implementations of the polarizable Gaussian multipole (pGM) model for three molecular dynamics programs: a patch for AMBER24 PMEMD (CPU and CUDA, SPFP and DPFP), an OpenMM 8 plugin (Reference, CPU, OpenCL and CUDA platforms) and a patch for GROMACS 2026.4 (CPU with domain decomposition, pGM terms on the GPU), with a shared C++ reference implementation and CUDA engine, topology converters, Gaussian van der Waals, and tests that compare the three programs at identical coordinates.</p>",
+  "description": "<p>Implementations of the polarizable Gaussian Multipole (pGM) model for three molecular dynamics programs: a patch for AMBER24 PMEMD (CPU and CUDA, SPFP and DPFP), an OpenMM 8 plugin (Reference, CPU, OpenCL and CUDA platforms) and a patch for GROMACS 2026.4 (CPU with domain decomposition, pGM terms on the GPU), with a shared C++ reference implementation and CUDA engine, topology converters, Gaussian van der Waals, and tests that compare the three programs at identical coordinates.</p>",
   "creators": [
     {"name": "Huang, Zhen", "affiliation": "University of California, Irvine"},
     {"name": "Lee, Tai-Sung", "affiliation": "Rutgers University"},
@@ -9,7 +9,7 @@
     {"name": "Luo, Ray", "affiliation": "University of California, Irvine"}
   ],
   "license": "MIT",
-  "keywords": ["molecular dynamics", "polarizable force field", "polarizable Gaussian multipole", "AMBER", "OpenMM", "GROMACS", "CUDA", "particle mesh Ewald"],
+  "keywords": ["molecular dynamics", "polarizable force field", "polarizable Gaussian Multipole", "AMBER", "OpenMM", "GROMACS", "CUDA", "particle mesh Ewald"],
   "notes": "core/, openmm/ and tests/ are MIT-licensed; the GROMACS patch (gromacs/) is LGPL-2.1; the AMBER patch (amber/) applies to AMBER24 and the patched PMEMD is subject to the AMBER license.",
   "references": [
     "Wei, H.; Qi, R.; Wang, J.; Cieplak, P.; Duan, Y.; Luo, R. J. Chem. Phys. 2020, 153, 114116. doi:10.1063/5.0019560",

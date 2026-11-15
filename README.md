@@ -1,8 +1,8 @@
-# pGM-MD: polarizable Gaussian multipole electrostatics for AMBER, OpenMM and GROMACS
+# pGM-MD: polarizable Gaussian Multipole electrostatics for AMBER, OpenMM and GROMACS
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24201966.svg)](https://doi.org/10.5281/zenodo.24201966)
 
-This repository holds the implementations of the polarizable Gaussian multipole (pGM) model for three
+This repository holds the implementations of the polarizable Gaussian Multipole (pGM) model for three
 molecular dynamics programs. pGM uses Gaussian charges, covalent permanent dipoles and induced Gaussian
 dipoles. Every pair interacts, with no exclusions or scaled 1-4 terms, and periodic systems use particle
 mesh Ewald (PME) for charges and dipoles. Gaussian van der Waals (GVDW) is also available as an
@@ -104,7 +104,7 @@ cross-implementation comparison (Huang, Z. et al., in preparation; the reference
 
 The software itself (version 1.0.0, used in that paper):
 
-* Z. Huang, T.-S. Lee, Y. Duan, R. Luo, pGM-MD: polarizable Gaussian multipole electrostatics for AMBER,
+* Z. Huang, T.-S. Lee, Y. Duan, R. Luo, pGM-MD: polarizable Gaussian Multipole electrostatics for AMBER,
   OpenMM and GROMACS, version 1.0.0, Zenodo (2026), doi:10.5281/zenodo.24201966
 
 The pGM formulation:

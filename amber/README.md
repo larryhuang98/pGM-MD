@@ -1,6 +1,6 @@
 # pGM for AMBER PMEMD
 
-Polarizable Gaussian multipole (pGM) molecular dynamics for AMBER PMEMD on CPUs
+Polarizable Gaussian Multipole (pGM) molecular dynamics for AMBER PMEMD on CPUs
 (`pmemd.pgm`, `pmemd.pgm.MPI`) and NVIDIA GPUs (`pmemd.pgm.cuda`, SPFP and DPFP).
 The patch adds these executables to an existing AMBER source tree; the standard
 `pmemd` and `pmemd.cuda` executables are built exactly as before.
