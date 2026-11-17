@@ -77,7 +77,7 @@ tests/xplat/run_xplat.sh all              # AMBER vs OpenMM vs GROMACS
 run: `tests/xplat/reference_output.txt`):
 
 * a liquid of 2,6-dimethylphenol (DMP), 8550 atoms;
-* 512 pGM waters.
+* 512 waters with the pGM-3P-2025 water parameters (Wu et al., J. Chem. Theory Comput. 21, 3563–3575 (2025)).
 
 The reference is the AMBER CPU code, run in double precision with τ = 10⁻¹⁰. Typical deviations are:
 
@@ -93,8 +93,8 @@ The double-precision differences come from the reciprocal-space difference descr
 
 * **Thermostatted NVT and NPT simulations.** Use the SPFP build with a 2 fs time step and τ = 10⁻⁴.
 * **NVE simulations that need tight energy conservation.** Use the DPFP build with a 1 fs time step and a
-  tolerance tight enough for the system: τ = 10⁻⁴ conserved energy for the regression water and τ = 10⁻⁵ was
-  needed for pGM water. For other systems, check the tolerance with a short NVE run and the on-the-fly
+  tolerance tight enough for the system: τ = 10⁻⁴ conserved energy for the test water of the AMBER
+  regression tests and τ = 10⁻⁵ was needed for pGM-3P-2025 water. For other systems, check the tolerance with a short NVE run and the on-the-fly
   estimate of the induction contribution to the drift.
 
 ## Citation
