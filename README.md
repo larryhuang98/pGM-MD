@@ -96,6 +96,10 @@ The double-precision differences come from the reciprocal-space difference descr
   tolerance tight enough for the system: τ = 10⁻⁴ conserved energy for the test water of the AMBER
   regression tests and τ = 10⁻⁵ was needed for pGM-3P-2025 water. For other systems, check the tolerance with a short NVE run and the on-the-fly
   estimate of the induction contribution to the drift.
+* **Ewald coefficient.** Set `ew_coeff` explicitly (0.40 Å⁻¹ with a 9–10 Å cutoff, with a reciprocal grid and
+  interpolation order that keep the reciprocal sum converged). The default that AMBER derives from the cutoff for point
+  charges (0.275 Å⁻¹ at 10 Å) leaves direct-space truncation errors in the Gaussian multipole terms; for the DMP liquid
+  they heated NVE simulations by about 5 kcal mol⁻¹ ns⁻¹.
 
 ## Citation
 
